@@ -6,16 +6,22 @@ Env vars are prefixed `API_` and loaded from `.env` in dev.
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# config.py -> archmentor_api -> apps/api -> apps -> repo root
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class Settings(BaseSettings):
     """Process-wide settings resolved once at startup."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # Anchor `.env` at the repo root so alembic (run from apps/api/)
+        # picks up the same file the FastAPI process does.
+        env_file=str(_REPO_ROOT / ".env"),
         env_prefix="API_",
         env_file_encoding="utf-8",
         extra="ignore",
