@@ -43,6 +43,18 @@ uv run alembic upgrade head
 
 Local stack: `./scripts/dev.sh` boots docker-compose services.
 
+### Run every check (mirrors CI)
+
+```bash
+uv run ruff check . && uv run ruff format --check .
+uv run ty check apps/api apps/agent
+uv run pytest -q
+pnpm -r lint && pnpm -r typecheck && pnpm -r test
+```
+
+CI (`.github/workflows/ci.yml`) runs the same set on push/PR — green here
+means green there.
+
 ## First run
 
 Order matters — schema and auth depend on Postgres being up.
@@ -79,7 +91,7 @@ When adding dependencies, look up the current stable version — never assume fr
 
 ## Current milestone
 
-See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` — milestones M0…M6.
+M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) is next. See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` for the full M0…M6 breakdown.
 
 ## Gotchas
 
@@ -88,4 +100,5 @@ See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` — milesto
 - **Agent subpackage `queue/`.** Intentionally shadows stdlib `queue`; ruff `A005` is ignored per-file in root `pyproject.toml`.
 - **pytest cross-app collection.** `apps/api/tests` and `apps/agent/tests` both live under a `tests` package name. Running from repo root requires `--import-mode=importlib` (already set in root `pyproject.toml`).
 - **GoTrue search_path.** `GOTRUE_DB_DATABASE_URL` must end with `?search_path=auth` — without it, the Go driver inherits the default `public` schema and runtime queries miss `auth.*` tables.
+- **JSONB degrades to JSON on SQLite.** `models/_base.py::jsonb_column` uses `JSONB().with_variant(JSON(), "sqlite")` so integration tests can spin up an in-memory SQLite engine. New models must use this helper — plain `JSONB` breaks the test harness.
 - **Version lookups over assumptions.** Before adding a dep or bumping a pin, fetch the current stable from the registry. The plan doc's versions are a snapshot; the repo pins are what's live.

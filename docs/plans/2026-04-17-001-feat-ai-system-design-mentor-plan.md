@@ -599,16 +599,16 @@ Built-in via LiveKit Agents `session.say()`. Framework auto-pauses TTS on candid
 
 ## Implementation Milestones
 
-### M0 — Foundation (week 1)
+### M0 — Foundation (week 1) ✅ done 2026-04-19
 
-- Monorepo init (`uv` workspace, `pnpm` workspace), CLAUDE.md, .gitignore
-- Docker compose: LiveKit server, Supabase local, Redis, MinIO, Langfuse
-- Next.js scaffold: Tailwind, shadcn, Supabase client, auth flow
-- FastAPI scaffold: Supabase JWT verify, SQLModel + Alembic init, session_events table
-- **Append-only event ledger** schema and write-through from day one
-- **Brain snapshot** model and serialization utility
-- CI: lint (oxlint, ruff), type check (tsc, ty)
-- One-command `scripts/dev.sh`
+- [x] Monorepo init (`uv` workspace, `pnpm` workspace), CLAUDE.md, .gitignore
+- [x] Docker compose: LiveKit server, Supabase local, Redis, MinIO, Langfuse
+- [x] Next.js scaffold: Tailwind, shadcn, Supabase client, auth flow
+- [x] FastAPI scaffold: Supabase JWT verify, SQLModel + Alembic init, session_events table
+- [x] **Append-only event ledger** schema and write-through from day one
+- [x] **Brain snapshot** model and serialization utility
+- [x] CI: lint (oxlint, ruff), type check (tsc, ty)
+- [x] One-command `scripts/dev.sh`
 
 **Verify:** user signs up/in, hits authed `GET /me`, all Docker services green, event write path works.
 
