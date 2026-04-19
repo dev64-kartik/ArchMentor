@@ -1,0 +1,29 @@
+# LiveKit server config (dev)
+# Docs: https://docs.livekit.io/home/self-hosting/deployment/
+
+port: 7880
+bind_addresses:
+  - ""
+
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: false
+  # Announce loopback + LAN to the browser for local dev.
+  # In production, set use_external_ip: true and open UDP 7882 externally.
+
+redis:
+  address: redis:6379
+
+# Keys are injected via LIVEKIT_KEYS env var in docker-compose.
+# Never commit real keys to this file.
+
+logging:
+  level: info
+  json: false
+
+# Room defaults
+room:
+  auto_create: true
+  empty_timeout: 300  # 5 min after last participant leaves
+  max_participants: 4  # candidate + agent + safety margin

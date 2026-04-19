@@ -1,0 +1,1 @@
+"""Serialized event router + coalescer."""

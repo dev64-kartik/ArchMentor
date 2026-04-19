@@ -1,0 +1,11 @@
+# Few-shot examples for the brain prompt.
+# Populated in M2; placeholder targets listed below.
+
+examples: []
+# - id: correct_interrupt_wrong_fact
+# - id: correct_noninterrupt_unconventional_but_valid
+# - id: stuck_check_scaffold
+# - id: counter_argument_concession
+# - id: counter_argument_teaching
+# - id: time_soft_nudge
+# - id: confidence_gated_abstention

@@ -1,0 +1,75 @@
+[project]
+name = "archmentor"
+version = "0.0.0"
+description = "AI-powered live system design mentor — workspace root"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { file = "LICENSE" }
+
+[tool.uv]
+package = false
+# Project-local cache keeps installs repeatable across shells/sandboxes that
+# can't write to the default `~/.cache/uv` path.
+cache-dir = ".uv-cache"
+
+[tool.uv.workspace]
+members = ["apps/api", "apps/agent"]
+
+[dependency-groups]
+dev = [
+    "ruff==0.15.11",
+    "ty==0.0.31",
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["apps/api/archmentor_api", "apps/agent/archmentor_agent"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+    "ASYNC",
+    "S",    # flake8-bandit
+    "A",    # flake8-builtins
+    "C4",   # comprehensions
+    "T20",  # no print
+    "PT",   # pytest
+    "PTH",  # pathlib
+]
+ignore = [
+    "S101",  # allow assert in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "PT"]
+"**/alembic/versions/*.py" = ["E501"]
+# Agent package layout mirrors the plan doc verbatim; the `queue/` module
+# name intentionally shadows the stdlib queue.
+"apps/agent/archmentor_agent/queue/**" = ["A005"]
+"apps/agent/archmentor_agent/**/__init__.py" = ["A005"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.ty.rules]
+# Strict defaults; tune per-project as needed.
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "apps/api/tests", "apps/agent/tests"]
+# `importlib` mode lets each app's `tests/` live independently without
+# colliding on the shared `tests` package name when pytest runs from root.
+addopts = "--import-mode=importlib"

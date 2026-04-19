@@ -1,0 +1,238 @@
+"""initial m0 schema
+
+Revision ID: 7250b3970037
+Revises:
+Create Date: 2026-04-19 19:20:56.272193
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+import sqlmodel
+import sqlmodel.sql.sqltypes
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+# revision identifiers, used by Alembic.
+revision: str = "7250b3970037"
+down_revision: str | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "problems",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("slug", sqlmodel.sql.sqltypes.AutoString(length=100), nullable=False),
+        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column("title", sqlmodel.sql.sqltypes.AutoString(length=200), nullable=False),
+        sa.Column("statement_md", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+        sa.Column("difficulty", sqlmodel.sql.sqltypes.AutoString(length=20), nullable=False),
+        sa.Column("rubric_yaml", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+        sa.Column("ideal_solution_md", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+        sa.Column(
+            "seniority_calibration_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False
+        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_problems_slug"), "problems", ["slug"], unique=False)
+    op.create_table(
+        "users",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("email", sqlmodel.sql.sqltypes.AutoString(length=320), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_users_email"), "users", ["email"], unique=False)
+    op.create_table(
+        "sessions",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("user_id", sa.Uuid(), nullable=False),
+        sa.Column("problem_id", sa.Uuid(), nullable=False),
+        sa.Column("problem_version", sa.Integer(), nullable=False),
+        sa.Column(
+            "status",
+            # Enum values mirror SessionStatus StrEnum (lowercase).
+            sa.Enum("scheduled", "active", "ended", "errored", name="sessionstatus"),
+            nullable=False,
+        ),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("ended_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("duration_s_planned", sa.Integer(), nullable=False),
+        sa.Column("livekit_room", sqlmodel.sql.sqltypes.AutoString(length=100), nullable=False),
+        sa.Column("prompt_version", sqlmodel.sql.sqltypes.AutoString(length=50), nullable=False),
+        sa.Column("cost_cap_usd", sa.Float(), nullable=False),
+        sa.Column("cost_actual_usd", sa.Float(), nullable=False),
+        sa.Column("token_totals_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["problem_id"], ["problems.id"]),
+        sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_sessions_problem_id"), "sessions", ["problem_id"], unique=False)
+    # Composite index serves "list sessions for user ordered by started_at".
+    # Postgres reads btree indexes bidirectionally, so ASC order covers DESC scans.
+    op.create_index(
+        "ix_sessions_user_id_started_at",
+        "sessions",
+        ["user_id", "started_at"],
+        unique=False,
+    )
+    op.create_table(
+        "brain_snapshots",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("session_id", sa.Uuid(), nullable=False),
+        sa.Column("t_ms", sa.Integer(), nullable=False),
+        sa.Column("session_state_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("event_payload_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("brain_output_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("reasoning_text", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+        sa.Column("tokens_input", sa.Integer(), nullable=False),
+        sa.Column("tokens_output", sa.Integer(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["session_id"], ["sessions.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    # Composite covers both the session_id FK lookup and ORDER BY t_ms in one scan.
+    op.create_index(
+        "ix_brain_snapshots_session_id_t_ms",
+        "brain_snapshots",
+        ["session_id", "t_ms"],
+        unique=False,
+    )
+    op.create_table(
+        "canvas_snapshots",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("session_id", sa.Uuid(), nullable=False),
+        sa.Column("t_ms", sa.Integer(), nullable=False),
+        sa.Column("scene_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("diff_from_prev_json", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["session_id"], ["sessions.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        op.f("ix_canvas_snapshots_session_id"), "canvas_snapshots", ["session_id"], unique=False
+    )
+    op.create_index(op.f("ix_canvas_snapshots_t_ms"), "canvas_snapshots", ["t_ms"], unique=False)
+    op.create_table(
+        "interruptions",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("session_id", sa.Uuid(), nullable=False),
+        sa.Column("t_ms", sa.Integer(), nullable=False),
+        sa.Column("trigger", sqlmodel.sql.sqltypes.AutoString(length=50), nullable=False),
+        sa.Column(
+            "priority",
+            # Enum values mirror InterruptionPriority StrEnum (lowercase).
+            sa.Enum("high", "medium", "low", name="interruptionpriority"),
+            nullable=False,
+        ),
+        sa.Column("confidence", sa.Float(), nullable=False),
+        sa.Column("text", sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+        sa.Column("candidate_response_window_ms", sa.Integer(), nullable=True),
+        sa.Column("round_number", sa.Integer(), nullable=False),
+        sa.Column("outcome", sqlmodel.sql.sqltypes.AutoString(length=50), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["session_id"], ["sessions.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        op.f("ix_interruptions_session_id"), "interruptions", ["session_id"], unique=False
+    )
+    op.create_index(op.f("ix_interruptions_t_ms"), "interruptions", ["t_ms"], unique=False)
+    op.create_table(
+        "reports",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("session_id", sa.Uuid(), nullable=False),
+        sa.Column(
+            "status",
+            # Enum values mirror ReportStatus StrEnum (lowercase).
+            sa.Enum("pending", "ready", "failed", name="reportstatus"),
+            nullable=False,
+        ),
+        sa.Column("summary_md", sqlmodel.sql.sqltypes.AutoString(), nullable=True),
+        sa.Column("per_dimension_json", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("strengths", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("gaps", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("next_steps", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("generated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("model_version", sqlmodel.sql.sqltypes.AutoString(length=50), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["session_id"], ["sessions.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_reports_session_id"), "reports", ["session_id"], unique=True)
+    op.create_table(
+        "session_events",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("session_id", sa.Uuid(), nullable=False),
+        sa.Column("t_ms", sa.Integer(), nullable=False),
+        sa.Column(
+            "type",
+            # Enum values mirror SessionEventType StrEnum (lowercase).
+            sa.Enum(
+                "utterance_candidate",
+                "utterance_ai",
+                "brain_decision",
+                "canvas_change",
+                "phase_transition",
+                "rubric_update",
+                "design_decision",
+                "silence_check",
+                "interruption",
+                "error",
+                name="sessioneventtype",
+            ),
+            nullable=False,
+        ),
+        sa.Column("payload_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["session_id"], ["sessions.id"]),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    # Composite covers both the session_id FK lookup and ORDER BY t_ms in one scan.
+    op.create_index(
+        "ix_session_events_session_id_t_ms",
+        "session_events",
+        ["session_id", "t_ms"],
+        unique=False,
+    )
+
+
+def downgrade() -> None:
+    op.drop_index("ix_session_events_session_id_t_ms", table_name="session_events")
+    op.drop_table("session_events")
+    op.drop_index(op.f("ix_reports_session_id"), table_name="reports")
+    op.drop_table("reports")
+    op.drop_index(op.f("ix_interruptions_t_ms"), table_name="interruptions")
+    op.drop_index(op.f("ix_interruptions_session_id"), table_name="interruptions")
+    op.drop_table("interruptions")
+    op.drop_index(op.f("ix_canvas_snapshots_t_ms"), table_name="canvas_snapshots")
+    op.drop_index(op.f("ix_canvas_snapshots_session_id"), table_name="canvas_snapshots")
+    op.drop_table("canvas_snapshots")
+    op.drop_index("ix_brain_snapshots_session_id_t_ms", table_name="brain_snapshots")
+    op.drop_table("brain_snapshots")
+    op.drop_index("ix_sessions_user_id_started_at", table_name="sessions")
+    op.drop_index(op.f("ix_sessions_problem_id"), table_name="sessions")
+    op.drop_table("sessions")
+    op.drop_index(op.f("ix_users_email"), table_name="users")
+    op.drop_table("users")
+    op.drop_index(op.f("ix_problems_slug"), table_name="problems")
+    op.drop_table("problems")
+
+    # Drop the Postgres enum types created by upgrade(). Without this, a
+    # downgrade->upgrade cycle fails with "type ... already exists".
+    # No-op on SQLite (enum types are stored inline).
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        for enum_name in (
+            "sessionstatus",
+            "sessioneventtype",
+            "interruptionpriority",
+            "reportstatus",
+        ):
+            op.execute(f"DROP TYPE IF EXISTS {enum_name}")

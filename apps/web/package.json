@@ -1,0 +1,35 @@
+{
+  "name": "@archmentor/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start --port 3000",
+    "lint": "oxlint --config ../../.oxlintrc.json .",
+    "format": "oxlint --config ../../.oxlintrc.json --fix .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@supabase/ssr": "0.10.2",
+    "@supabase/supabase-js": "2.103.3",
+    "clsx": "2.1.1",
+    "livekit-client": "2.18.3",
+    "next": "16.2.4",
+    "react": "19.2.5",
+    "react-dom": "19.2.5",
+    "tailwind-merge": "3.5.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.2.2",
+    "@types/node": "22.19.17",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "tailwindcss": "4.2.2",
+    "typescript": "5.9.3",
+    "vite": "8.0.8",
+    "vitest": "4.1.4"
+  }
+}
