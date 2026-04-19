@@ -22,12 +22,15 @@ class InterviewSession(SQLModel, table=True):
     __tablename__ = "sessions"
 
     id: UUID = Field(default_factory=pk_uuid, primary_key=True)
-    user_id: UUID = Field(foreign_key="users.id", index=True)
+    # Composite index (user_id, started_at) lives in the migration — do not
+    # set index=True on user_id here; autogenerate would then propose a
+    # redundant single-column index on every new revision.
+    user_id: UUID = Field(foreign_key="users.id")
     problem_id: UUID = Field(foreign_key="problems.id", index=True)
     problem_version: int = Field(nullable=False)
 
     status: SessionStatus = Field(default=SessionStatus.SCHEDULED, nullable=False)
-    started_at: datetime | None = Field(default=None, index=True)
+    started_at: datetime | None = Field(default=None)
     ended_at: datetime | None = Field(default=None)
     duration_s_planned: int = Field(default=2700, nullable=False)  # 45 minutes
 

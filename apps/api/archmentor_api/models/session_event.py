@@ -34,8 +34,10 @@ class SessionEvent(SQLModel, table=True):
     __tablename__ = "session_events"
 
     id: UUID = Field(default_factory=pk_uuid, primary_key=True)
-    session_id: UUID = Field(foreign_key="sessions.id", index=True)
-    t_ms: int = Field(nullable=False, index=True)
+    # Composite index (session_id, t_ms) lives in the migration — see session.py
+    # for the rationale on why single-column index=True is omitted here.
+    session_id: UUID = Field(foreign_key="sessions.id")
+    t_ms: int = Field(nullable=False)
     type: SessionEventType = Field(nullable=False)
     payload_json: dict[str, object] = Field(sa_column=jsonb_column())
 
