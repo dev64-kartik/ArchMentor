@@ -1,0 +1,180 @@
+# ArchMentor — local dev stack
+#
+# IMPORTANT: image tags below are major-version pins for scaffolding.
+# Before first `docker compose up`, verify current stable tags and re-pin
+# to exact versions. Run `./scripts/dev.sh` from repo root.
+
+name: archmentor
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ─── Postgres: shared instance, multiple databases ──────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: archmentor-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-archmentor}
+      # Additional databases created by init script
+      AUTH_DB: ${AUTH_DB:-auth}
+      LANGFUSE_DB: ${LANGFUSE_DB:-langfuse}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init-databases.sh:/docker-entrypoint-initdb.d/10-init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-archmentor}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+
+  # ─── Supabase Auth (GoTrue) ─────────────────────────────────────────────
+  # GoTrue exposes /signup, /token, /logout on port 9999.
+  # FastAPI verifies JWTs locally using GOTRUE_JWT_SECRET.
+  gotrue:
+    image: supabase/gotrue:v2.188.1
+    container_name: archmentor-gotrue
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${GOTRUE_API_EXTERNAL_URL:-http://localhost:9999}
+      GOTRUE_DB_DRIVER: postgres
+      # `options=-c search_path=auth` pins the connection to GoTrue's schema;
+      # without it the Go driver inherits the default `public` search_path and
+      # queries like `SELECT ... FROM identities` miss `auth.identities`.
+      GOTRUE_DB_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_dev}@postgres:5432/${AUTH_DB:-auth}?sslmode=disable&search_path=auth
+      GOTRUE_SITE_URL: ${SITE_URL:-http://localhost:3000}
+      GOTRUE_URI_ALLOW_LIST: ${SITE_URL:-http://localhost:3000}
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_SECRET: ${GOTRUE_JWT_SECRET:-dev_jwt_secret_change_me_minimum_32_chars}
+      GOTRUE_JWT_EXP: "3600"
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_MAILER_AUTOCONFIRM: "true"  # dev: skip email confirmation
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_SMTP_HOST: ${SMTP_HOST:-}
+      GOTRUE_LOG_LEVEL: info
+    ports:
+      - "${GOTRUE_PORT:-9999}:9999"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+
+  # ─── Redis: hot session state ───────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: archmentor-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+
+  # ─── MinIO: object storage (audio, canvas snapshots) ────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    container_name: archmentor-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin_dev}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
+  # ─── LiveKit server ─────────────────────────────────────────────────────
+  livekit:
+    image: livekit/livekit-server:v1.8
+    container_name: archmentor-livekit
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-devsecret_change_me_minimum_32_chars}"
+    ports:
+      - "${LIVEKIT_PORT:-7880}:7880"           # HTTP/WebSocket signalling
+      - "${LIVEKIT_TCP_PORT:-7881}:7881"       # TCP fallback
+      - "${LIVEKIT_UDP_PORT:-7882}:7882/udp"   # RTC UDP
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7880/ | grep -q OK"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  # ─── Langfuse: LLM observability ────────────────────────────────────────
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: archmentor-langfuse
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_dev}@postgres:5432/${LANGFUSE_DB:-langfuse}
+      NEXTAUTH_URL: ${LANGFUSE_URL:-http://localhost:3001}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-dev_nextauth_secret_change_me_min_32}
+      SALT: ${LANGFUSE_SALT:-dev_salt_change_me_minimum_32_chars}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_INIT_PROJECT_NAME: archmentor-dev
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-dev-public-key}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-dev-secret-key}
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "${LANGFUSE_PORT:-3001}:3000"
+    healthcheck:
+      # Langfuse (Next.js standalone) binds to the network IP, not loopback;
+      # hit the container's own hostname which resolves inside the container.
+      test: ["CMD-SHELL", "wget -qO- http://$$(hostname -i | awk '{print $$1}'):3000/api/public/health | grep -q OK"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+
+networks:
+  default:
+    name: archmentor

@@ -1,0 +1,39 @@
+[project]
+name = "archmentor-agent"
+version = "0.0.0"
+description = "ArchMentor LiveKit agent worker"
+readme = "README.md"
+requires-python = ">=3.13"
+
+dependencies = [
+    "anthropic>=0.42.0",
+    "livekit-agents>=0.12.0",
+    "livekit-plugins-silero>=0.7.0",
+    "pydantic>=2.10.3",
+    "redis>=5.2.0",
+    "structlog>=24.4.0",
+    "httpx>=0.28.1",
+    "pyyaml>=6.0.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.4",
+    "ty>=0.0.1a11",
+]
+
+[build-system]
+requires = ["uv_build>=0.5.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+module-name = "archmentor_agent"
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ty.src]
+root = "./archmentor_agent"

@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ty_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# uv / venv
+.venv/
+venv/
+env/
+.uv-cache/
+
+# Node
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+.turbo/
+
+# Next.js
+.next/
+next-env.d.ts
+out/
+
+# Build artifacts
+coverage/
+.nyc_output/
+
+# Environment
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+!.env.example
+
+# Docker / infra local volumes
+infra/data/
+infra/.volumes/
+
+# LiveKit / Supabase / MinIO local state
+**/.livekit/
+**/supabase/.temp/
+**/supabase/.branches/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+
+# Secrets
+*.pem
+*.key
+!tests/fixtures/**/*.pem
+
+# ML model weights / heavy artifacts (root-only; don't shadow source `models/` dirs)
+/models/
+*.bin
+*.safetensors
+*.gguf
+!tests/fixtures/**/*.bin
+
+# Claude
+.claude/settings.local.json
