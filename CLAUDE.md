@@ -79,7 +79,7 @@ Then start the three app processes per the commands table. `API_JWT_SECRET` in `
 - **Transcript is untrusted input.** System prompt must reject embedded instructions.
 - **Prompt caching on static prefix.** Problem + rubric + system prompt are cache-stable; rolling transcript is per-call.
 - **Confidence-gated interruption.** Brain emits a confidence score; abstain below 0.6. Log the moment for prompt iteration.
-- **Shared JWT secret.** `API_JWT_SECRET` (FastAPI verifier) must equal `GOTRUE_JWT_SECRET` (GoTrue signer). Drift silently turns every `/me` request into 401.
+- **Shared JWT secret + issuer.** `API_JWT_SECRET` (FastAPI verifier) must equal `GOTRUE_JWT_SECRET` (GoTrue signer); drift silently turns every `/me` request into 401. Both are required — no placeholder default. `API_JWT_ISSUER` must match `GOTRUE_API_EXTERNAL_URL` so PyJWT enforces the `iss` claim.
 
 ## Agent-native
 

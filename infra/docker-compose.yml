@@ -60,7 +60,9 @@ services:
       GOTRUE_SITE_URL: ${SITE_URL:-http://localhost:3000}
       GOTRUE_URI_ALLOW_LIST: ${SITE_URL:-http://localhost:3000}
       GOTRUE_DISABLE_SIGNUP: "false"
-      GOTRUE_JWT_SECRET: ${GOTRUE_JWT_SECRET:-dev_jwt_secret_change_me_minimum_32_chars}
+      # GOTRUE_JWT_SECRET must be set in .env — no default. Docker-compose
+      # aborts with the message below if the var is missing or empty.
+      GOTRUE_JWT_SECRET: ${GOTRUE_JWT_SECRET:?set GOTRUE_JWT_SECRET in .env (openssl rand -base64 48)}
       GOTRUE_JWT_EXP: "3600"
       GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
       GOTRUE_JWT_AUD: authenticated
@@ -84,7 +86,9 @@ services:
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      # Bound to localhost so stray LAN peers can't read session state.
+      # Containers on the compose network still reach redis:6379 directly.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -122,7 +126,7 @@ services:
     restart: unless-stopped
     command: ["--config", "/etc/livekit.yaml"]
     environment:
-      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-devsecret_change_me_minimum_32_chars}"
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY in .env}: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET in .env (openssl rand -base64 48)}"
     ports:
       - "${LIVEKIT_PORT:-7880}:7880"           # HTTP/WebSocket signalling
       - "${LIVEKIT_TCP_PORT:-7881}:7881"       # TCP fallback

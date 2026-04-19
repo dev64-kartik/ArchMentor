@@ -29,16 +29,24 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     jwt_secret: str = Field(
-        default="dev_jwt_secret_change_me_minimum_32_chars",
-        description="Must match GOTRUE_JWT_SECRET for local verification.",
+        description="Must match GOTRUE_JWT_SECRET. Required — no default.",
+        min_length=32,
     )
     jwt_audience: str = "authenticated"
-    jwt_issuer: str | None = None
+    jwt_issuer: str = Field(
+        default="http://localhost:9999",
+        description="GoTrue `iss` claim. Must match GOTRUE_API_EXTERNAL_URL.",
+    )
 
     cors_origins: list[str] = ["http://localhost:3000"]
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return the cached settings instance."""
-    return Settings()
+    """Return the cached settings instance.
+
+    `Settings()` reads `jwt_secret` from `API_JWT_SECRET`; ty cannot see
+    through pydantic-settings' env-var resolution, so the "required kwarg"
+    diagnostic is a false positive here.
+    """
+    return Settings()  # ty: ignore[missing-argument]
