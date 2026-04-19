@@ -17,10 +17,10 @@ members = ["apps/api", "apps/agent"]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.7",
-    "ty>=0.0.1a11",
-    "pytest>=8.3",
-    "pytest-asyncio>=0.24",
+    "ruff==0.15.11",
+    "ty==0.0.31",
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
 ]
 
 [tool.ruff]
