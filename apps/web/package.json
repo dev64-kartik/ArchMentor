@@ -10,7 +10,7 @@
     "lint": "oxlint --config ../../.oxlintrc.json .",
     "format": "oxlint --config ../../.oxlintrc.json --fix .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
     "@supabase/ssr": "0.10.2",
