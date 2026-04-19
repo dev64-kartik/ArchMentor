@@ -32,7 +32,6 @@ class Settings(BaseSettings):
         default="dev_jwt_secret_change_me_minimum_32_chars",
         description="Must match GOTRUE_JWT_SECRET for local verification.",
     )
-    jwt_algorithm: str = "HS256"
     jwt_audience: str = "authenticated"
     jwt_issuer: str | None = None
 

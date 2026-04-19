@@ -12,6 +12,9 @@ from archmentor_api.models._base import pk_uuid, utcnow
 
 
 class InterruptionPriority(StrEnum):
+    # Keep these values in sync with the `priority` enum in
+    # `archmentor_agent.brain.tools.INTERVIEW_DECISION_TOOL` — the brain
+    # emits one of these strings and we persist it here without translation.
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"

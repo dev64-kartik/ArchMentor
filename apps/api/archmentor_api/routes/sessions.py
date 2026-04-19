@@ -15,7 +15,7 @@ router = APIRouter(prefix="/sessions", tags=["sessions"])
 def list_sessions(user: CurrentUser) -> list[dict[str, object]]:
     # TODO(M2): query `sessions` for this user_id.
     _ = user
-    return []
+    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented")
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)

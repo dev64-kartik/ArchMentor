@@ -10,7 +10,7 @@ router = APIRouter(prefix="/problems", tags=["problems"])
 @router.get("/")
 def list_problems() -> list[dict[str, object]]:
     # TODO(M3/M6): read from `problems` table seeded by scripts/seed_problems.py
-    return []
+    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented")
 
 
 @router.get("/{slug}")

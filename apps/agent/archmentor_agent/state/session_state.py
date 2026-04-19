@@ -52,7 +52,13 @@ class InterruptionRecord(BaseModel):
     outcome: str | None = None
 
 
-class CanvasSnapshot(BaseModel):
+class CanvasState(BaseModel):
+    """In-memory Excalidraw state the brain consumes.
+
+    Distinct from `archmentor_api.models.canvas_snapshot.CanvasSnapshot`,
+    which is the durable Postgres row written every few seconds.
+    """
+
     description: str = ""
     last_change_s: int = 0
 
@@ -107,7 +113,7 @@ class SessionState(BaseModel):
     interruptions: list[InterruptionRecord] = Field(default_factory=list)
 
     # Canvas (structured, not pixels)
-    canvas_state: CanvasSnapshot = Field(default_factory=CanvasSnapshot)
+    canvas_state: CanvasState = Field(default_factory=CanvasState)
 
     # Pending utterance awaiting speech-check gate
     pending_utterance: PendingUtterance | None = None

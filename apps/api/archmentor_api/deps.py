@@ -20,11 +20,13 @@ class Principal(BaseModel):
 
 
 def _verify_jwt(token: str, settings: Settings) -> dict[str, object]:
+    # Algorithm is pinned to HS256 (GoTrue default) to prevent algorithm
+    # confusion attacks via a misconfigured env var.
     try:
         return jwt.decode(
             token,
             settings.jwt_secret,
-            algorithms=[settings.jwt_algorithm],
+            algorithms=["HS256"],
             audience=settings.jwt_audience,
             issuer=settings.jwt_issuer,
         )

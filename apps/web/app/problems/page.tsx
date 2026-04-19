@@ -19,7 +19,7 @@ export default async function ProblemsPage() {
         <div>
           <h1 className="text-3xl font-semibold tracking-tight">Problems</h1>
           <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
-            Signed in as <span className="font-medium">{user.email}</span>
+            Signed in as <span className="font-medium">{user.email ?? "unknown"}</span>
           </p>
         </div>
         <SignOutButton />

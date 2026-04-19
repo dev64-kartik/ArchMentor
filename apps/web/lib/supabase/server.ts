@@ -4,6 +4,11 @@ import { createServerClient } from "@supabase/ssr";
 /**
  * Server-side Supabase client for use in React Server Components and
  * route handlers. Reads/writes auth cookies via `next/headers`.
+ *
+ * Next.js 15 forbids cookie mutation outside Server Actions and Route
+ * Handlers. The `setAll` callback runs during token rotation inside
+ * `auth.getUser()`, which Server Components call during render — so the
+ * write must be best-effort; middleware handles the durable refresh.
  */
 export async function createSupabaseServerClient() {
   const cookieStore = await cookies();
@@ -16,8 +21,13 @@ export async function createSupabaseServerClient() {
     cookies: {
       getAll: () => cookieStore.getAll(),
       setAll: (cookiesToSet) => {
-        for (const { name, value, options } of cookiesToSet) {
-          cookieStore.set(name, value, options);
+        try {
+          for (const { name, value, options } of cookiesToSet) {
+            cookieStore.set(name, value, options);
+          }
+        } catch {
+          // Server Component render context — cookie mutation is forbidden.
+          // Middleware owns the durable refresh on the next request.
         }
       },
     },

@@ -12,7 +12,7 @@ export async function middleware(request: NextRequest) {
   const url = process.env["NEXT_PUBLIC_GOTRUE_URL"];
   const anonKey = process.env["NEXT_PUBLIC_SUPABASE_ANON_KEY"] ?? "anon";
   if (!url) {
-    return response;
+    throw new Error("NEXT_PUBLIC_GOTRUE_URL is not set");
   }
 
   const supabase = createServerClient(url, anonKey, {

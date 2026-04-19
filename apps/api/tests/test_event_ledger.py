@@ -114,9 +114,7 @@ def test_append_event_is_insert_only(engine: Engine, live_session_id: str) -> No
         db.commit()
 
         rows = db.exec(
-            select(SessionEvent)
-            .where(SessionEvent.session_id == session_id)
-            .order_by("t_ms")
+            select(SessionEvent).where(SessionEvent.session_id == session_id).order_by("t_ms")
         ).all()
         assert [r.t_ms for r in rows] == [0, 500]
         assert [r.type for r in rows] == [

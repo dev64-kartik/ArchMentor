@@ -7,9 +7,27 @@ mid-session JSON parse failures.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypedDict
 
-INTERVIEW_DECISION_TOOL: dict[str, Any] = {
+
+class ToolInputSchema(TypedDict):
+    type: str
+    required: list[str]
+    properties: dict[str, Any]
+    additionalProperties: bool
+
+
+class ToolDescriptor(TypedDict):
+    name: str
+    description: str
+    input_schema: ToolInputSchema
+
+
+# The `priority` enum below mirrors `archmentor_api.models.interruption.InterruptionPriority`
+# (StrEnum with "high" | "medium" | "low" values). Keep the two in sync when
+# either definition changes — there is no shared import path between the
+# agent worker and the API package.
+INTERVIEW_DECISION_TOOL: ToolDescriptor = {
     "name": "interview_decision",
     "description": (
         "Emit the next interview decision. Call this on every turn. "
