@@ -612,16 +612,18 @@ Built-in via LiveKit Agents `session.say()`. Framework auto-pauses TTS on candid
 
 **Verify:** user signs up/in, hits authed `GET /me`, all Docker services green, event write path works.
 
-### M1 — Voice loop skeleton (week 2)
+### M1 — Voice loop skeleton (week 2) — in progress on `feat/m1-voice-loop`
 
-- LiveKit Agent worker: `cli.run_app(WorkerOptions(entrypoint_fnc=...))`
-- **Noise gate** (energy threshold + spectral filter) before VAD
-- Silero VAD via `AgentSession(vad=silero.VAD.load())`
-- whisper.cpp STT with Metal backend via `pywhispercpp`
-- Kokoro TTS via `streaming-tts` with `TTSConfig(device="mps")`
-- `session.say()` for TTS output with automatic barge-in
-- Browser LiveKitRoom: mic publishes, can join room
-- Test noise gate with mechanical keyboard + trackpad clicks
+- [x] LiveKit Agent worker: `cli.run_app(WorkerOptions(entrypoint_fnc=...))` — entrypoint scaffold with per-room `MentorAgent` that logs transcripts + acknowledges turns
+- [x] **Noise gate** (energy threshold + spectral filter) before VAD — pure numpy, unit-tested with synthetic speech/transient/silence fixtures
+- [x] Silero VAD via `AgentSession(vad=silero.VAD.load())` — wired in entrypoint
+- [x] whisper.cpp STT adapter via `pywhispercpp` — lazy-imported behind `[audio]` extra
+- [x] Kokoro TTS adapter via `streaming-tts` — lazy-imported async generator behind `[audio]` extra
+- [x] Browser LiveKitRoom: `POST /livekit/token` endpoint + `SessionRoom` client component + `/session/dev-test` dev-only route
+- [x] Agent → API event ledger HTTP client with 5xx retries
+- [x] `POST /sessions/{id}/events` ingest endpoint with shared-secret auth
+- [ ] livekit-agents `STT`/`TTS` adapter classes around `audio/stt.transcribe` and `tts/kokoro.synthesize` — framework glue required for `session.say()` + candidate turn-end
+- [ ] Manual mic test on Apple Silicon: noise gate rejects mechanical keyboard + trackpad clicks
 
 **Verify:** candidate joins room, speaks, agent logs transcript to event ledger, agent speaks back static line at turn-end. Keyboard sounds don't trigger VAD.
 

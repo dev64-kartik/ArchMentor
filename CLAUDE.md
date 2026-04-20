@@ -91,7 +91,17 @@ When adding dependencies, look up the current stable version — never assume fr
 
 ## Current milestone
 
-M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) is next. See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` for the full M0…M6 breakdown.
+M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) is in progress on `feat/m1-voice-loop`. Shipped: `POST /livekit/token`, `POST /sessions/{id}/events` (agent ingest with shared secret), noise gate + unit tests, STT/TTS adapters behind optional `audio` extra with lazy imports, agent ledger client with retries, agent entrypoint scaffold, and the browser LiveKitRoom join flow (`/session/[id]`, `/session/dev-test`). **Remaining:** wire livekit-agents-compatible STT/TTS adapter classes around `audio/stt.transcribe` and `tts/kokoro.synthesize` — required for a live mic smoke test.
+
+### M1 audio extras + manual mic test
+
+The agent ships Metal/MPS-only audio deps (`pywhispercpp`, `streaming-tts`) behind the `audio` extra so CI (Linux) can install the agent without native wheels:
+
+```bash
+uv sync --all-packages --extra audio   # macOS only
+```
+
+Use `/session/dev-test` (fixed room `session-dev-test`) to smoke-test the browser → LiveKit → agent path before M2 ships real session creation. See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` for the full M0…M6 breakdown.
 
 ## Gotchas
 
@@ -102,3 +112,5 @@ M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) is next. See `docs/p
 - **GoTrue search_path.** `GOTRUE_DB_DATABASE_URL` must end with `?search_path=auth` — without it, the Go driver inherits the default `public` schema and runtime queries miss `auth.*` tables.
 - **JSONB degrades to JSON on SQLite.** `models/_base.py::jsonb_column` uses `JSONB().with_variant(JSON(), "sqlite")` so integration tests can spin up an in-memory SQLite engine. New models must use this helper — plain `JSONB` breaks the test harness.
 - **Version lookups over assumptions.** Before adding a dep or bumping a pin, fetch the current stable from the registry. The plan doc's versions are a snapshot; the repo pins are what's live.
+- **Audio extras are Apple Silicon only.** `pywhispercpp` (whisper.cpp Metal) and `streaming-tts` (Kokoro on MPS) live under the agent's `audio` extra. They are lazy-imported from `audio/stt.py` and `tts/kokoro.py` so CI on Linux can install the agent without them. Never move them into the required `dependencies` list.
+- **Agent ingest secret, not user JWT.** The agent worker is a backend peer; it appends events via `X-Agent-Token` shared secret (`API_AGENT_INGEST_TOKEN` == `ARCHMENTOR_AGENT_INGEST_TOKEN`), not a Supabase JWT. Verified with `hmac.compare_digest` in `deps.require_agent`.
