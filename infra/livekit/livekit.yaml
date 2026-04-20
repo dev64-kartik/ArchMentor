@@ -9,8 +9,13 @@ rtc:
   tcp_port: 7881
   udp_port: 7882
   use_external_ip: false
-  # Announce loopback + LAN to the browser for local dev.
-  # In production, set use_external_ip: true and open UDP 7882 externally.
+  # Advertise the host-mapped loopback address to the browser. Without
+  # `node_ip`, LiveKit auto-detects the container's docker-bridge IP
+  # (172.18.0.x) and hands that to the browser as an ICE host
+  # candidate — the browser can't route to it, ICE fails, and the
+  # WebSocket connection errors out. In production, drop `node_ip`
+  # and set use_external_ip: true instead.
+  node_ip: 127.0.0.1
 
 redis:
   address: redis:6379
