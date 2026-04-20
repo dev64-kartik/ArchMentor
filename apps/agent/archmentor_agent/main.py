@@ -129,24 +129,6 @@ async def entrypoint(ctx: JobContext) -> None:
         await ledger.aclose()
 
 
-def _framework_adapter_gap() -> RuntimeError:
-    """Raised until `framework_adapters.py` wires whisper.cpp/Kokoro into livekit-agents.
-
-    The building blocks — `archmentor_agent.audio.stt.transcribe`,
-    `archmentor_agent.tts.kokoro.synthesize`, the noise gate — are all
-    unit-tested and ready. The remaining piece is the livekit-agents
-    STT/TTS base-class adapters that pipe our functions into
-    AgentSession's streaming runtime. That's the M1 manual-verify step
-    on Apple Silicon: implement and sanity-check on a mic before M2.
-    """
-    return RuntimeError(
-        "framework STT/TTS adapters not wired yet. See "
-        "apps/agent/archmentor_agent/audio/framework_adapters.py for the shape; "
-        "implement WhisperCppSTT and KokoroStreamingTTS against "
-        "livekit.agents.stt.STT / tts.TTS before running a live mic test."
-    )
-
-
 def _session_id_from_ctx(ctx: JobContext) -> UUID:
     """Extract the session UUID from the room name.
 
@@ -174,11 +156,15 @@ def _ledger_config() -> LedgerConfig:
 
 
 def _build_stt():  # type: ignore[no-untyped-def]
-    raise _framework_adapter_gap()
+    from archmentor_agent.audio.framework_adapters import WhisperCppSTT
+
+    return WhisperCppSTT()
 
 
 def _build_tts():  # type: ignore[no-untyped-def]
-    raise _framework_adapter_gap()
+    from archmentor_agent.audio.framework_adapters import KokoroStreamingTTS
+
+    return KokoroStreamingTTS()
 
 
 def main() -> None:

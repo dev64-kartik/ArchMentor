@@ -91,7 +91,7 @@ When adding dependencies, look up the current stable version — never assume fr
 
 ## Current milestone
 
-M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) is in progress on `feat/m1-voice-loop`. Shipped: `POST /livekit/token`, `POST /sessions/{id}/events` (agent ingest with shared secret), noise gate + unit tests, STT/TTS adapters behind optional `audio` extra with lazy imports, agent ledger client with retries, agent entrypoint scaffold, and the browser LiveKitRoom join flow (`/session/[id]`, `/session/dev-test`). **Remaining:** wire livekit-agents-compatible STT/TTS adapter classes around `audio/stt.transcribe` and `tts/kokoro.synthesize` — required for a live mic smoke test.
+M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) code-complete on `feat/m1-voice-loop`: `POST /livekit/token`, `POST /sessions/{id}/events` (agent ingest with shared secret), noise gate, STT/TTS pure-Python helpers + livekit-agents `WhisperCppSTT`/`KokoroStreamingTTS` adapter classes behind the optional `audio` extra, ledger client with retries, agent entrypoint, and the browser LiveKitRoom join flow (`/session/[id]`, `/session/dev-test`). **Remaining:** live mic verification on Apple Silicon before declaring M1 done.
 
 ### M1 audio extras + manual mic test
 

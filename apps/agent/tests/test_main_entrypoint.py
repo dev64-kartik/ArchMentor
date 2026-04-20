@@ -55,12 +55,15 @@ def test_ledger_config_uses_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.agent_token == "tok"  # noqa: S105 — fixture value
 
 
-def test_entrypoint_raises_until_framework_adapters_wired(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Until the livekit-agents STT/TTS glue ships, _build_stt/_build_tts must
-    raise a clear error that names the unimplemented piece."""
-    from archmentor_agent import main
+def test_build_stt_returns_whisper_adapter() -> None:
+    from archmentor_agent.audio.framework_adapters import WhisperCppSTT
+    from archmentor_agent.main import _build_stt
 
-    with pytest.raises(RuntimeError, match="framework STT/TTS adapters"):
-        main._build_stt()
-    with pytest.raises(RuntimeError, match="framework STT/TTS adapters"):
-        main._build_tts()
+    assert isinstance(_build_stt(), WhisperCppSTT)
+
+
+def test_build_tts_returns_kokoro_adapter() -> None:
+    from archmentor_agent.audio.framework_adapters import KokoroStreamingTTS
+    from archmentor_agent.main import _build_tts
+
+    assert isinstance(_build_tts(), KokoroStreamingTTS)

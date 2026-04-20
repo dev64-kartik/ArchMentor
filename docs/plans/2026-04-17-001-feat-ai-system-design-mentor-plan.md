@@ -622,7 +622,7 @@ Built-in via LiveKit Agents `session.say()`. Framework auto-pauses TTS on candid
 - [x] Browser LiveKitRoom: `POST /livekit/token` endpoint + `SessionRoom` client component + `/session/dev-test` dev-only route
 - [x] Agent → API event ledger HTTP client with 5xx retries
 - [x] `POST /sessions/{id}/events` ingest endpoint with shared-secret auth
-- [ ] livekit-agents `STT`/`TTS` adapter classes around `audio/stt.transcribe` and `tts/kokoro.synthesize` — framework glue required for `session.say()` + candidate turn-end
+- [x] livekit-agents `STT`/`TTS` adapter classes around `audio/stt.transcribe` and `tts/kokoro.synthesize` — `WhisperCppSTT` + `KokoroStreamingTTS` in `audio/framework_adapters.py`, wired into the agent entrypoint
 - [ ] Manual mic test on Apple Silicon: noise gate rejects mechanical keyboard + trackpad clicks
 
 **Verify:** candidate joins room, speaks, agent logs transcript to event ledger, agent speaks back static line at turn-end. Keyboard sounds don't trigger VAD.
