@@ -8,7 +8,7 @@ from uuid import UUID
 
 from sqlmodel import Field, SQLModel
 
-from archmentor_api.models._base import jsonb_column, pk_uuid, utcnow
+from archmentor_api.models._base import jsonb_column, pk_uuid, str_enum_column, utcnow
 
 
 class SessionStatus(StrEnum):
@@ -29,7 +29,10 @@ class InterviewSession(SQLModel, table=True):
     problem_id: UUID = Field(foreign_key="problems.id", index=True)
     problem_version: int = Field(nullable=False)
 
-    status: SessionStatus = Field(default=SessionStatus.SCHEDULED, nullable=False)
+    status: SessionStatus = Field(
+        default=SessionStatus.SCHEDULED,
+        sa_column=str_enum_column(SessionStatus, default=SessionStatus.SCHEDULED),
+    )
     started_at: datetime | None = Field(default=None)
     ended_at: datetime | None = Field(default=None)
     duration_s_planned: int = Field(default=2700, nullable=False)  # 45 minutes
