@@ -14,6 +14,17 @@ dependencies = [
     "structlog==25.5.0",
     "httpx==0.28.1",
     "pyyaml==6.0.3",
+    "numpy==2.4.4",
+]
+
+[project.optional-dependencies]
+# Apple Silicon audio stack. Kept optional so CI (Linux runners) can
+# install the agent without building Metal/MPS-dependent wheels.
+# Lazy-imported in `audio/stt.py` and `tts/kokoro.py`; the agent
+# entrypoint reports a clear error if the extras are missing.
+audio = [
+    "pywhispercpp==1.4.1",
+    "streaming-tts==0.3.8",
 ]
 
 [dependency-groups]
