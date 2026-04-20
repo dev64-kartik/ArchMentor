@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from uuid import UUID
 
 import structlog
+from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -240,6 +242,14 @@ def _build_tts():  # type: ignore[no-untyped-def]
 
 
 def main() -> None:
+    # The livekit-agents CLI reads LIVEKIT_URL / LIVEKIT_API_KEY /
+    # LIVEKIT_API_SECRET directly from os.environ. Unlike the API (which
+    # gets .env via pydantic-settings), the agent has no framework-level
+    # dotenv loader — load it here, anchored at the repo root. Explicit
+    # shell env wins over .env (override=False, pydantic-settings default).
+    repo_root = Path(__file__).resolve().parents[3]
+    load_dotenv(repo_root / ".env", override=False)
+
     # The Claude Code sandbox sets ALL_PROXY=socks5h://... for outbound
     # traffic, which aiohttp/httpx honour for *every* connection —
     # including ws://localhost, even though NO_PROXY lists localhost.
