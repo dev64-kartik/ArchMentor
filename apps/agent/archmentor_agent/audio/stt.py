@@ -59,8 +59,15 @@ def _load_model() -> Any:
         raise AudioExtrasMissingError() from exc
 
     model_name = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "large-v3")
-    log.info("whisper.cpp.load", model=model_name)
-    _MODEL_SINGLETON = module.Model(model_name)
+    # pywhispercpp defaults to `~/Library/Application Support/pywhispercpp`
+    # which the Claude sandbox denies writes to. Route the model cache
+    # to the repo-local `.model-cache/whisper/` (sandbox-writable).
+    models_dir = os.environ.get("ARCHMENTOR_WHISPER_DIR", ".model-cache/whisper")
+    from pathlib import Path
+
+    Path(models_dir).mkdir(parents=True, exist_ok=True)
+    log.info("whisper.cpp.load", model=model_name, models_dir=models_dir)
+    _MODEL_SINGLETON = module.Model(model_name, models_dir=models_dir)
     return _MODEL_SINGLETON
 
 

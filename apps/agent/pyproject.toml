@@ -28,6 +28,16 @@ audio = [
     # audioop-lts backports the audioop stdlib module removed in Python
     # 3.13 — pydub (pulled in by streaming-tts) still imports it.
     "audioop-lts==0.2.2",
+    # httpx SOCKS support. huggingface_hub constructs an httpx client
+    # eagerly from ALL_PROXY; without socksio it ImportErrors before
+    # HF_HUB_OFFLINE can short-circuit the fetch.
+    "socksio==1.0.0",
+    # Kokoro's English pipeline needs the spaCy small model. We pin it
+    # as a direct wheel URL so `uv sync` pulls it deterministically —
+    # otherwise `spacy download` would need to run at first use and
+    # invoke `pip install` against github, which the Claude harness
+    # blocks via a shim.
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
 ]
 
 [dependency-groups]
