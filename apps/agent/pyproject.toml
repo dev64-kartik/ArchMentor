@@ -25,6 +25,9 @@ dependencies = [
 audio = [
     "pywhispercpp==1.4.1",
     "streaming-tts==0.3.8",
+    # audioop-lts backports the audioop stdlib module removed in Python
+    # 3.13 — pydub (pulled in by streaming-tts) still imports it.
+    "audioop-lts==0.2.2",
 ]
 
 [dependency-groups]
