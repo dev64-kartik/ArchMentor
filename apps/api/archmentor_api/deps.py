@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from typing import Annotated
 
 import jwt
@@ -70,3 +71,23 @@ def require_user(
 
 
 CurrentUser = Annotated[Principal, Depends(require_user)]
+
+
+def require_agent(
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_agent_token: Annotated[str | None, Header(alias="X-Agent-Token")] = None,
+) -> None:
+    """Authenticate the LiveKit agent worker via shared secret.
+
+    The agent is not a user and has no Supabase JWT; it presents the
+    static `AGENT_INGEST_TOKEN` on backend-to-backend calls. Constant-time
+    compare to avoid timing side channels.
+    """
+    if not x_agent_token or not hmac.compare_digest(x_agent_token, settings.agent_ingest_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid agent credentials",
+        )
+
+
+AgentAuth = Annotated[None, Depends(require_agent)]

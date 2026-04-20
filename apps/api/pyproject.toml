@@ -18,6 +18,7 @@ dependencies = [
     "pyjwt[crypto]==2.12.1",
     "python-multipart==0.0.26",
     "structlog==25.5.0",
+    "livekit-api==1.1.0",
 ]
 
 [dependency-groups]

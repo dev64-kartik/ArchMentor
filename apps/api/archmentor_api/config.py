@@ -46,6 +46,25 @@ class Settings(BaseSettings):
 
     cors_origins: list[str] = ["http://localhost:3000"]
 
+    # LiveKit (token minting for the browser client).
+    livekit_url: str = "ws://localhost:7880"
+    livekit_api_key: str = Field(
+        description="LiveKit API key. Required — no default.",
+        min_length=1,
+    )
+    livekit_api_secret: str = Field(
+        description="LiveKit API secret. Required — no default.",
+        min_length=32,
+    )
+    livekit_token_ttl_s: int = 900  # 15 minutes
+
+    # Shared secret the agent worker presents when appending to the event
+    # ledger. Not a user JWT — the agent is a trusted backend peer.
+    agent_ingest_token: str = Field(
+        description="Shared secret for agent→API event ingest. Required — no default.",
+        min_length=32,
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
