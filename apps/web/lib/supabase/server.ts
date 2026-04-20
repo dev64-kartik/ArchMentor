@@ -12,6 +12,9 @@ import { createServerClient } from "@supabase/ssr";
  */
 export async function createSupabaseServerClient() {
   const cookieStore = await cookies();
+  // Use the same URL on server and browser so Supabase-SSR derives the
+  // same cookie storage key on both sides — otherwise server reads miss
+  // the session the browser just set.
   const url = process.env["NEXT_PUBLIC_GOTRUE_URL"];
   const anonKey = process.env["NEXT_PUBLIC_SUPABASE_ANON_KEY"] ?? "anon";
   if (!url) {

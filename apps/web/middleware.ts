@@ -9,6 +9,7 @@ import { NextResponse, type NextRequest } from "next/server";
 export async function middleware(request: NextRequest) {
   const response = NextResponse.next({ request });
 
+  // Same URL on server + browser so the SSR cookie key matches on both.
   const url = process.env["NEXT_PUBLIC_GOTRUE_URL"];
   const anonKey = process.env["NEXT_PUBLIC_SUPABASE_ANON_KEY"] ?? "anon";
   if (!url) {

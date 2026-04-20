@@ -1,7 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ConnectionState, Room, RoomEvent, Track } from "livekit-client";
+import {
+  ConnectionState,
+  type RemoteAudioTrack,
+  Room,
+  RoomEvent,
+  Track,
+} from "livekit-client";
 
 import { fetchLiveKitToken } from "@/lib/livekit/token";
 
@@ -19,11 +25,13 @@ type AiSpeakingState = "idle" | "listening" | "speaking" | "thinking";
  */
 export function SessionRoom({ room: roomName }: Props) {
   const roomRef = useRef<Room | null>(null);
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>(
     ConnectionState.Disconnected,
   );
   const [aiState, setAiState] = useState<AiSpeakingState>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -34,10 +42,28 @@ export function SessionRoom({ room: roomName }: Props) {
       if (!cancelled) setConnectionState(state);
     });
     room.on(RoomEvent.TrackSubscribed, (track) => {
-      if (track.kind === Track.Kind.Audio) setAiState("speaking");
+      if (track.kind !== Track.Kind.Audio) return;
+      // Attach the remote (agent) audio to an <audio> element so the
+      // browser actually plays it. LiveKit's `attach()` wires the
+      // MediaStream into the existing element.
+      if (audioElRef.current) {
+        (track as RemoteAudioTrack).attach(audioElRef.current);
+        audioElRef.current.play().catch(() => {
+          // Autoplay blocked — show the unlock button.
+          if (!cancelled) setNeedsAudioUnlock(true);
+        });
+      }
+      setAiState("speaking");
     });
     room.on(RoomEvent.TrackUnsubscribed, (track) => {
-      if (track.kind === Track.Kind.Audio) setAiState("listening");
+      if (track.kind !== Track.Kind.Audio) return;
+      (track as RemoteAudioTrack).detach();
+      setAiState("listening");
+    });
+    room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+      // `canPlaybackAudio` flips when Chrome blocks/allows the media
+      // context. Surface the unlock prompt while blocked.
+      if (!cancelled) setNeedsAudioUnlock(!room.canPlaybackAudio);
     });
 
     (async () => {
@@ -70,9 +96,26 @@ export function SessionRoom({ room: roomName }: Props) {
         </span>
       </div>
       <AiStateIndicator state={aiState} />
+      {needsAudioUnlock ? (
+        <button
+          type="button"
+          onClick={() => {
+            roomRef.current?.startAudio().catch(() => undefined);
+            audioElRef.current?.play().catch(() => undefined);
+            setNeedsAudioUnlock(false);
+          }}
+          className="rounded-md bg-amber-500 px-3 py-2 text-sm font-medium text-white hover:bg-amber-600"
+        >
+          Click to enable AI audio
+        </button>
+      ) : null}
       {error ? (
         <p className="text-xs text-red-600 dark:text-red-400">{error}</p>
       ) : null}
+      {/* Audio sink for the agent's remote track. Chrome sometimes
+          blocks autoplay until a user gesture — when it does, the
+          unlock button above appears. */}
+      <audio ref={audioElRef} autoPlay playsInline controls className="w-full" />
     </div>
   );
 }
