@@ -3,11 +3,14 @@ import { redirect } from "next/navigation";
 import { SessionRoom } from "@/components/livekit/session-room";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
+// Matches scripts/seed_dev_session.py — the room name embeds this UUID so
+// the agent can extract it via _session_id_from_ctx and write events.
+const DEV_ROOM = "session-00000000-0000-0000-0000-000000000001";
+
 /**
  * M1 dev-only room. Lets you validate the voice loop end-to-end before
- * M2 builds `POST /sessions` to mint real session rows + rooms. The
- * room name is fixed so the agent worker can be dispatched against
- * `session-dev-test` manually. Remove once M2 ships.
+ * M2 builds `POST /sessions` to mint real session rows + rooms. Run
+ * `uv run python scripts/seed_dev_session.py` once before using.
  */
 export default async function DevTestSessionPage() {
   const supabase = await createSupabaseServerClient();
@@ -23,11 +26,12 @@ export default async function DevTestSessionPage() {
       <header className="space-y-2">
         <h1 className="text-2xl font-semibold tracking-tight">M1 dev room</h1>
         <p className="text-sm text-neutral-600 dark:text-neutral-400">
-          Joins a fixed LiveKit room named <code>session-dev-test</code>. Used to smoke-test
-          the voice loop before M2 wires real session creation.
+          Joins <code>{DEV_ROOM}</code>. Run{" "}
+          <code>uv run python scripts/seed_dev_session.py</code> once before using so the agent
+          has a session row to append events against.
         </p>
       </header>
-      <SessionRoom room="session-dev-test" />
+      <SessionRoom room={DEV_ROOM} />
     </main>
   );
 }
