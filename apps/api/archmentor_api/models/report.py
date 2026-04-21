@@ -8,7 +8,7 @@ from uuid import UUID
 
 from sqlmodel import Field, SQLModel
 
-from archmentor_api.models._base import jsonb_column, pk_uuid, utcnow
+from archmentor_api.models._base import jsonb_column, pk_uuid, str_enum_column, utcnow
 
 
 class ReportStatus(StrEnum):
@@ -22,7 +22,10 @@ class Report(SQLModel, table=True):
 
     id: UUID = Field(default_factory=pk_uuid, primary_key=True)
     session_id: UUID = Field(foreign_key="sessions.id", unique=True, index=True)
-    status: ReportStatus = Field(default=ReportStatus.PENDING, nullable=False)
+    status: ReportStatus = Field(
+        default=ReportStatus.PENDING,
+        sa_column=str_enum_column(ReportStatus, default=ReportStatus.PENDING),
+    )
 
     summary_md: str | None = Field(default=None)
     per_dimension_json: dict[str, object] | None = Field(

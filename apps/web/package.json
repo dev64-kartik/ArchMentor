@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev --port 3000",
-    "build": "next build",
+    "dev": "next dev --webpack --port 3000",
+    "build": "next build --webpack",
     "start": "next start --port 3000",
     "lint": "oxlint --config ../../.oxlintrc.json .",
     "format": "oxlint --config ../../.oxlintrc.json --fix .",

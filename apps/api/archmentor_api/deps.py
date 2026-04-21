@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from typing import Annotated
 
 import jwt
@@ -70,3 +71,35 @@ def require_user(
 
 
 CurrentUser = Annotated[Principal, Depends(require_user)]
+
+
+def require_agent(
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_agent_token: Annotated[str | None, Header(alias="X-Agent-Token")] = None,
+) -> None:
+    """Authenticate the LiveKit agent worker via shared secret.
+
+    The agent is not a user and has no Supabase JWT; it presents the
+    static `AGENT_INGEST_TOKEN` on backend-to-backend calls. Constant-time
+    compare to avoid timing side channels.
+
+    A missing header is 401 (prompting the caller to authenticate); a
+    present-but-wrong token is 403 (the caller authenticated but is not
+    authorized). This distinction lets the agent's ledger client treat
+    "misconfigured token" as a hard failure while still retrying
+    genuine transient issues.
+    """
+    if not x_agent_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing agent credentials",
+            headers={"WWW-Authenticate": 'AgentToken realm="archmentor"'},
+        )
+    if not hmac.compare_digest(x_agent_token, settings.agent_ingest_token):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid agent credentials",
+        )
+
+
+AgentAuth = Annotated[None, Depends(require_agent)]

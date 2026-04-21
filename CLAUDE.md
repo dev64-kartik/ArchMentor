@@ -80,6 +80,11 @@ Then start the three app processes per the commands table. `API_JWT_SECRET` in `
 - **Prompt caching on static prefix.** Problem + rubric + system prompt are cache-stable; rolling transcript is per-call.
 - **Confidence-gated interruption.** Brain emits a confidence score; abstain below 0.6. Log the moment for prompt iteration.
 - **Shared JWT secret + issuer.** `API_JWT_SECRET` (FastAPI verifier) must equal `GOTRUE_JWT_SECRET` (GoTrue signer); drift silently turns every `/me` request into 401. Both are required — no placeholder default. `API_JWT_ISSUER` must match `GOTRUE_API_EXTERNAL_URL` so PyJWT enforces the `iss` claim.
+- **`/livekit/token` is session-scoped.** Looks up `sessions.livekit_room`; 404 if absent, 403 if not the caller's session, 409 if not `ACTIVE`. Never mint tokens for arbitrary room strings.
+- **`/gotrue/*` proxy is an explicit allowlist.** `apps/web/next.config.ts` enumerates GoTrue endpoints; a catch-all `/gotrue/:path*` would expose `/gotrue/admin/*` at same-origin — don't reintroduce.
+- **Session-event ingest caps `payload_json` at 16 KiB** and rejects non-`ACTIVE` sessions with 409. Protects the append-only ledger and the M2 brain's rolling transcript.
+- **Ledger writes are fire-and-forget.** `MentorAgent._log` schedules `ledger.append` on `_ledger_tasks`; the entrypoint drains the set before `ledger.aclose()`. Never `await` the ledger from a TTS-blocking path.
+- **Agent-auth distinguishes 401 from 403.** Missing `X-Agent-Token` → 401; wrong token → 403. The ledger client treats all 4xx as permanent, so this separation lets a misconfigured token fail fast.
 
 ## Agent-native
 
@@ -91,7 +96,17 @@ When adding dependencies, look up the current stable version — never assume fr
 
 ## Current milestone
 
-M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) is next. See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` for the full M0…M6 breakdown.
+M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) ✅ done 2026-04-21 on `feat/m1-voice-loop` (PR #2), including live mic verification on Apple Silicon and a post-review hardening pass (commit `3ef2206`). **Next:** M2 — Claude Opus tool-use brain, event router with serialization gate, utterance queue, decisions log, Hinglish STT config.
+
+### M1 audio extras + manual mic test
+
+The agent ships Metal/MPS-only audio deps (`pywhispercpp`, `streaming-tts`) behind the `audio` extra so CI (Linux) can install the agent without native wheels:
+
+```bash
+uv sync --all-packages --extra audio   # macOS only
+```
+
+Use `/session/dev-test` (fixed room `session-dev-test`) to smoke-test the browser → LiveKit → agent path before M2 ships real session creation. See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` for the full M0…M6 breakdown.
 
 ## Gotchas
 
@@ -102,3 +117,10 @@ M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) is next. See `docs/p
 - **GoTrue search_path.** `GOTRUE_DB_DATABASE_URL` must end with `?search_path=auth` — without it, the Go driver inherits the default `public` schema and runtime queries miss `auth.*` tables.
 - **JSONB degrades to JSON on SQLite.** `models/_base.py::jsonb_column` uses `JSONB().with_variant(JSON(), "sqlite")` so integration tests can spin up an in-memory SQLite engine. New models must use this helper — plain `JSONB` breaks the test harness.
 - **Version lookups over assumptions.** Before adding a dep or bumping a pin, fetch the current stable from the registry. The plan doc's versions are a snapshot; the repo pins are what's live.
+- **Audio extras are Apple Silicon only.** `pywhispercpp` (whisper.cpp Metal) and `streaming-tts` (Kokoro on MPS) live under the agent's `audio` extra. They are lazy-imported from `audio/stt.py` and `tts/kokoro.py` so CI on Linux can install the agent without them. Never move them into the required `dependencies` list.
+- **Agent ingest secret, not user JWT.** The agent worker is a backend peer; it appends events via `X-Agent-Token` shared secret (`API_AGENT_INGEST_TOKEN` == `ARCHMENTOR_AGENT_INGEST_TOKEN`), not a Supabase JWT. Verified with `hmac.compare_digest` in `deps.require_agent`.
+- **`load_dotenv(override=True)` is dev-only.** Agent `main.py` gates override on `ARCHMENTOR_ENV=dev`; any other value runs shell-wins so orchestrator-injected secrets aren't silently overwritten by a stale `.env`.
+- **`.env.example` placeholders are rejected at startup.** `Settings` refuses any secret containing the `replace_with_` marker. Copying `.env.example` without editing fails loudly.
+- **`WhisperCppSTT._resample_to_whisper_rate` raises on empty output.** Never fall back to the original wrong-rate buffer — whisper turns it into fabricated transcripts.
+- **Model singletons use `threading.Lock`.** `audio/stt.py::_load_model` and `tts/kokoro.py::_load_engine` double-check-lock because they run on the default thread-pool executor. New singletons must follow the same pattern.
+- **`scripts/kill.sh` for full teardown.** `pkill -f archmentor_agent.main` misses the `multiprocessing.spawn` workers livekit-agents dispatches; `kill.sh` sweeps orphans by venv path + websocket fingerprint.

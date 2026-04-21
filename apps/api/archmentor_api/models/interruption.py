@@ -8,7 +8,7 @@ from uuid import UUID
 
 from sqlmodel import Field, SQLModel
 
-from archmentor_api.models._base import pk_uuid, utcnow
+from archmentor_api.models._base import pk_uuid, str_enum_column, utcnow
 
 
 class InterruptionPriority(StrEnum):
@@ -28,7 +28,7 @@ class Interruption(SQLModel, table=True):
     t_ms: int = Field(nullable=False, index=True)
 
     trigger: str = Field(max_length=50, nullable=False)
-    priority: InterruptionPriority = Field(nullable=False)
+    priority: InterruptionPriority = Field(sa_column=str_enum_column(InterruptionPriority))
     confidence: float = Field(nullable=False)
     text: str = Field(nullable=False)
     candidate_response_window_ms: int | None = Field(default=None)

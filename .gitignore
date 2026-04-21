@@ -89,3 +89,6 @@ pnpm-debug.log*
 # Claude
 .claude/settings.local.json
 .context/
+apps/web/.env.local
+.model-cache/
+.logs/

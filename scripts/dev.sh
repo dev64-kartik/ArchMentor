@@ -51,6 +51,18 @@ done
 echo "✓ all services healthy"
 $COMPOSE ps
 
+# ─── Warm model caches ──────────────────────────────────────────────────
+# Kokoro + NLTK punkt land in `.model-cache/` (gitignored). Skipped if
+# the `audio` extra isn't installed — CI/Linux boxes don't need it.
+if [[ -n "${SKIP_WARM_MODELS:-}" ]]; then
+  echo "• skipping model warm-up (SKIP_WARM_MODELS set)"
+else
+  echo "• warming model caches (Kokoro + NLTK) — first run downloads ~300MB"
+  uv run python scripts/warm_models.py || {
+    echo "⚠ model warm-up failed; agent will still try lazy-load at first session." >&2
+  }
+fi
+
 cat <<'NEXT'
 
 ──────────────────────────────────────────────────────────────────────

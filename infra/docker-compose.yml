@@ -66,6 +66,9 @@ services:
       GOTRUE_JWT_EXP: "3600"
       GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
       GOTRUE_JWT_AUD: authenticated
+      # Issuer claim must be present in every access token so the API
+      # verifier (PyJWT configured with API_JWT_ISSUER) accepts it.
+      GOTRUE_JWT_ISSUER: ${GOTRUE_API_EXTERNAL_URL:-http://localhost:9999}
       GOTRUE_MAILER_AUTOCONFIRM: "true"  # dev: skip email confirmation
       GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
       GOTRUE_SMTP_HOST: ${SMTP_HOST:-}
@@ -121,7 +124,7 @@ services:
 
   # ─── LiveKit server ─────────────────────────────────────────────────────
   livekit:
-    image: livekit/livekit-server:v1.8
+    image: livekit/livekit-server:v1.9.12
     container_name: archmentor-livekit
     restart: unless-stopped
     command: ["--config", "/etc/livekit.yaml"]
