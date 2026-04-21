@@ -102,7 +102,73 @@ async def transcribe(
     ]
 
 
+_WHISPER_INITIAL_PROMPT = (
+    # Keep the prompt minimal. Whisper's initial_prompt is capped at
+    # 224 tokens and acts as a decoder prior, not a vocabulary list;
+    # enumerating technical terms is whack-a-mole and can miscorrect
+    # legitimate utterances elsewhere. The real disambiguation happens
+    # downstream in the brain, where Claude has the full session
+    # context ("lasting first out" after 3 min of cache discussion is
+    # obviously LIFO). This prompt just establishes English + register.
+    "System design interview in English with an Indian accent. "
+    "Technical discussion of distributed systems, databases, and APIs."
+)
+
+
+# Below this RMS (measured before normalization) we assume the
+# buffer is near-silent — Silero VAD occasionally forwards
+# breath/room-noise segments, and running whisper on them wastes
+# a GPU second to produce a hallucinated "Thank you." / "Right."
+# Return empty from `transcribe` so the agent drops the turn.
+_MIN_SPEECH_RMS = 0.015
+
+# Target RMS after normalization. Whisper was trained on audio in
+# roughly this energy range; pushing quiet input up to here shrinks
+# the gap between acoustic evidence and language-model prior.
+_NORMALIZE_TARGET_RMS = 0.15
+
+# Gain ceiling. Without this, a truly silent buffer (RMS ≈ 0.001)
+# would be amplified 150x and turn room noise into "speech".
+_MAX_NORMALIZE_GAIN = 15.0
+
+
 def _run_inference(samples: np.ndarray) -> list[dict[str, Any]]:
+    # LiveKit's default mic pipeline + a MacBook built-in mic
+    # routinely hand us buffers at RMS 0.04-0.06 (~5% of full scale).
+    # Whisper large-v3-turbo was trained on audio ~3x hotter; on
+    # quiet input its language-model prior dominates and produces
+    # generic filler ("Right.", "Thank you.", "How's the weather?").
+    # RMS-based normalization (not peak) because a single pop/click
+    # can dominate the peak while leaving the bulk of the signal
+    # near-silent. Gain is capped so pure noise doesn't get scaled
+    # into fake speech.
+    rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+    if rms < _MIN_SPEECH_RMS:
+        log.info("whisper.skip_low_rms", rms=round(rms, 4), samples=int(samples.size))
+        return []
+    gain = min(_NORMALIZE_TARGET_RMS / rms, _MAX_NORMALIZE_GAIN)
+    samples = np.clip(samples * gain, -1.0, 1.0).astype(np.float32, copy=False)
+
     model = _load_model()
-    raw = model.transcribe(samples)
+
+    raw = model.transcribe(
+        samples,
+        # Pin language. Multilingual models auto-detect on every buffer
+        # and on short/quiet turns sometimes mis-identify → garbage.
+        language="en",
+        # Domain + accent hint. Whisper trained heavily on YouTube;
+        # short or ambiguous inputs tend to collapse to generic
+        # filler ("thanks for watching", "I'll see you in the next
+        # video"). A domain prompt anchors the LM prior.
+        initial_prompt=_WHISPER_INITIAL_PROMPT,
+        # Strict greedy decoding. The default sampling fallback
+        # (retry with higher temperature on low-confidence segments)
+        # is a primary source of creative hallucinations.
+        temperature=0.0,
+        temperature_inc=0.0,
+        # More aggressive no-speech detection. Default 0.6 still lets
+        # room-noise segments through as hallucinated filler; 0.8
+        # rejects them as silence.
+        no_speech_thold=0.8,
+    )
     return [{"text": s.text, "t0": s.t0, "t1": s.t1} for s in raw]
