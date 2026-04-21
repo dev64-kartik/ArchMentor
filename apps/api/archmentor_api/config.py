@@ -8,11 +8,19 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # config.py -> archmentor_api -> apps/api -> apps -> repo root
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# Fields whose values must never survive the copy from `.env.example`.
+# The placeholders there deliberately contain `replace_with_` so that
+# `cp .env.example .env && docker compose up` can't accidentally boot a
+# process with publicly-known secrets. A conservative substring check
+# is enough — we don't need to detect every unfortunate value, only the
+# ones we shipped in the example file.
+_PLACEHOLDER_MARKER = "replace_with_"
 
 
 class Settings(BaseSettings):
@@ -64,6 +72,28 @@ class Settings(BaseSettings):
         description="Shared secret for agent→API event ingest. Required — no default.",
         min_length=32,
     )
+
+    @field_validator(
+        "jwt_secret",
+        "livekit_api_key",
+        "livekit_api_secret",
+        "agent_ingest_token",
+    )
+    @classmethod
+    def _reject_env_example_placeholder(cls, value: str) -> str:
+        """Refuse any value that still contains the `.env.example` placeholder marker.
+
+        The example file ships with `replace_with_...` placeholders so a
+        developer who runs `cp .env.example .env` before editing secrets
+        gets a refusing startup instead of a silently-live service
+        carrying publicly-known credentials.
+        """
+        if _PLACEHOLDER_MARKER in value:
+            raise ValueError(
+                "Value still contains the `.env.example` placeholder — "
+                "replace it with a real secret before starting the API."
+            )
+        return value
 
 
 @lru_cache(maxsize=1)

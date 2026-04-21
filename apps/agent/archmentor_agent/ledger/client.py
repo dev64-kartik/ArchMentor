@@ -54,12 +54,16 @@ class LedgerClient:
         """
         body = {"t_ms": t_ms, "type": event_type, "payload_json": payload}
         path = f"/sessions/{session_id}/events"
+        total_attempts = self._cfg.max_retries + 1
 
-        for attempt in range(self._cfg.max_retries + 1):
+        for attempt in range(total_attempts):
+            is_last = attempt == total_attempts - 1
             try:
                 response = await self._client.post(path, json=body)
             except httpx.HTTPError as exc:
                 log.warning("ledger.transport_error", attempt=attempt, error=str(exc))
+                if is_last:
+                    break
                 await self._sleep_backoff(attempt)
                 continue
 
@@ -76,8 +80,11 @@ class LedgerClient:
                 )
                 return False
 
-            # 5xx: transient. Back off and retry.
+            # 5xx: transient. Back off and retry, but skip the sleep on
+            # the final attempt — there's nothing to wait for.
             log.warning("ledger.server_error", attempt=attempt, status=response.status_code)
+            if is_last:
+                break
             await self._sleep_backoff(attempt)
 
         log.error("ledger.dropped_after_retries", event_type=event_type, t_ms=t_ms)

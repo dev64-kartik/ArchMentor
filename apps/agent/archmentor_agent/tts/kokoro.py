@@ -30,20 +30,24 @@ KOKORO_SAMPLE_RATE = 24_000
 _DRAIN_POLL_S = 0.05
 
 _ENGINE_SINGLETON: Any | None = None
+_ENGINE_LOCK = threading.Lock()
 
 
 def _load_engine() -> Any:
     global _ENGINE_SINGLETON
     if _ENGINE_SINGLETON is not None:
         return _ENGINE_SINGLETON
-    try:
-        module = importlib.import_module("streaming_tts")
-    except ImportError as exc:
-        raise AudioExtrasMissingError() from exc
-    voice = os.environ.get("ARCHMENTOR_TTS_VOICE", "af_bella")
-    log.info("kokoro.load", voice=voice, sample_rate=KOKORO_SAMPLE_RATE)
-    _ENGINE_SINGLETON = module.KokoroEngine(voice=voice)
-    return _ENGINE_SINGLETON
+    with _ENGINE_LOCK:
+        if _ENGINE_SINGLETON is not None:
+            return _ENGINE_SINGLETON
+        try:
+            module = importlib.import_module("streaming_tts")
+        except ImportError as exc:
+            raise AudioExtrasMissingError() from exc
+        voice = os.environ.get("ARCHMENTOR_TTS_VOICE", "af_bella")
+        log.info("kokoro.load", voice=voice, sample_rate=KOKORO_SAMPLE_RATE)
+        _ENGINE_SINGLETON = module.KokoroEngine(voice=voice)
+        return _ENGINE_SINGLETON
 
 
 async def synthesize(text: str) -> AsyncIterator[np.ndarray]:
@@ -67,6 +71,28 @@ async def _stream_engine(engine: Any, text: str) -> AsyncIterator[np.ndarray]:
     synth_error: list[BaseException] = []
 
     synth_done = threading.Event()
+    # Set when the generator exits (either consumer broke out early,
+    # the task was cancelled, or the loop is tearing down). The drain
+    # thread checks this before every `call_soon_threadsafe` so it
+    # doesn't try to post to a dead event loop.
+    consumer_gone = threading.Event()
+
+    def _safe_post(item: np.ndarray | None) -> None:
+        """Post to the asyncio bridge only if the consumer is still alive.
+
+        `loop.call_soon_threadsafe` raises `RuntimeError: Event loop is
+        closed` when the consumer's loop has shut down. That happens
+        after a task cancellation + session teardown race.
+        """
+        if consumer_gone.is_set() or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(_put_nowait, bridge, item)
+        except RuntimeError:
+            # Loop closed between the check and the call — consumer is
+            # gone. Drop the item; the drain thread will exit on its
+            # next iteration when it sees `consumer_gone`.
+            consumer_gone.set()
 
     def _run_synth() -> None:
         try:
@@ -79,19 +105,19 @@ async def _stream_engine(engine: Any, text: str) -> AsyncIterator[np.ndarray]:
     def _drain_queue() -> None:
         # Drain engine.queue into the asyncio bridge until the synth
         # thread is done AND the queue is empty, then signal end-of-stream.
-        while True:
+        while not consumer_gone.is_set():
             try:
                 chunk: Any = engine.queue.get(timeout=_DRAIN_POLL_S)
             except Empty:
                 if synth_done.is_set():
-                    loop.call_soon_threadsafe(_put_nowait, bridge, None)
+                    _safe_post(None)
                     return
                 continue
             if chunk is None:  # producer-side sentinel
-                loop.call_soon_threadsafe(_put_nowait, bridge, None)
+                _safe_post(None)
                 return
             arr = _int16_bytes_to_float32(chunk)
-            loop.call_soon_threadsafe(_put_nowait, bridge, arr)
+            _safe_post(arr)
 
     synth_thread = threading.Thread(target=_run_synth, name="kokoro.synth", daemon=True)
     drain_thread = threading.Thread(target=_drain_queue, name="kokoro.drain", daemon=True)
@@ -105,7 +131,12 @@ async def _stream_engine(engine: Any, text: str) -> AsyncIterator[np.ndarray]:
                 break
             yield item
     finally:
-        # Ensure workers exit so threads aren't left orphaned.
+        # Tell the drain thread to stop posting before we wait on it.
+        consumer_gone.set()
+        # Ensure workers exit so threads aren't left orphaned. Engine
+        # inference is an atomic call we can't interrupt; on cancel we
+        # accept the worst-case 2 s stall. The daemon=True flag above
+        # ensures the thread can't block interpreter shutdown either.
         synth_thread.join(timeout=2.0)
         drain_thread.join(timeout=2.0)
         if synth_error:

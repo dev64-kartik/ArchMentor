@@ -110,6 +110,55 @@ async def test_whisper_stt_recognize_empty_transcript_has_zero_confidence() -> N
     assert event.alternatives[0].confidence == 0.0
 
 
+async def test_whisper_stt_resamples_48khz_to_16khz() -> None:
+    """Chrome's default mic track is 48 kHz — the framework can hand us
+    that buffer directly, and whisper.cpp will fabricate transcripts if
+    we don't resample first. This test proves the resample path runs
+    and transcribe receives the downsampled sample count."""
+    stt_impl = WhisperCppSTT()
+    # 1 second of 48 kHz audio (48_000 samples).
+    t = np.arange(48_000, dtype=np.float32) / 48_000
+    speech = (0.3 * np.sin(2 * np.pi * 400 * t)).astype(np.float32)
+    frame = _int16_frame(speech, sample_rate=48_000)
+
+    seen_samples: list[int] = []
+
+    async def fake_transcribe(samples: np.ndarray) -> list[TranscriptChunk]:
+        seen_samples.append(int(samples.shape[0]))
+        return [TranscriptChunk(text="hi", t_start_ms=0, t_end_ms=500)]
+
+    with patch.object(framework_adapters, "transcribe", fake_transcribe):
+        await stt_impl._recognize_impl(frame)
+
+    assert len(seen_samples) == 1
+    # 48 kHz → 16 kHz is a 3x downsample; allow tiny slack for the
+    # polyphase resampler's edge handling.
+    assert 15_500 <= seen_samples[0] <= 16_500
+
+
+async def test_whisper_stt_reuses_resampler_across_calls() -> None:
+    """The resampler is cached per (input_rate, channels). Repeated
+    STT calls on the same rate must not allocate a fresh resampler —
+    doing so throws away polyphase state and adds per-utterance cost
+    in a hot path."""
+    stt_impl = WhisperCppSTT()
+    t = np.arange(48_000, dtype=np.float32) / 48_000
+    speech = (0.3 * np.sin(2 * np.pi * 400 * t)).astype(np.float32)
+    frame = _int16_frame(speech, sample_rate=48_000)
+
+    async def fake_transcribe(samples: np.ndarray) -> list[TranscriptChunk]:
+        del samples
+        return []
+
+    with patch.object(framework_adapters, "transcribe", fake_transcribe):
+        await stt_impl._recognize_impl(frame)
+        first_resampler = stt_impl._resamplers[(48_000, 1)]
+        await stt_impl._recognize_impl(frame)
+        second_resampler = stt_impl._resamplers[(48_000, 1)]
+
+    assert first_resampler is second_resampler
+
+
 def test_kokoro_tts_configuration() -> None:
     tts_impl = KokoroStreamingTTS()
     assert tts_impl.sample_rate == 24_000

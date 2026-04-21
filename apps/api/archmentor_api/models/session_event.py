@@ -38,7 +38,7 @@ class SessionEvent(SQLModel, table=True):
     # for the rationale on why single-column index=True is omitted here.
     session_id: UUID = Field(foreign_key="sessions.id")
     t_ms: int = Field(nullable=False)
-    type: SessionEventType = Field(sa_column=str_enum_column(SessionEventType))
+    type: SessionEventType = Field(sa_column=str_enum_column(SessionEventType, nullable=False))
     payload_json: dict[str, object] = Field(sa_column=jsonb_column())
 
     created_at: datetime = Field(default_factory=utcnow, nullable=False)

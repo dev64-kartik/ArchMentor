@@ -53,17 +53,3 @@ def test_ledger_config_uses_env(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _ledger_config()
     assert cfg.base_url == "http://api.test:9999"
     assert cfg.agent_token == "tok"  # noqa: S105 — fixture value
-
-
-def test_build_stt_returns_whisper_adapter() -> None:
-    from archmentor_agent.audio.framework_adapters import WhisperCppSTT
-    from archmentor_agent.main import _build_stt
-
-    assert isinstance(_build_stt(), WhisperCppSTT)
-
-
-def test_build_tts_returns_kokoro_adapter() -> None:
-    from archmentor_agent.audio.framework_adapters import KokoroStreamingTTS
-    from archmentor_agent.main import _build_tts
-
-    assert isinstance(_build_tts(), KokoroStreamingTTS)

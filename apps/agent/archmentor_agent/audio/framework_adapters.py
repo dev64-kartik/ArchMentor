@@ -75,6 +75,11 @@ class WhisperCppSTT(stt.STT):
                 interim_results=False,
             )
         )
+        # Cache resamplers keyed by (input_rate, channels). Re-allocating
+        # on every STT call both wastes buffers and throws away the
+        # resampler's internal polyphase state (harmless at the edges of
+        # utterances but still adds allocations in the hot path).
+        self._resamplers: dict[tuple[int, int], rtc.AudioResampler] = {}
 
     @property
     def model(self) -> str:
@@ -86,6 +91,47 @@ class WhisperCppSTT(stt.STT):
     def provider(self) -> str:
         return "whisper.cpp"
 
+    def preload(self) -> None:
+        """Load the whisper.cpp model eagerly (normally called from `prewarm`).
+
+        The framework's per-job init watchdog kills the worker if first
+        inference has to load a multi-GB model on cold start. `prewarm`
+        runs outside that watchdog; calling `preload` there makes the
+        cost explicit and surfaces model-load errors at worker startup
+        instead of on the first live utterance.
+
+        Separate from `__init__` so tests can construct the adapter
+        without depending on `pywhispercpp` being installed.
+        """
+        # Deferred import — `stt_core` is the pure helper module.
+        from archmentor_agent.audio import stt as stt_core
+
+        stt_core._load_model()
+
+    def _resample_to_whisper_rate(self, frame: rtc.AudioFrame, source_rate: int) -> rtc.AudioFrame:
+        key = (source_rate, int(frame.num_channels))
+        resampler = self._resamplers.get(key)
+        if resampler is None:
+            resampler = rtc.AudioResampler(
+                input_rate=source_rate,
+                output_rate=_WHISPER_SAMPLE_RATE,
+                num_channels=key[1],
+                quality=rtc.AudioResamplerQuality.HIGH,
+            )
+            self._resamplers[key] = resampler
+        out_frames = resampler.push(frame)
+        out_frames.extend(resampler.flush())
+        if not out_frames:
+            # A non-empty input frame should always produce output. If it
+            # doesn't, silently passing the original 24/48 kHz buffer to
+            # whisper (which is hard-wired for 16 kHz) produces fabricated
+            # transcripts — fail loudly instead.
+            raise RuntimeError(
+                f"AudioResampler produced no output for {source_rate} Hz frame "
+                f"({frame.samples_per_channel} samples, {frame.num_channels} ch)"
+            )
+        return combine_frames(out_frames)
+
     async def _recognize_impl(
         self,
         buffer: AudioBuffer,
@@ -95,20 +141,41 @@ class WhisperCppSTT(stt.STT):
     ) -> stt.SpeechEvent:
         del language, conn_options  # reserved; whisper auto-detects language
 
-        frame = combine_frames(buffer)
-        source_rate = int(frame.sample_rate)
-        if source_rate != _WHISPER_SAMPLE_RATE:
-            frame = _resample_frame(frame, _WHISPER_SAMPLE_RATE)
-        samples = _audio_frame_to_float32(frame)
-        rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
-        log.info(
-            "stt.recognize.begin",
-            duration_s=round(float(frame.duration), 2),
-            samples=int(samples.shape[0]),
-            source_rate=source_rate,
-            rms=round(rms, 4),
-        )
-        chunks = await transcribe(samples)
+        try:
+            frame = combine_frames(buffer)
+            source_rate = int(frame.sample_rate)
+            if source_rate != _WHISPER_SAMPLE_RATE:
+                frame = self._resample_to_whisper_rate(frame, source_rate)
+            samples = _audio_frame_to_float32(frame)
+            rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+            log.info(
+                "stt.recognize.begin",
+                duration_s=round(float(frame.duration), 2),
+                samples=int(samples.shape[0]),
+                source_rate=source_rate,
+                rms=round(rms, 4),
+            )
+            chunks = await transcribe(samples)
+        except (RuntimeError, ValueError, ImportError) as exc:
+            # A single bad buffer must not kill the AgentSession. The
+            # most likely causes here — a wrong-rate resample no-output,
+            # malformed int16 data, or `pywhispercpp` not installed —
+            # are all well-defined and safe to surface as an empty
+            # final transcript so the framework continues processing
+            # future buffers.
+            log.warning("stt.recognize.error", error=str(exc), error_type=type(exc).__name__)
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[
+                    stt.SpeechData(
+                        language=LanguageCode("en"),
+                        text="",
+                        start_time=0.0,
+                        end_time=0.0,
+                        confidence=0.0,
+                    )
+                ],
+            )
 
         text = " ".join(c.text for c in chunks).strip()
         log.info(
@@ -188,28 +255,6 @@ def _audio_frame_to_float32(frame: rtc.AudioFrame) -> np.ndarray:
         # Downmix: average channels. Interleaved layout, so reshape then mean.
         pcm = pcm.reshape(-1, frame.num_channels).mean(axis=1).astype(np.int16)
     return (pcm.astype(np.float32) / 32_768.0).astype(np.float32)
-
-
-def _resample_frame(frame: rtc.AudioFrame, target_rate: int) -> rtc.AudioFrame:
-    """Resample a LiveKit AudioFrame to ``target_rate``.
-
-    Uses the high-quality polyphase resampler bundled with livekit-rtc
-    (no scipy dep required). Returns a single combined frame so the
-    caller can treat the resampled output identically to the input.
-    """
-    resampler = rtc.AudioResampler(
-        input_rate=int(frame.sample_rate),
-        output_rate=target_rate,
-        num_channels=int(frame.num_channels),
-        quality=rtc.AudioResamplerQuality.HIGH,
-    )
-    out_frames = resampler.push(frame)
-    out_frames.extend(resampler.flush())
-    if not out_frames:
-        # Shouldn't happen for a non-empty input frame, but guard so we
-        # return a valid AudioFrame (even if empty) rather than crash.
-        return frame
-    return combine_frames(out_frames)
 
 
 def _float32_to_int16_bytes(samples: np.ndarray) -> bytes:

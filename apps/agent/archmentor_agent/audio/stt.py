@@ -14,8 +14,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 import structlog
@@ -23,6 +24,17 @@ import structlog
 log = structlog.get_logger(__name__)
 
 _MODEL_SINGLETON: Any | None = None
+# Protect the `check-then-set` on _MODEL_SINGLETON against concurrent
+# first calls from the default thread-pool executor.
+_MODEL_LOCK = threading.Lock()
+
+
+class _WhisperSegment(TypedDict):
+    """Shape of a whisper.cpp segment dict returned by `_run_inference`."""
+
+    text: str
+    t0: float
+    t1: float
 
 
 @dataclass(frozen=True)
@@ -52,23 +64,26 @@ def _load_model() -> Any:
     global _MODEL_SINGLETON
     if _MODEL_SINGLETON is not None:
         return _MODEL_SINGLETON
+    with _MODEL_LOCK:
+        if _MODEL_SINGLETON is not None:
+            return _MODEL_SINGLETON
 
-    try:
-        module = importlib.import_module("pywhispercpp.model")
-    except ImportError as exc:
-        raise AudioExtrasMissingError() from exc
+        try:
+            module = importlib.import_module("pywhispercpp.model")
+        except ImportError as exc:
+            raise AudioExtrasMissingError() from exc
 
-    model_name = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "large-v3")
-    # pywhispercpp defaults to `~/Library/Application Support/pywhispercpp`
-    # which the Claude sandbox denies writes to. Route the model cache
-    # to the repo-local `.model-cache/whisper/` (sandbox-writable).
-    models_dir = os.environ.get("ARCHMENTOR_WHISPER_DIR", ".model-cache/whisper")
-    from pathlib import Path
+        model_name = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "large-v3")
+        # pywhispercpp defaults to `~/Library/Application Support/pywhispercpp`
+        # which the Claude sandbox denies writes to. Route the model cache
+        # to the repo-local `.model-cache/whisper/` (sandbox-writable).
+        models_dir = os.environ.get("ARCHMENTOR_WHISPER_DIR", ".model-cache/whisper")
+        from pathlib import Path
 
-    Path(models_dir).mkdir(parents=True, exist_ok=True)
-    log.info("whisper.cpp.load", model=model_name, models_dir=models_dir)
-    _MODEL_SINGLETON = module.Model(model_name, models_dir=models_dir)
-    return _MODEL_SINGLETON
+        Path(models_dir).mkdir(parents=True, exist_ok=True)
+        log.info("whisper.cpp.load", model=model_name, models_dir=models_dir)
+        _MODEL_SINGLETON = module.Model(model_name, models_dir=models_dir)
+        return _MODEL_SINGLETON
 
 
 async def transcribe(
@@ -132,7 +147,7 @@ _NORMALIZE_TARGET_RMS = 0.15
 _MAX_NORMALIZE_GAIN = 15.0
 
 
-def _run_inference(samples: np.ndarray) -> list[dict[str, Any]]:
+def _run_inference(samples: np.ndarray) -> list[_WhisperSegment]:
     # LiveKit's default mic pipeline + a MacBook built-in mic
     # routinely hand us buffers at RMS 0.04-0.06 (~5% of full scale).
     # Whisper large-v3-turbo was trained on audio ~3x hotter; on

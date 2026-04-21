@@ -81,7 +81,11 @@ def _ensure_whisper() -> None:
 
     models_dir = REPO_ROOT / ".model-cache" / "whisper"
     models_dir.mkdir(parents=True, exist_ok=True)
-    model_name = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "base.en")
+    # Default must match `audio/stt.py::_load_model` (also `large-v3`).
+    # A mismatch means this warm-up never prepares the model the agent
+    # actually loads at runtime — the first live STT call then pays the
+    # full download/init cost.
+    model_name = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "large-v3")
 
     candidates = [
         models_dir / f"ggml-{model_name}.bin",

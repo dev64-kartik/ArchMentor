@@ -25,7 +25,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import UUID
 
 import structlog
@@ -45,6 +45,20 @@ from archmentor_agent.ledger import LedgerClient, LedgerConfig
 
 AiState = Literal["speaking", "listening", "thinking"]
 AI_STATE_TOPIC = "ai_state"
+
+
+class _UserInputEvent(Protocol):
+    """Minimal shape of livekit-agents `user_input_transcribed` events.
+
+    The framework doesn't export a typed event class for this, so we
+    declare the subset of fields we rely on here. If the SDK renames
+    `is_final` or `transcript`, ty flags every call site rather than
+    letting a `getattr(..., False)` fallback silently drop turns.
+    """
+
+    is_final: bool
+    transcript: str
+
 
 log = structlog.get_logger(__name__)
 
@@ -116,19 +130,44 @@ class MentorAgent(Agent):
         # hallucinating on the agent's own audio bleed-in. The event
         # listener checks this and drops pre-intro user input.
         self.opening_complete = asyncio.Event()
+        # Fire-and-forget ledger writes go here. The entrypoint's
+        # finally block drains this set before closing the HTTP client
+        # so in-flight writes don't get cut off mid-request.
+        self._ledger_tasks: set[asyncio.Task[bool]] = set()
 
     async def on_enter(self) -> None:
         log.info("agent.on_enter.begin", session_id=str(self._session_id))
         self._t0_ms = int(time.monotonic() * 1000)
-        await self._publish_state("speaking")
-        log.info("agent.opening.say.begin", text=OPENING_UTTERANCE)
-        handle = self.session.say(OPENING_UTTERANCE)
-        await handle.wait_for_playout()
-        log.info("agent.opening.say.end")
-        await self._log("utterance_ai", {"text": OPENING_UTTERANCE, "speaker": "ai"})
-        await self._publish_state("listening")
-        self.opening_complete.set()
-        log.info("agent.on_enter.end")
+        # `opening_complete` must be set no matter what. If we leave it
+        # unset (TTS error, ledger error, cancellation), the STT event
+        # handler drops every user turn for the life of the session —
+        # the session is alive and connected but effectively deaf.
+        # Surface the error, then unblock STT in `finally`.
+        try:
+            await self._publish_state("speaking")
+            log.info("agent.opening.say.begin", text=OPENING_UTTERANCE)
+            handle = self.session.say(OPENING_UTTERANCE)
+            await handle.wait_for_playout()
+            log.info("agent.opening.say.end")
+            self._log("utterance_ai", {"text": OPENING_UTTERANCE, "speaker": "ai"})
+            await self._publish_state("listening")
+        except Exception:
+            log.exception("agent.on_enter.failed")
+            # Best effort: put the UI back into a sensible state even
+            # though we couldn't play the intro.
+            try:
+                await self._publish_state("listening")
+            except Exception:
+                # Double-fault: the publish already catches transport
+                # errors internally; anything escaping here is either a
+                # programming error or teardown. We're already in the
+                # error handler of on_enter — log and drop so the
+                # original exception still propagates to the caller.
+                log.exception("agent.on_enter.publish_listening_failed")
+            raise
+        finally:
+            self.opening_complete.set()
+            log.info("agent.on_enter.end")
 
     async def handle_user_input(self, text: str) -> None:
         """Called from the session's `user_input_transcribed` event.
@@ -143,7 +182,7 @@ class MentorAgent(Agent):
             log.info("agent.user_input.dropped_hallucination", text=text)
             return
         await self._publish_state("thinking")
-        await self._log(
+        self._log(
             "utterance_candidate",
             {"text": text, "speaker": "candidate"},
         )
@@ -159,7 +198,7 @@ class MentorAgent(Agent):
             await self._publish_state("listening")
             return
         log.info("agent.ack.end")
-        await self._log("utterance_ai", {"text": TURN_ACK_UTTERANCE, "speaker": "ai"})
+        self._log("utterance_ai", {"text": TURN_ACK_UTTERANCE, "speaker": "ai"})
         await self._publish_state("listening")
 
     async def _publish_state(self, state: AiState) -> None:
@@ -171,42 +210,64 @@ class MentorAgent(Agent):
         the UI flip the indicator promptly and tells the candidate
         when it's their turn to speak.
         """
+        # json.dumps of a fixed-shape dict can't fail at runtime — keep
+        # it outside the transport try/except so a future shape change
+        # surfaces as an error, not a swallowed warning.
+        payload = json.dumps({"ai_state": state})
         try:
             await self._room.local_participant.publish_data(
-                json.dumps({"ai_state": state}),
+                payload,
                 topic=AI_STATE_TOPIC,
             )
-        except Exception as exc:
-            # Data publish must never break the voice loop — if the
-            # room is mid-teardown or the participant isn't connected
-            # yet, log and continue.
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            # Data publish must never break the voice loop — room is
+            # mid-teardown or the participant isn't connected yet.
             log.warning("agent.publish_state_failed", state=state, reason=str(exc))
 
-    async def _log(self, event_type: str, payload: dict[str, object]) -> None:
-        await self._ledger.append(
-            session_id=self._session_id,
-            t_ms=_now_relative_ms(self),
-            event_type=event_type,
-            payload=payload,
+    def _log(self, event_type: str, payload: dict[str, object]) -> None:
+        """Schedule a fire-and-forget ledger append.
+
+        Awaiting the ledger inline blocks the voice loop whenever the
+        API is slow (a 5xx retry storm can stall a turn for seconds).
+        Ledger writes are best-effort from the agent's side — the
+        `LedgerClient` handles retries and drops on permanent failure
+        — so we schedule the task and move on. The entrypoint drains
+        the task set before closing the HTTP client.
+        """
+        # Snapshot `t_ms` synchronously: once we return control to the
+        # caller the relative clock may drift before the task runs.
+        t_ms = self._now_relative_ms()
+        task = asyncio.create_task(
+            self._ledger.append(
+                session_id=self._session_id,
+                t_ms=t_ms,
+                event_type=event_type,
+                payload=payload,
+            )
         )
+        self._ledger_tasks.add(task)
+        task.add_done_callback(self._ledger_tasks.discard)
 
+    def _now_relative_ms(self) -> int:
+        """Milliseconds since session start, clamped to a non-negative int.
 
-def _now_relative_ms(agent: MentorAgent) -> int:
-    """Milliseconds since session start, clamped to a non-negative int."""
-    if agent._t0_ms is None:
-        agent._t0_ms = int(time.monotonic() * 1000)
-        return 0
-    return max(0, int(time.monotonic() * 1000) - agent._t0_ms)
+        `on_enter` is the sole clock initializer. If `_log` is called
+        before `on_enter` runs, return 0 rather than seeding `_t0_ms`
+        with a different monotonic origin than the session uses.
+        """
+        if self._t0_ms is None:
+            return 0
+        return max(0, int(time.monotonic() * 1000) - self._t0_ms)
 
 
 def prewarm(proc: JobProcess) -> None:
     """Load heavy models once per worker process, before any job runs.
 
-    Without this, `_build_tts()` inside the entrypoint triggers the
-    first Kokoro model load (and NLTK/HF download on a cold cache)
-    inside the 60-second per-job init watchdog — which then kills the
-    process mid-download. Prewarm is run at worker startup and has no
-    such deadline.
+    Without this, the entrypoint's first `AgentSession` instantiation
+    triggers Kokoro + whisper model loads (plus NLTK/HF downloads on a
+    cold cache) inside the 60-second per-job init watchdog — which
+    then kills the process mid-download. Prewarm runs at worker
+    startup and has no such deadline.
     """
     # Lazy imports: extras must be installed, but they only need to
     # resolve when a worker is actually prewarming (never in tests/CI).
@@ -221,7 +282,13 @@ def prewarm(proc: JobProcess) -> None:
     tts_voice = os.environ.get("ARCHMENTOR_TTS_VOICE", "af_bella")
     log.info("agent.prewarm.begin", whisper_model=whisper_model, tts_voice=tts_voice)
     proc.userdata["vad"] = silero.VAD.load()
-    proc.userdata["stt"] = WhisperCppSTT()
+    # Construct + eagerly load the whisper model so the first live
+    # utterance doesn't pay the cold-start cost. `preload()` was
+    # previously implicit via "first call loads"; shipping it as an
+    # explicit prewarm step keeps STT latency predictable.
+    stt_adapter = WhisperCppSTT()
+    stt_adapter.preload()
+    proc.userdata["stt"] = stt_adapter
     # Construct Kokoro now so HF weights + NLTK tokenizer load here,
     # not under the job-dispatch watchdog.
     tts = KokoroStreamingTTS()
@@ -253,10 +320,10 @@ async def entrypoint(ctx: JobContext) -> None:
     # mid-flight (ruff RUF006).
     input_tasks: set[asyncio.Task[None]] = set()
 
-    def _on_user_input(ev) -> None:  # type: ignore[no-untyped-def]
+    def _on_user_input(ev: _UserInputEvent) -> None:
         # Framework emits interim + final transcripts; only respond to final.
-        is_final = bool(getattr(ev, "is_final", False))
-        text = (getattr(ev, "transcript", None) or "").strip()
+        is_final = bool(ev.is_final)
+        text = (ev.transcript or "").strip()
         log.info(
             "agent.user_input.event",
             is_final=is_final,
@@ -307,12 +374,22 @@ async def entrypoint(ctx: JobContext) -> None:
         await session.aclose()
         # Drain any in-flight handle_user_input tasks. STT can produce
         # a final transcript up to a second after the user disconnects,
-        # and handle_user_input writes to the ledger — if we close the
-        # httpx client below while a task is mid-request, the task
-        # raises `client has been closed` and the transcript is lost.
+        # and handle_user_input schedules fire-and-forget ledger writes
+        # whose lifecycle outlives the coroutine that started them.
         if input_tasks:
             log.info("agent.shutdown.drain_input_tasks", count=len(input_tasks))
             await asyncio.gather(*input_tasks, return_exceptions=True)
+        # Now drain the ledger writes themselves — these tasks were
+        # scheduled from within handle_user_input (and on_enter) and
+        # can still be mid-request even after handle_user_input has
+        # returned. Finishing them before closing the httpx client
+        # prevents `client has been closed` errors and lost events.
+        if mentor._ledger_tasks:
+            log.info(
+                "agent.shutdown.drain_ledger_tasks",
+                count=len(mentor._ledger_tasks),
+            )
+            await asyncio.gather(*mentor._ledger_tasks, return_exceptions=True)
         await ledger.aclose()
 
 
@@ -342,33 +419,21 @@ def _ledger_config() -> LedgerConfig:
     return LedgerConfig(base_url=base, agent_token=token)
 
 
-def _build_stt():  # type: ignore[no-untyped-def]
-    from archmentor_agent.audio.framework_adapters import WhisperCppSTT
-
-    return WhisperCppSTT()
-
-
-def _build_tts():  # type: ignore[no-untyped-def]
-    from archmentor_agent.audio.framework_adapters import KokoroStreamingTTS
-
-    return KokoroStreamingTTS()
-
-
 def main() -> None:
     # The livekit-agents CLI reads LIVEKIT_URL / LIVEKIT_API_KEY /
     # LIVEKIT_API_SECRET directly from os.environ. Unlike the API (which
     # gets .env via pydantic-settings), the agent has no framework-level
     # dotenv loader — load it here, anchored at the repo root.
     #
-    # `override=True`: .env is authoritative for local dev. The default
-    # (shell wins) is the right call in production, but in this repo
-    # iteration on .env (e.g., switching whisper models) silently fails
-    # if a stale shell export still has the old value — exactly the
-    # kind of mid-debug confusion we want to avoid. In production the
-    # API uses pydantic-settings (which respects shell), so this only
-    # affects the dev agent worker.
+    # `override=True` is dev-only: iterating on .env (e.g., switching
+    # whisper models) silently fails if a stale shell export still has
+    # the old value. In production the orchestrator injects env vars
+    # directly; overriding them with a stale on-disk .env would be a
+    # silent credential-swap hazard. ARCHMENTOR_ENV=dev (the default)
+    # enables override; any other value runs with shell-wins semantics.
     repo_root = Path(__file__).resolve().parents[3]
-    load_dotenv(repo_root / ".env", override=True)
+    env_name = os.environ.get("ARCHMENTOR_ENV", "dev")
+    load_dotenv(repo_root / ".env", override=(env_name == "dev"))
 
     # The Claude Code sandbox sets ALL_PROXY=socks5h://... for outbound
     # traffic, which aiohttp/httpx honour for *every* connection —

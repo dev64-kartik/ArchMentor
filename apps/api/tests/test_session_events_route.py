@@ -109,12 +109,15 @@ def test_append_event_requires_agent_token(client: TestClient, session_id: UUID)
 
 
 def test_append_event_rejects_wrong_agent_token(client: TestClient, session_id: UUID) -> None:
+    """A present-but-wrong X-Agent-Token is 403 (authenticated but unauthorized),
+    not 401 — that distinction lets the agent's ledger client treat it as a
+    permanent hard failure instead of a retry-worthy transient."""
     response = client.post(
         f"/sessions/{session_id}/events",
         json={"t_ms": 0, "type": "utterance_candidate", "payload_json": {}},
         headers={"X-Agent-Token": "nope"},
     )
-    assert response.status_code == 401
+    assert response.status_code == 403
 
 
 def test_append_event_rejects_negative_t_ms(client: TestClient, session_id: UUID) -> None:
@@ -142,3 +145,56 @@ def test_append_event_404_when_session_missing(client: TestClient) -> None:
         headers=_agent_headers(),
     )
     assert response.status_code == 404
+
+
+@pytest.fixture
+def ended_session_id(engine: Engine) -> UUID:
+    with Session(engine) as db:
+        user = User(id=uuid4(), email="candidate@example.com")
+        problem = Problem(
+            slug=f"prob-{uuid4().hex[:8]}",
+            title="Design",
+            statement_md="# Design",
+            difficulty="medium",
+            rubric_yaml="dimensions: []",
+            ideal_solution_md="...",
+            seniority_calibration_json={},
+        )
+        db.add(user)
+        db.add(problem)
+        db.flush()
+        row = InterviewSession(
+            user_id=user.id,
+            problem_id=problem.id,
+            problem_version=problem.version,
+            status=SessionStatus.ENDED,
+            livekit_room=f"room-{uuid4().hex[:8]}",
+            prompt_version="v0",
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def test_append_event_409_when_session_not_active(
+    client: TestClient, ended_session_id: UUID
+) -> None:
+    """Writes against an ended/errored session poison replay + eval state."""
+    response = client.post(
+        f"/sessions/{ended_session_id}/events",
+        json={"t_ms": 0, "type": "utterance_ai", "payload_json": {}},
+        headers=_agent_headers(),
+    )
+    assert response.status_code == 409
+
+
+def test_append_event_rejects_oversized_payload(client: TestClient, session_id: UUID) -> None:
+    """Payloads over the 16 KiB cap must 413 — caps DoS + injection surface."""
+    huge = {"text": "x" * (16 * 1024 + 500)}
+    response = client.post(
+        f"/sessions/{session_id}/events",
+        json={"t_ms": 0, "type": "utterance_candidate", "payload_json": huge},
+        headers=_agent_headers(),
+    )
+    assert response.status_code == 413
