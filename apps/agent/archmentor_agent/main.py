@@ -21,12 +21,16 @@ of the real STT/TTS adapters happens only when `entrypoint` is called.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import time
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 import structlog
 from dotenv import load_dotenv
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -39,6 +43,9 @@ from livekit.agents import (
 
 from archmentor_agent.ledger import LedgerClient, LedgerConfig
 
+AiState = Literal["speaking", "listening", "thinking"]
+AI_STATE_TOPIC = "ai_state"
+
 log = structlog.get_logger(__name__)
 
 OPENING_UTTERANCE = (
@@ -48,9 +55,8 @@ OPENING_UTTERANCE = (
 TURN_ACK_UTTERANCE = "Got it. Keep going when you're ready."
 
 
-# whisper emits bracketed sound tags when it gets silence or non-speech
-# (`[Music]`, `[BLANK_AUDIO]`, `[Silence]`, etc). They aren't transcripts —
-# drop them before we log and reply.
+# Whisper emits bracketed sound tags on silence/non-speech:
+# `[Music]`, `[BLANK_AUDIO]`, `[Silence]`, etc.
 _HALLUCINATION_TAGS = {
     "[music]",
     "[blank_audio]",
@@ -61,12 +67,33 @@ _HALLUCINATION_TAGS = {
     "(blank_audio)",
 }
 
+# Whisper was trained heavily on YouTube; on silence or near-silence,
+# small models (base.en, tiny.en) frequently hallucinate stock outro
+# phrases. Match against stems so trailing punctuation/whitespace
+# variations all get caught. Larger models (small.en+) hallucinate
+# these too, just less often — keep the filter as a safety net.
+_HALLUCINATION_PHRASES = (
+    "thanks for watching",
+    "thank you for watching",
+    "see you in the next video",
+    "see you next time",
+    "subscribe to my channel",
+    "and the one that i love",
+    "we'll see you next time",
+    "this video is sponsored by",
+    "don't forget to like",
+    "please subscribe",
+    "bye bye",
+)
+
 
 def _is_whisper_hallucination(text: str) -> bool:
-    stripped = text.strip().lower()
+    stripped = text.strip().lower().rstrip(".!?,")
     if not stripped:
         return True
-    return stripped in _HALLUCINATION_TAGS or (stripped.startswith("[") and stripped.endswith("]"))
+    if stripped in _HALLUCINATION_TAGS or (stripped.startswith("[") and stripped.endswith("]")):
+        return True
+    return any(phrase in stripped for phrase in _HALLUCINATION_PHRASES)
 
 
 class MentorAgent(Agent):
@@ -76,15 +103,32 @@ class MentorAgent(Agent):
     anchored) replaces the static acknowledgement in M2.
     """
 
-    def __init__(self, *, session_id: UUID, ledger: LedgerClient) -> None:
+    def __init__(self, *, session_id: UUID, ledger: LedgerClient, room: rtc.Room) -> None:
         super().__init__(instructions="You acknowledge candidate turns while M2 wires the brain.")
         self._session_id = session_id
         self._ledger = ledger
+        self._room = room
         self._t0_ms: int | None = None
+        # Set once the opening utterance has finished playing. The
+        # framework refuses follow-up `session.say()` while the agent
+        # is mid-speech ("speech scheduling is paused"), and any STT
+        # transcript captured during the intro is almost always whisper
+        # hallucinating on the agent's own audio bleed-in. The event
+        # listener checks this and drops pre-intro user input.
+        self.opening_complete = asyncio.Event()
 
     async def on_enter(self) -> None:
-        await self.session.say(OPENING_UTTERANCE)
+        log.info("agent.on_enter.begin", session_id=str(self._session_id))
+        self._t0_ms = int(time.monotonic() * 1000)
+        await self._publish_state("speaking")
+        log.info("agent.opening.say.begin", text=OPENING_UTTERANCE)
+        handle = self.session.say(OPENING_UTTERANCE)
+        await handle.wait_for_playout()
+        log.info("agent.opening.say.end")
         await self._log("utterance_ai", {"text": OPENING_UTTERANCE, "speaker": "ai"})
+        await self._publish_state("listening")
+        self.opening_complete.set()
+        log.info("agent.on_enter.end")
 
     async def handle_user_input(self, text: str) -> None:
         """Called from the session's `user_input_transcribed` event.
@@ -96,12 +140,15 @@ class MentorAgent(Agent):
         middle.
         """
         if _is_whisper_hallucination(text):
-            log.debug("agent.user_input.dropped_hallucination", text=text)
+            log.info("agent.user_input.dropped_hallucination", text=text)
             return
+        await self._publish_state("thinking")
         await self._log(
             "utterance_candidate",
             {"text": text, "speaker": "candidate"},
         )
+        log.info("agent.ack.begin", ack=TURN_ACK_UTTERANCE)
+        await self._publish_state("speaking")
         try:
             await self.session.say(TURN_ACK_UTTERANCE)
         except RuntimeError as exc:
@@ -109,8 +156,31 @@ class MentorAgent(Agent):
             # raise, just log and drop the ack — the candidate utterance
             # is already in the ledger.
             log.warning("agent.say_skipped", reason=str(exc))
+            await self._publish_state("listening")
             return
+        log.info("agent.ack.end")
         await self._log("utterance_ai", {"text": TURN_ACK_UTTERANCE, "speaker": "ai"})
+        await self._publish_state("listening")
+
+    async def _publish_state(self, state: AiState) -> None:
+        """Tell the browser which phase the agent is in.
+
+        The frontend stays connected via a single audio track that never
+        unsubscribes between utterances, so it can't infer state from
+        track events. Surfacing it explicitly via a data message lets
+        the UI flip the indicator promptly and tells the candidate
+        when it's their turn to speak.
+        """
+        try:
+            await self._room.local_participant.publish_data(
+                json.dumps({"ai_state": state}),
+                topic=AI_STATE_TOPIC,
+            )
+        except Exception as exc:
+            # Data publish must never break the voice loop — if the
+            # room is mid-teardown or the participant isn't connected
+            # yet, log and continue.
+            log.warning("agent.publish_state_failed", state=state, reason=str(exc))
 
     async def _log(self, event_type: str, payload: dict[str, object]) -> None:
         await self._ledger.append(
@@ -123,8 +193,6 @@ class MentorAgent(Agent):
 
 def _now_relative_ms(agent: MentorAgent) -> int:
     """Milliseconds since session start, clamped to a non-negative int."""
-    import time
-
     if agent._t0_ms is None:
         agent._t0_ms = int(time.monotonic() * 1000)
         return 0
@@ -149,7 +217,9 @@ def prewarm(proc: JobProcess) -> None:
         WhisperCppSTT,
     )
 
-    log.info("agent.prewarm.begin")
+    whisper_model = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "large-v3")
+    tts_voice = os.environ.get("ARCHMENTOR_TTS_VOICE", "af_bella")
+    log.info("agent.prewarm.begin", whisper_model=whisper_model, tts_voice=tts_voice)
     proc.userdata["vad"] = silero.VAD.load()
     proc.userdata["stt"] = WhisperCppSTT()
     # Construct Kokoro now so HF weights + NLTK tokenizer load here,
@@ -177,7 +247,7 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     log.info("agent.connected", room=ctx.room.name, session_id=str(session_id))
 
-    mentor = MentorAgent(session_id=session_id, ledger=ledger)
+    mentor = MentorAgent(session_id=session_id, ledger=ledger, room=ctx.room)
 
     # Keep strong refs to spawned tasks so the GC doesn't cancel them
     # mid-flight (ruff RUF006).
@@ -185,21 +255,64 @@ async def entrypoint(ctx: JobContext) -> None:
 
     def _on_user_input(ev) -> None:  # type: ignore[no-untyped-def]
         # Framework emits interim + final transcripts; only respond to final.
-        if not getattr(ev, "is_final", False):
-            return
+        is_final = bool(getattr(ev, "is_final", False))
         text = (getattr(ev, "transcript", None) or "").strip()
-        log.info("agent.user_input", text=text, session_id=str(session_id))
+        log.info(
+            "agent.user_input.event",
+            is_final=is_final,
+            text=text,
+            session_id=str(session_id),
+        )
+        if not is_final:
+            return
+        if not mentor.opening_complete.is_set():
+            # STT fired during the opening line — almost always whisper
+            # hallucinating on the agent's own audio. Drop it.
+            log.info("agent.user_input.dropped_pre_intro", text=text)
+            return
         task = asyncio.create_task(mentor.handle_user_input(text))
         input_tasks.add(task)
         task.add_done_callback(input_tasks.discard)
 
     session.on("user_input_transcribed", _on_user_input)
 
+    # `AgentSession.wait_for_inactive()` returns the moment the speech
+    # queue is idle AND the user hasn't spoken yet — which is true for
+    # the ~1ms gap between `session.start()` returning and `on_enter`'s
+    # `say()` scheduling the opening utterance. The finally block then
+    # runs `aclose()` and the intro's `say()` raises "AgentSession is
+    # closing". Wait instead on the real room lifecycle: either the
+    # agent's own room connection drops, or the last remote participant
+    # (i.e. the candidate) leaves.
+    room_closed = asyncio.Event()
+
+    def _mark_closed(*_: object) -> None:
+        room_closed.set()
+
+    def _on_participant_left(participant: rtc.RemoteParticipant) -> None:
+        log.info("agent.participant_disconnected", identity=participant.identity)
+        if not ctx.room.remote_participants:
+            room_closed.set()
+
+    ctx.room.on("disconnected", _mark_closed)
+    ctx.room.on("participant_disconnected", _on_participant_left)
+
     try:
         await session.start(room=ctx.room, agent=mentor)
-        await session.wait_for_inactive()
+        await room_closed.wait()
+        log.info("agent.room_closed")
     finally:
+        # Close the session first so no new user_input_transcribed
+        # events get dispatched (and no new `input_tasks` are created).
         await session.aclose()
+        # Drain any in-flight handle_user_input tasks. STT can produce
+        # a final transcript up to a second after the user disconnects,
+        # and handle_user_input writes to the ledger — if we close the
+        # httpx client below while a task is mid-request, the task
+        # raises `client has been closed` and the transcript is lost.
+        if input_tasks:
+            log.info("agent.shutdown.drain_input_tasks", count=len(input_tasks))
+            await asyncio.gather(*input_tasks, return_exceptions=True)
         await ledger.aclose()
 
 
@@ -245,10 +358,17 @@ def main() -> None:
     # The livekit-agents CLI reads LIVEKIT_URL / LIVEKIT_API_KEY /
     # LIVEKIT_API_SECRET directly from os.environ. Unlike the API (which
     # gets .env via pydantic-settings), the agent has no framework-level
-    # dotenv loader — load it here, anchored at the repo root. Explicit
-    # shell env wins over .env (override=False, pydantic-settings default).
+    # dotenv loader — load it here, anchored at the repo root.
+    #
+    # `override=True`: .env is authoritative for local dev. The default
+    # (shell wins) is the right call in production, but in this repo
+    # iteration on .env (e.g., switching whisper models) silently fails
+    # if a stale shell export still has the old value — exactly the
+    # kind of mid-debug confusion we want to avoid. In production the
+    # API uses pydantic-settings (which respects shell), so this only
+    # affects the dev agent worker.
     repo_root = Path(__file__).resolve().parents[3]
-    load_dotenv(repo_root / ".env", override=False)
+    load_dotenv(repo_root / ".env", override=True)
 
     # The Claude Code sandbox sets ALL_PROXY=socks5h://... for outbound
     # traffic, which aiohttp/httpx honour for *every* connection —
