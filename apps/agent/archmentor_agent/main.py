@@ -41,6 +41,7 @@ from livekit.agents import (
     cli,
 )
 
+from archmentor_agent.config import get_settings
 from archmentor_agent.ledger import LedgerClient, LedgerConfig
 
 AiState = Literal["speaking", "listening", "thinking"]
@@ -278,9 +279,12 @@ def prewarm(proc: JobProcess) -> None:
         WhisperCppSTT,
     )
 
-    whisper_model = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "large-v3")
-    tts_voice = os.environ.get("ARCHMENTOR_TTS_VOICE", "af_bella")
-    log.info("agent.prewarm.begin", whisper_model=whisper_model, tts_voice=tts_voice)
+    settings = get_settings()
+    log.info(
+        "agent.prewarm.begin",
+        whisper_model=settings.whisper_model,
+        tts_voice=settings.tts_voice,
+    )
     proc.userdata["vad"] = silero.VAD.load()
     # Construct + eagerly load the whisper model so the first live
     # utterance doesn't pay the cold-start cost. `preload()` was
@@ -412,11 +416,19 @@ def _session_id_from_ctx(ctx: JobContext) -> UUID:
 
 
 def _ledger_config() -> LedgerConfig:
-    base = os.environ.get("ARCHMENTOR_API_URL", "http://localhost:8000")
-    token = os.environ.get("ARCHMENTOR_AGENT_INGEST_TOKEN")
-    if not token:
-        raise RuntimeError("ARCHMENTOR_AGENT_INGEST_TOKEN is required")
-    return LedgerConfig(base_url=base, agent_token=token)
+    """Build the ledger client config from `Settings`.
+
+    Settings construction itself enforces presence + non-placeholder on
+    `agent_ingest_token`, so this function no longer raises directly —
+    `get_settings()` raises `pydantic.ValidationError` at import time
+    when the env var is missing. Tests that exercise the missing-token
+    failure mode now assert against `ValidationError`, not `RuntimeError`.
+    """
+    settings = get_settings()
+    return LedgerConfig(
+        base_url=settings.api_url,
+        agent_token=settings.agent_ingest_token.get_secret_value(),
+    )
 
 
 def main() -> None:

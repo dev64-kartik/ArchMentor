@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import os
 import threading
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
 import numpy as np
 import structlog
+
+from archmentor_agent.config import get_settings
 
 log = structlog.get_logger(__name__)
 
@@ -73,11 +74,12 @@ def _load_model() -> Any:
         except ImportError as exc:
             raise AudioExtrasMissingError() from exc
 
-        model_name = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "large-v3")
+        settings = get_settings()
+        model_name = settings.whisper_model
         # pywhispercpp defaults to `~/Library/Application Support/pywhispercpp`
         # which the Claude sandbox denies writes to. Route the model cache
         # to the repo-local `.model-cache/whisper/` (sandbox-writable).
-        models_dir = os.environ.get("ARCHMENTOR_WHISPER_DIR", ".model-cache/whisper")
+        models_dir = settings.whisper_dir
         from pathlib import Path
 
         Path(models_dir).mkdir(parents=True, exist_ok=True)
