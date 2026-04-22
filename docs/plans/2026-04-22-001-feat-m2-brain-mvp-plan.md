@@ -15,6 +15,8 @@ Replace M1's static turn-end acknowledgement with the real interview brain: a no
 
 Scope deliberately trimmed from the origin plan's M2 bullet list: Langfuse wiring, `POST /sessions`, streaming LLM→TTS, Haiku summary compression, and content-based phase transitions all defer to later milestones. M2 proves the brain loop end-to-end on the existing `/session/dev-test` flow.
 
+**Status:** ✅ All 10 units landed 2026-04-22 on `feat/m2-brain-mvp`.
+
 ## Execution Checkpoint
 
 Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
@@ -27,10 +29,10 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 | 4. Brain snapshot API + agent client | ✅ Done | `aee37b5` |
 | 5. Utterance queue + speech-check gate | ✅ Done | `be72d73` |
 | 6. Event router + coalescer (test-first) | ✅ Done | `2d74ae7` |
-| 7. Wire brain loop into `MentorAgent` | ⬜ Pending | — |
-| 8. Hinglish STT config + STT-errors clause | ⬜ Pending | — |
-| 9. `scripts/replay.py --snapshot` CLI | ⬜ Pending | — |
-| 10. Dev seed + smoke harness + CLAUDE.md | ⬜ Pending | — |
+| 7. Wire brain loop into `MentorAgent` | ✅ Done | `2a0f22e` |
+| 8. Hinglish STT config + STT-errors clause | ✅ Done | `f5951db` |
+| 9. `scripts/replay.py --snapshot` CLI | ✅ Done | `6d1cf6f` |
+| 10. Dev seed + smoke harness + CLAUDE.md | ✅ Done | this commit |
 
 **Test status at last update:** 235 passed / 1 deselected (the real-Redis integration test). All `ruff check`, `ruff format --check`, `ty check apps/api apps/agent`, and `pnpm -r lint/typecheck/test` pass. CI parity command from CLAUDE.md is green.
 

@@ -96,7 +96,7 @@ When adding dependencies, look up the current stable version — never assume fr
 
 ## Current milestone
 
-M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) ✅ done 2026-04-21 on `feat/m1-voice-loop` (PR #2), including live mic verification on Apple Silicon and a post-review hardening pass (commit `3ef2206`). **Next:** M2 — Claude Opus tool-use brain, event router with serialization gate, utterance queue, decisions log, Hinglish STT config.
+M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) ✅ done 2026-04-21. M2 (brain MVP + session persistence) ✅ landed 2026-04-22 on `feat/m2-brain-mvp` — Opus tool-use brain, serialized event router with coalescer, utterance queue + speech-check gate, Redis `SessionState` with no-TTL + CAS, `brain_snapshots` ingest route + replay CLI, Hinglish-friendly STT. See `docs/plans/2026-04-22-001-feat-m2-brain-mvp-plan.md` for the execution checkpoint and deferred work. **Next:** M3 — `POST /sessions`, Excalidraw canvas + canvas_change event priority, streaming LLM→TTS preamble.
 
 ### M1 audio extras + manual mic test
 
@@ -106,7 +106,15 @@ The agent ships Metal/MPS-only audio deps (`pywhispercpp`, `streaming-tts`) behi
 uv sync --all-packages --extra audio   # macOS only
 ```
 
-Use `/session/dev-test` (fixed room `session-dev-test`) to smoke-test the browser → LiveKit → agent path before M2 ships real session creation. See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` for the full M0…M6 breakdown.
+Use `/session/dev-test` (fixed room `session-dev-test`) to smoke-test the browser → LiveKit → agent path — M2 still runs through this route; `POST /sessions` lands in M3. See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` for the full M0…M6 breakdown and `docs/plans/2026-04-22-001-feat-m2-brain-mvp-plan.md` for the M2 execution checkpoint.
+
+After running `scripts/dev.sh` and `alembic upgrade head`, seed the dev problem + session:
+
+```bash
+uv run python scripts/seed_dev_session.py --email you@example.com
+```
+
+This writes the URL-shortener problem + rubric from `apps/agent/archmentor_agent/brain/bootstrap.py` to Postgres so the agent's in-memory `ProblemCard` matches the stored row byte-for-byte.
 
 ## Gotchas
 
@@ -124,3 +132,7 @@ Use `/session/dev-test` (fixed room `session-dev-test`) to smoke-test the browse
 - **`WhisperCppSTT._resample_to_whisper_rate` raises on empty output.** Never fall back to the original wrong-rate buffer — whisper turns it into fabricated transcripts.
 - **Model singletons use `threading.Lock`.** `audio/stt.py::_load_model` and `tts/kokoro.py::_load_engine` double-check-lock because they run on the default thread-pool executor. New singletons must follow the same pattern.
 - **`scripts/kill.sh` for full teardown.** `pkill -f archmentor_agent.main` misses the `multiprocessing.spawn` workers livekit-agents dispatches; `kill.sh` sweeps orphans by venv path + websocket fingerprint.
+- **Redis session keys have NO TTL by design.** `MentorAgent.shutdown()` calls `store.delete(session_id)` explicitly; a crashed worker leaves an orphan `session:<id>:state` key until M6's stale-session reaper. Manual cleanup: `redis-cli KEYS 'session:*:state' | xargs redis-cli DEL`.
+- **`cache_creation_input_tokens=0` on every M2 brain call is expected.** The static prefix (system.md + URL-shortener problem + rubric) is under Opus 4.x's ~4096-token cache-activation floor, so the `cache_control` marker is silently ignored. Not a bug — re-measure once M3+ rubrics pad the prefix.
+- **Dev ProblemCard is in two places deliberately.** `apps/agent/archmentor_agent/brain/bootstrap.py` defines the URL-shortener problem in-process (agent hands it to the brain at `on_enter`), and `scripts/seed_dev_session.py` writes the same strings to Postgres. Both read the same module constants — any edit must land in `bootstrap.py` and be followed by a re-seed. M3's `POST /sessions` replaces the in-process path with an API fetch.
+- **`scripts/replay.py --snapshot` requires BOTH API and agent env vars.** The script imports `archmentor_api.db.engine` (which reads `API_*`) and `archmentor_agent.brain.client` (which reads `ARCHMENTOR_*`). Tests under `apps/agent/tests/` seed both sets at module import.

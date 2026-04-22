@@ -33,6 +33,14 @@ import argparse
 from uuid import UUID
 
 import archmentor_api.models  # noqa: F401 — register tables on metadata
+from archmentor_agent.brain.bootstrap import (
+    DEV_PROBLEM_RUBRIC_YAML,
+    DEV_PROBLEM_SLUG,
+    DEV_PROBLEM_STATEMENT_MD,
+    DEV_PROBLEM_TITLE,
+    DEV_PROBLEM_VERSION,
+    DEV_PROMPT_VERSION,
+)
 from archmentor_api.config import get_settings
 from archmentor_api.db import engine
 from archmentor_api.models.problem import Problem
@@ -45,7 +53,6 @@ from sqlmodel import Session, select
 DEV_USER_ID = UUID("000000000000000000000000000000aa")
 DEV_USER_EMAIL = "dev@archmentor.local"
 DEV_SESSION_ID = UUID("00000000-0000-0000-0000-000000000001")
-DEV_PROBLEM_SLUG = "dev-test"
 DEV_ROOM = f"session-{DEV_SESSION_ID}"
 
 
@@ -109,15 +116,25 @@ def main() -> None:
         if problem is None:
             problem = Problem(
                 slug=DEV_PROBLEM_SLUG,
-                title="Dev-only smoke test problem",
-                statement_md="# Smoke test\n\nSay anything — this problem exists only so the "
-                "M1 voice loop has a session row to append events against.",
-                difficulty="easy",
-                rubric_yaml="dimensions: []",
-                ideal_solution_md="(n/a)",
+                version=DEV_PROBLEM_VERSION,
+                title=DEV_PROBLEM_TITLE,
+                statement_md=DEV_PROBLEM_STATEMENT_MD,
+                difficulty="medium",
+                rubric_yaml=DEV_PROBLEM_RUBRIC_YAML,
+                ideal_solution_md=(
+                    "(deferred to M5 — M2 exercises the brain loop on the statement + rubric alone)"
+                ),
                 seniority_calibration_json={},
             )
             db.add(problem)
+        else:
+            # Keep Postgres content in lock-step with brain/bootstrap.py
+            # so the agent's in-memory ProblemCard and the stored row
+            # can't silently drift between re-seeds.
+            problem.version = DEV_PROBLEM_VERSION
+            problem.title = DEV_PROBLEM_TITLE
+            problem.statement_md = DEV_PROBLEM_STATEMENT_MD
+            problem.rubric_yaml = DEV_PROBLEM_RUBRIC_YAML
         db.flush()
 
         session_row = db.get(InterviewSession, DEV_SESSION_ID)
@@ -129,7 +146,7 @@ def main() -> None:
                 problem_version=problem.version,
                 status=SessionStatus.ACTIVE,
                 livekit_room=DEV_ROOM,
-                prompt_version="m1-dev",
+                prompt_version=DEV_PROMPT_VERSION,
             )
             db.add(session_row)
         else:
@@ -138,11 +155,15 @@ def main() -> None:
             session_row.user_id = user.id
             session_row.status = SessionStatus.ACTIVE
             session_row.livekit_room = DEV_ROOM
+            session_row.problem_version = problem.version
+            session_row.prompt_version = DEV_PROMPT_VERSION
 
         db.commit()
 
     print(  # noqa: T201
-        f"seeded dev session {DEV_SESSION_ID} (room {DEV_ROOM}, owner {owner_id} <{owner_email}>)"
+        f"seeded dev session {DEV_SESSION_ID} "
+        f"(room {DEV_ROOM}, owner {owner_id} <{owner_email}>, "
+        f"problem {DEV_PROBLEM_SLUG!r} v{DEV_PROBLEM_VERSION} — {DEV_PROBLEM_TITLE})"
     )
 
 
