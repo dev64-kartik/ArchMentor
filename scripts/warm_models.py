@@ -87,6 +87,24 @@ def _ensure_whisper() -> None:
     # full download/init cost.
     model_name = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "large-v3")
 
+    # Regression guard: if the agent's Settings default drifts from the
+    # warm-up script's default, the prewarm silently stages the wrong
+    # weights and the first live turn re-downloads ~2GB. Cross-check
+    # once here so the mismatch surfaces at warm-up time, not mid-call.
+    try:
+        from archmentor_agent.config import Settings  # type: ignore[import-not-found]
+
+        agent_default = Settings.model_fields["whisper_model"].default
+    except ImportError:
+        agent_default = None
+    if agent_default is not None and agent_default != model_name:
+        print(
+            f"[warm] ! whisper model drift: script={model_name!r} agent default={agent_default!r}. "
+            "Export ARCHMENTOR_WHISPER_MODEL to match, or re-sync the defaults.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     candidates = [
         models_dir / f"ggml-{model_name}.bin",
         models_dir / f"{model_name}.bin",

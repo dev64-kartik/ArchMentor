@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -118,6 +119,156 @@ def test_run_inference_normalizes_quiet_input_up_to_target() -> None:
     # Post-normalization RMS should be close to the target (allow a
     # small tolerance for clipping and float noise).
     assert boosted_rms == pytest.approx(stt._NORMALIZE_TARGET_RMS, rel=0.05)
+
+
+def _capture_call(captured: list[dict[str, object]]) -> Any:
+    """Return a `transcribe` fake that records each call's kwargs + samples."""
+
+    def _capture(samples: np.ndarray, **kwargs: object) -> list[object]:
+        captured.append({"samples_size": int(samples.size), **kwargs})
+        return []
+
+    return _capture
+
+
+def test_run_inference_does_not_pin_language_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hinglish M2 change — `language=` must not be passed on the default call.
+
+    Pinning English forces multilingual whisper to decode every buffer
+    as English, which garbles romanized Hindi connectors (`matlab`,
+    `yaani`). The brain's `[STT errors]` prompt clause interprets
+    mis-heard switches in context instead.
+    """
+    _disable_hinglish_fallback(monkeypatch)
+    captured: list[dict[str, object]] = []
+    fake_model = SimpleNamespace(
+        transcribe=_capture_call(captured),
+        language=None,
+    )
+    with patch.object(stt, "_load_model", return_value=fake_model):
+        stt._run_inference(_speech_buffer())
+
+    assert captured, "whisper.transcribe should have been called"
+    assert "language" not in captured[0], "English pin must be removed for Hinglish"
+
+
+def test_initial_prompt_mentions_hinglish_without_vocab_list() -> None:
+    """The initial_prompt sets register (Hinglish switch) not vocab."""
+    text = stt._WHISPER_INITIAL_PROMPT.lower()
+    assert "romanized hindi" in text or "hinglish" in text
+    # Must stay well under whisper's 224-token cap (rough byte proxy).
+    assert len(stt._WHISPER_INITIAL_PROMPT.encode("utf-8")) < 600
+
+
+def _disable_hinglish_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force `Settings.hinglish_fallback=False` for fallback-free tests."""
+    from archmentor_agent.config import Settings, reset_settings_cache
+
+    monkeypatch.setenv("ARCHMENTOR_HINGLISH_FALLBACK", "false")
+    from pydantic_settings import SettingsConfigDict
+
+    config_no_env_file = SettingsConfigDict(**{**Settings.model_config, "env_file": None})
+    monkeypatch.setattr(Settings, "model_config", config_no_env_file)
+    reset_settings_cache()
+
+
+def _enable_hinglish_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from archmentor_agent.config import Settings, reset_settings_cache
+
+    monkeypatch.setenv("ARCHMENTOR_HINGLISH_FALLBACK", "true")
+    from pydantic_settings import SettingsConfigDict
+
+    config_no_env_file = SettingsConfigDict(**{**Settings.model_config, "env_file": None})
+    monkeypatch.setattr(Settings, "model_config", config_no_env_file)
+    reset_settings_cache()
+
+
+def test_hinglish_fallback_retries_short_buffer_mis_detected_as_welsh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_hinglish_fallback(monkeypatch)
+    captured: list[dict[str, object]] = []
+
+    def _first_call_welsh(*_a: object, **kwargs: object) -> list[object]:
+        # Record the call, then flip `model.language` to simulate
+        # whisper.cpp auto-detecting Welsh on this short Indian-accented buffer.
+        captured.append({"pass": 1, **kwargs})
+        fake_model.language = "cy"  # Welsh
+        return []
+
+    def _second_call_english(*_a: object, **kwargs: object) -> list[object]:
+        captured.append({"pass": 2, **kwargs})
+        return [SimpleNamespace(text="cascading", t0=0, t1=150)]
+
+    class _ToggleModel:
+        def __init__(self) -> None:
+            self.language: str | None = None
+            self._first = True
+
+        def transcribe(self, samples: np.ndarray, **kwargs: object) -> list[object]:
+            if self._first:
+                self._first = False
+                return _first_call_welsh(samples, **kwargs)
+            return _second_call_english(samples, **kwargs)
+
+    fake_model: Any = _ToggleModel()
+
+    # ~1 second buffer (well under the 3s threshold).
+    short = _speech_buffer(size=16_000)
+    with patch.object(stt, "_load_model", return_value=fake_model):
+        segments = stt._run_inference(short)
+
+    assert len(captured) == 2
+    assert captured[0].get("language") is None, "default call must not pin language"
+    assert captured[1].get("language") == "en", "fallback retry pins English"
+    assert segments, "fallback retry should produce segments"
+    assert segments[0]["text"] == "cascading"
+
+
+def test_hinglish_fallback_skips_long_buffers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Longer utterances stay auto-detected even when flagged as exotic.
+
+    A deliberate multi-second Hindi switch is far more plausible than a
+    mis-detect on a long buffer, so we don't second-guess the model.
+    """
+    _enable_hinglish_fallback(monkeypatch)
+    captured: list[dict[str, object]] = []
+
+    class _Model:
+        language = "cy"  # mis-detected, but buffer is long
+
+        def transcribe(self, samples: np.ndarray, **kwargs: object) -> list[object]:
+            captured.append({"samples_size": int(samples.size), **kwargs})
+            return []
+
+    fake_model: Any = _Model()
+
+    # 5 seconds — beyond the 3s fallback ceiling.
+    long_buffer = _speech_buffer(size=5 * 16_000)
+    with patch.object(stt, "_load_model", return_value=fake_model):
+        stt._run_inference(long_buffer)
+
+    assert len(captured) == 1  # no retry
+
+
+def test_hinglish_fallback_disabled_by_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    _disable_hinglish_fallback(monkeypatch)
+    captured: list[dict[str, object]] = []
+
+    class _Model:
+        language = "cy"
+
+        def transcribe(self, samples: np.ndarray, **kwargs: object) -> list[object]:
+            captured.append({"samples_size": int(samples.size), **kwargs})
+            return []
+
+    fake_model: Any = _Model()
+    with patch.object(stt, "_load_model", return_value=fake_model):
+        stt._run_inference(_speech_buffer(size=16_000))
+
+    assert len(captured) == 1  # fallback gated off → no retry
 
 
 def test_run_inference_gain_is_capped_for_near_silent_input() -> None:
