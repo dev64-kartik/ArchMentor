@@ -24,7 +24,7 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 | 1. Agent `Settings` module | ✅ Done | `5a37d7b` |
 | 2. Redis session state store | ✅ Done | `a87d799` |
 | 3. Brain client (Anthropic tool-use + jsonschema) | ✅ Done | `04a4dc9` |
-| 4. Brain snapshot API + agent client | ⬜ Pending | — |
+| 4. Brain snapshot API + agent client | ✅ Done | pending commit |
 | 5. Utterance queue + speech-check gate | ⬜ Pending | — |
 | 6. Event router + coalescer (test-first) | ⬜ Pending | — |
 | 7. Wire brain loop into `MentorAgent` | ⬜ Pending | — |
@@ -32,7 +32,7 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 | 9. `scripts/replay.py --snapshot` CLI | ⬜ Pending | — |
 | 10. Dev seed + smoke harness + CLAUDE.md | ⬜ Pending | — |
 
-**Test status at last update:** 179 passed / 1 deselected (the real-Redis integration test). All `ruff check`, `ruff format --check`, `ty check apps/api apps/agent`, and `pnpm -r lint/typecheck/test` pass. CI parity command from CLAUDE.md is green.
+**Test status at last update:** 195 passed / 1 deselected (the real-Redis integration test). All `ruff check`, `ruff format --check`, `ty check apps/api apps/agent`, and `pnpm -r lint/typecheck/test` pass. CI parity command from CLAUDE.md is green.
 
 **Resolved during execution that's worth remembering for the rest of M2:**
 - Both `apps/api/tests/__init__.py` and `apps/agent/tests/__init__.py` make pytest treat conftests as `tests.conftest` and collide. Agent conftest now lives at `apps/agent/conftest.py` (one level up); pytest still discovers it for tests under `apps/agent/tests/` because conftest discovery walks upward.
@@ -432,7 +432,7 @@ on_turn_end:
 
 ---
 
-- [ ] **Unit 4: Brain snapshot API endpoint + agent client**
+- [x] **Unit 4: Brain snapshot API endpoint + agent client** — landed 2026-04-22 on `feat/m2-brain-mvp`. Notes: `/sessions/{id}/snapshots` factors `_require_active_session` with the events route; byte cap is summed across the four JSON blobs + reasoning text (256 KiB total) so an adversarial agent can't split a DoS payload across fields. `SnapshotClient` is a structural copy of `LedgerClient` (same retry/backoff, same 4xx-drop, same fire-and-forget). 16 new tests.
 
 **Goal:** Ship `POST /sessions/{id}/snapshots` on the API and a matching agent-side client so every brain call writes one `brain_snapshots` row.
 
