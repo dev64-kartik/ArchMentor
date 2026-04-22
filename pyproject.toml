@@ -72,4 +72,9 @@ asyncio_mode = "auto"
 testpaths = ["tests", "apps/api/tests", "apps/agent/tests"]
 # `importlib` mode lets each app's `tests/` live independently without
 # colliding on the shared `tests` package name when pytest runs from root.
-addopts = "--import-mode=importlib"
+# `-m "not integration"` keeps CI green without a docker-compose Redis;
+# integration tests opt in via `pytest -m integration`.
+addopts = "--import-mode=importlib -m 'not integration'"
+markers = [
+    "integration: requires the docker-compose stack (Redis, Postgres) — opt in with -m integration",
+]
