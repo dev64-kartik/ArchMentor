@@ -15,6 +15,30 @@ Replace M1's static turn-end acknowledgement with the real interview brain: a no
 
 Scope deliberately trimmed from the origin plan's M2 bullet list: Langfuse wiring, `POST /sessions`, streaming LLM→TTS, Haiku summary compression, and content-based phase transitions all defer to later milestones. M2 proves the brain loop end-to-end on the existing `/session/dev-test` flow.
 
+## Execution Checkpoint
+
+Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
+
+| Unit | Status | Commit |
+|------|--------|--------|
+| 1. Agent `Settings` module | ✅ Done | `5a37d7b` |
+| 2. Redis session state store | ✅ Done | `a87d799` |
+| 3. Brain client (Anthropic tool-use + jsonschema) | 🔜 In progress | — |
+| 4. Brain snapshot API + agent client | ⬜ Pending | — |
+| 5. Utterance queue + speech-check gate | ⬜ Pending | — |
+| 6. Event router + coalescer (test-first) | ⬜ Pending | — |
+| 7. Wire brain loop into `MentorAgent` | ⬜ Pending | — |
+| 8. Hinglish STT config + STT-errors clause | ⬜ Pending | — |
+| 9. `scripts/replay.py --snapshot` CLI | ⬜ Pending | — |
+| 10. Dev seed + smoke harness + CLAUDE.md | ⬜ Pending | — |
+
+**Test status at last update:** 127 passed / 1 deselected (the real-Redis integration test). All `ruff check`, `ruff format --check`, and `ty check apps/api apps/agent` pass. CI parity command from CLAUDE.md is green.
+
+**Resolved during execution that's worth remembering for the rest of M2:**
+- Both `apps/api/tests/__init__.py` and `apps/agent/tests/__init__.py` make pytest treat conftests as `tests.conftest` and collide. Agent conftest now lives at `apps/agent/conftest.py` (one level up); pytest still discovers it for tests under `apps/agent/tests/` because conftest discovery walks upward.
+- The dev `.env` interferes with `monkeypatch.delenv` and source-default assertions because pydantic-settings re-reads `.env` after env-var deletions. Tests bypass this by replacing `Settings.model_config` with a copy that has `env_file=None`. New unit tests should follow the same pattern (`apps/agent/tests/test_settings.py::_isolated_env`).
+- Root `pyproject.toml` `[tool.pytest.ini_options]` now defaults to `-m "not integration"` so the integration marker registered in unit 2 is opt-in. Integration tests added in later units must use `@pytest.mark.integration` to stay out of the default CI run.
+
 ## Problem Frame
 
 M1 shipped a working voice loop (mic → VAD → whisper.cpp → static ack → Kokoro → LiveKit) but no mentor. The mentor product *is* Opus-level reasoning; every other milestone assumes this one works. M2's success criterion is narrow and visible: a 5-minute session on the seeded problem where the brain interrupts at a factual error, stays silent through valid reasoning, persists state, and survives replay. Everything else (phase machine, counter-argument steelmans, canvas, reports) builds on top.
@@ -262,7 +286,7 @@ on_turn_end:
 
 ## Implementation Units
 
-- [ ] **Unit 1: Agent `Settings` module**
+- [x] **Unit 1: Agent `Settings` module** — landed 2026-04-22 on `feat/m2-brain-mvp` (commit `5a37d7b`).
 
 **Goal:** Consolidate env-var reads into one `pydantic-settings`-backed `Settings` singleton so brain/redis/ledger can all share configuration validation.
 
@@ -303,7 +327,7 @@ on_turn_end:
 
 ---
 
-- [ ] **Unit 2: Redis session state store**
+- [x] **Unit 2: Redis session state store** — landed 2026-04-22 on `feat/m2-brain-mvp` (commit `a87d799`). Notes: `fakeredis>=2.33` pinned (resolved to 2.35.1); the real-Redis WATCH/MULTI fidelity test is gated by `@pytest.mark.integration` and the root `pyproject.toml` deselects integration markers by default so CI stays green.
 
 **Goal:** Flesh out `state/redis_store.py` with atomic load / atomic update / explicit cleanup of `SessionState`, with no TTL on session keys.
 
