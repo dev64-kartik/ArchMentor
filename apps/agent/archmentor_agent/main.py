@@ -1,17 +1,25 @@
 """LiveKit agent worker entrypoint.
 
-Responsibilities in M1:
+Responsibilities in M2:
 - Join the LiveKit room dispatched to this worker.
 - Speak a static opening line via `session.say()`.
 - Detect candidate turn-ends via the framework's built-in VAD + STT.
-- Append `utterance_candidate` / `utterance_ai` events to the control-
-  plane event ledger over HTTP.
+- Initialize `SessionState` in Redis and dispatch every `turn_end` to
+  the event router (`EventRouter.handle`). The router coalesces
+  concurrent events, runs Anthropic tool-use via `BrainClient`, writes
+  a snapshot to Postgres, and pushes any `speak` utterance to the
+  queue. `handle_user_input` waits for the dispatch to finish then
+  drains the utterance queue to TTS under the speech-check gate.
+- Carry forward M1's append-only ledger writes (candidate utterance,
+  AI utterance, brain-decision events) — all still fire-and-forget.
 - Keep pre-VAD noise gating in-path so keyboard/trackpad clicks don't
   fire false turn-ends.
 
-Brain wiring (tool-use brain, phase state, counter-argument, etc.)
-lands in M2. For now the agent responds with a static acknowledgement
-at each turn-end — enough to prove the voice loop end-to-end.
+`settings.brain_enabled = False` preserves the M1 static-ack path so
+STT/TTS iteration isn't held hostage by a broken Anthropic key. The
+branch lives in `_run_turn`; the brain components are built only when
+enabled to avoid construction overhead + failed validations on the
+cold path.
 
 Audio deps (`pywhispercpp`, `streaming-tts`) are optional; this module
 imports cleanly in CI where those wheels aren't installed. The import
@@ -21,11 +29,13 @@ of the real STT/TTS adapters happens only when `entrypoint` is called.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 import structlog
@@ -41,11 +51,28 @@ from livekit.agents import (
     cli,
 )
 
+from archmentor_agent.brain.bootstrap import (
+    DEV_PROMPT_VERSION,
+    build_dev_problem_card,
+)
+from archmentor_agent.brain.client import BrainClient
 from archmentor_agent.config import get_settings
+from archmentor_agent.events.router import EventRouter
+from archmentor_agent.events.types import EventType, RouterEvent
 from archmentor_agent.ledger import LedgerClient, LedgerConfig
+from archmentor_agent.queue import SpeechCheckGate, UtteranceQueue
+from archmentor_agent.snapshots.client import SnapshotClient, SnapshotClientConfig
+from archmentor_agent.state.redis_store import RedisSessionStore
+from archmentor_agent.state.session_state import (
+    PendingUtterance,
+    SessionState,
+)
 
 AiState = Literal["speaking", "listening", "thinking"]
 AI_STATE_TOPIC = "ai_state"
+
+# Default 45-minute session budget, mirrors `InterviewSession.duration_s_planned`.
+_DEFAULT_SESSION_SECONDS = 2700
 
 
 class _UserInputEvent(Protocol):
@@ -111,18 +138,82 @@ def _is_whisper_hallucination(text: str) -> bool:
     return any(phrase in stripped for phrase in _HALLUCINATION_PHRASES)
 
 
-class MentorAgent(Agent):
-    """Minimal agent: logs transcripts, acknowledges turn-ends (M1).
+class _BrainWiring:
+    """Bundle of per-session brain collaborators.
 
-    The real interviewer brain (Opus tool-use, phase-aware, rubric-
-    anchored) replaces the static acknowledgement in M2.
+    Grouping them here keeps `MentorAgent.__init__` readable and gives
+    tests one seam to override all of them (or swap individual
+    components) rather than threading six kwargs through every test.
     """
 
-    def __init__(self, *, session_id: UUID, ledger: LedgerClient, room: rtc.Room) -> None:
-        super().__init__(instructions="You acknowledge candidate turns while M2 wires the brain.")
+    def __init__(
+        self,
+        *,
+        brain: BrainClient,
+        store: RedisSessionStore,
+        snapshot_client: SnapshotClient,
+        router: EventRouter,
+        queue: UtteranceQueue,
+        gate: SpeechCheckGate,
+    ) -> None:
+        self.brain = brain
+        self.store = store
+        self.snapshot_client = snapshot_client
+        self.router = router
+        self.queue = queue
+        self.gate = gate
+
+
+def build_initial_session_state(
+    *,
+    cost_cap_usd: float,
+    prompt_version: str = DEV_PROMPT_VERSION,
+    now: datetime | None = None,
+) -> SessionState:
+    """Assemble the `SessionState` the brain starts from on `on_enter`.
+
+    Split out so Unit 7's integration tests can build a seed state
+    without invoking the full entrypoint. The ProblemCard comes from
+    `brain.bootstrap` until M3 lands a bootstrap API route.
+    """
+    return SessionState(
+        problem=build_dev_problem_card(),
+        system_prompt_version=prompt_version,
+        started_at=now or datetime.now(UTC),
+        elapsed_s=0,
+        remaining_s=_DEFAULT_SESSION_SECONDS,
+        cost_cap_usd=cost_cap_usd,
+    )
+
+
+class MentorAgent(Agent):
+    """Voice-loop agent with M2's tool-use brain wiring.
+
+    The M1 static-ack path (`TURN_ACK_UTTERANCE`) is preserved as an
+    explicit fallback when `settings.brain_enabled=False` so STT/TTS
+    iteration isn't blocked by a broken Anthropic key or quota.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_id: UUID,
+        ledger: LedgerClient,
+        room: rtc.Room,
+        brain_enabled: bool,
+        brain: _BrainWiring | None,
+    ) -> None:
+        super().__init__(
+            instructions=(
+                "You are ArchMentor's interview coordinator. The brain "
+                "pipeline makes all speaking decisions via tool-use."
+            )
+        )
         self._session_id = session_id
         self._ledger = ledger
         self._room = room
+        self._brain_enabled = brain_enabled
+        self._brain = brain
         self._t0_ms: int | None = None
         # Set once the opening utterance has finished playing. The
         # framework refuses follow-up `session.say()` while the agent
@@ -135,6 +226,26 @@ class MentorAgent(Agent):
         # finally block drains this set before closing the HTTP client
         # so in-flight writes don't get cut off mid-request.
         self._ledger_tasks: set[asyncio.Task[bool]] = set()
+        # Same discipline for brain-snapshot POSTs. Kept separate so the
+        # drain order (snapshots after router.drain, before client
+        # aclose) is explicit in `entrypoint`.
+        self._snapshot_tasks: set[asyncio.Task[bool]] = set()
+
+    def attach_brain(self, wiring: _BrainWiring) -> None:
+        """Inject the brain collaborators after construction.
+
+        Separate from `__init__` because `build_brain_wiring` needs a
+        constructed agent to bind its `schedule_snapshot` / `log_event`
+        methods as callbacks. The pattern is: construct the agent,
+        build the wiring with it, attach. Tests that exercise the
+        kill-switch path skip this step entirely — `_brain` stays None.
+        """
+        if not self._brain_enabled:
+            raise RuntimeError(
+                "attach_brain called but brain_enabled=False — "
+                "the static-ack path does not consume brain wiring."
+            )
+        self._brain = wiring
 
     async def on_enter(self) -> None:
         log.info("agent.on_enter.begin", session_id=str(self._session_id))
@@ -145,6 +256,7 @@ class MentorAgent(Agent):
         # the session is alive and connected but effectively deaf.
         # Surface the error, then unblock STT in `finally`.
         try:
+            await self._initialize_brain_state()
             await self._publish_state("speaking")
             log.info("agent.opening.say.begin", text=OPENING_UTTERANCE)
             handle = self.session.say(OPENING_UTTERANCE)
@@ -170,37 +282,202 @@ class MentorAgent(Agent):
             self.opening_complete.set()
             log.info("agent.on_enter.end")
 
-    async def handle_user_input(self, text: str) -> None:
-        """Called from the session's `user_input_transcribed` event.
+    async def _initialize_brain_state(self) -> None:
+        """Seed Redis with a fresh SessionState for this session.
 
-        `on_user_turn_completed` only fires when an LLM is wired into
-        the session — we deliberately skip the LLM in M1 so the brain
-        slot stays clean for M2. Listening to the STT-level transcript
-        event lets us drive TTS acknowledgements without a model in the
-        middle.
+        Skipped when the brain is disabled — the M1 fallback path has
+        no session-state consumer so a Redis round-trip would be wasted
+        (and fail if Redis isn't running, which is a valid M1-only
+        dev configuration).
+        """
+        if not self._brain_enabled or self._brain is None:
+            return
+        state = build_initial_session_state(
+            # M2 reads cost cap from `Settings.cost_cap_usd` if/when we
+            # add it; until then the SessionState default (5.0) is the
+            # intended ceiling — matches the API's
+            # `InterviewSession.cost_cap_usd` column default.
+            cost_cap_usd=5.0,
+        )
+        await self._brain.store.put(self._session_id, state)
+        log.info(
+            "agent.state.seeded",
+            session_id=str(self._session_id),
+            problem_slug=state.problem.slug,
+            cost_cap_usd=state.cost_cap_usd,
+        )
+
+    async def handle_user_input(self, text: str) -> None:
+        """Called from the session's `user_input_transcribed` final event.
+
+        Hallucination filter + ledger write + state="thinking" are
+        shared; the brain dispatch runs when `brain_enabled`, otherwise
+        the M1 static-ack path runs. Never raises: voice-loop errors
+        degrade to silence, not session death.
         """
         if _is_whisper_hallucination(text):
             log.info("agent.user_input.dropped_hallucination", text=text)
             return
+
+        turn_t_ms = self._now_relative_ms()
+        self._log("utterance_candidate", {"text": text, "speaker": "candidate"})
+
+        if not self._brain_enabled or self._brain is None:
+            await self._run_static_ack_turn()
+            return
+
+        await self._run_brain_turn(text=text, turn_t_ms=turn_t_ms)
+
+    async def _run_static_ack_turn(self) -> None:
+        """M1 fallback — speak the fixed acknowledgement.
+
+        Kept as an explicit branch (not a log-only stub) so the kill
+        switch survives a broken Anthropic key. The wiring tests flip
+        `brain_enabled` between cases to cover both paths.
+        """
         await self._publish_state("thinking")
-        self._log(
-            "utterance_candidate",
-            {"text": text, "speaker": "candidate"},
-        )
         log.info("agent.ack.begin", ack=TURN_ACK_UTTERANCE)
         await self._publish_state("speaking")
         try:
-            await self.session.say(TURN_ACK_UTTERANCE)
+            await self._say(TURN_ACK_UTTERANCE)
         except RuntimeError as exc:
-            # Tab close / disconnect races the session teardown. Don't
-            # raise, just log and drop the ack — the candidate utterance
-            # is already in the ledger.
+            # Tab close / disconnect races the session teardown.
             log.warning("agent.say_skipped", reason=str(exc))
             await self._publish_state("listening")
             return
         log.info("agent.ack.end")
         self._log("utterance_ai", {"text": TURN_ACK_UTTERANCE, "speaker": "ai"})
         await self._publish_state("listening")
+
+    async def _run_brain_turn(self, *, text: str, turn_t_ms: int) -> None:
+        """Brain path: dispatch to router, wait for decision, speak if any."""
+        assert self._brain is not None  # narrowed by caller
+        brain = self._brain
+
+        # The interim handler already flipped the gate to "done
+        # speaking" when the final arrived; we mirror that explicitly
+        # here in case the final came in without a matching interim
+        # (whisper sometimes skips interims on short buffers).
+        brain.gate.mark_done_speaking()
+
+        await self._publish_state("thinking")
+
+        event = RouterEvent(
+            type=EventType.TURN_END,
+            t_ms=turn_t_ms,
+            payload={"text": text},
+        )
+        try:
+            await brain.router.handle(event)
+        except NotImplementedError:
+            # canvas_change is the only type that raises at M2; turn_end
+            # never should. If this fires it's a type-system regression
+            # — log and fall through to listening.
+            log.exception("agent.router.unexpected_not_implemented")
+            await self._publish_state("listening")
+            return
+
+        # Let the dispatch loop run the Anthropic call + snapshot post
+        # + queue push. `wait_for_idle` does NOT clear pending, so it
+        # picks up anything that lands during the wait too.
+        try:
+            await brain.router.wait_for_idle()
+        except asyncio.CancelledError:
+            # The router's dispatch may be cancelled by an interim
+            # transcript (barge-in). Propagate so the caller task
+            # unwinds cleanly; another turn_end will re-dispatch.
+            raise
+
+        await self._drain_utterance_queue()
+
+    async def _drain_utterance_queue(self) -> None:
+        """Pop the next fresh utterance and speak it.
+
+        Only one utterance per pause — a single call to `session.say`
+        per `handle_user_input` invocation. The speech-check gate
+        isn't consulted on the turn_end path because a final transcript
+        already *is* the "candidate is done" signal; barge-in races
+        during the brain call are handled via `cancel_in_flight` from
+        the interim handler, not here. The gate becomes load-bearing
+        in M3+ when `long_silence` and `canvas_change` events can push
+        utterances outside a natural turn-end.
+        """
+        assert self._brain is not None
+        brain = self._brain
+
+        utterance = brain.queue.pop_if_fresh()
+        if utterance is None:
+            await self._publish_state("listening")
+            return
+
+        await self._publish_state("speaking")
+        try:
+            await self._say(utterance.text)
+        except RuntimeError as exc:
+            log.warning("agent.say_skipped", reason=str(exc))
+            await self._publish_state("listening")
+            return
+        self._log("utterance_ai", {"text": utterance.text, "speaker": "ai"})
+        await self._publish_state("listening")
+
+    async def _say(self, text: str) -> None:
+        """TTS hand-off seam.
+
+        Production calls `self.session.say(text)`. Tests override this
+        method to record the utterance without needing an active
+        `AgentSession` (the base class's `session` property raises
+        "agent is not running" without a live activity context).
+        """
+        await self.session.say(text)
+
+    async def handle_interim_transcript(self, text: str) -> None:
+        """Mark the gate + cancel any in-flight brain call (barge-in).
+
+        Called from the `user_input_transcribed` handler whenever
+        `is_final=False`. No-op when the brain is disabled — the
+        static-ack path doesn't care whether the candidate is
+        mid-sentence.
+        """
+        if not self._brain_enabled or self._brain is None:
+            return
+        self._brain.gate.mark_speaking()
+        log.info("agent.interim.cancel_in_flight", text_preview=text[:40])
+        await self._brain.router.cancel_in_flight()
+
+    async def shutdown(self) -> None:
+        """Graceful teardown — finish in-flight work, then clean up.
+
+        Order matters (plan Unit 7 "Shutdown drain ordering"):
+        router.drain() finishes the current dispatch and drops pending;
+        `_snapshot_tasks` drains post-dispatch snapshot POSTs;
+        `_ledger_tasks` drains everything else; `store.delete` removes
+        the no-TTL session key; client aclose() frees HTTP pools.
+        """
+        if self._brain_enabled and self._brain is not None:
+            log.info("agent.shutdown.router_drain.begin")
+            await self._brain.router.drain()
+            log.info("agent.shutdown.router_drain.end")
+            if self._snapshot_tasks:
+                log.info(
+                    "agent.shutdown.drain_snapshot_tasks",
+                    count=len(self._snapshot_tasks),
+                )
+                await asyncio.gather(*self._snapshot_tasks, return_exceptions=True)
+
+        if self._ledger_tasks:
+            log.info(
+                "agent.shutdown.drain_ledger_tasks",
+                count=len(self._ledger_tasks),
+            )
+            await asyncio.gather(*self._ledger_tasks, return_exceptions=True)
+
+        if self._brain_enabled and self._brain is not None:
+            # Explicit cleanup — Redis session keys have no TTL.
+            # A crashed worker leaves an orphan key until M6's stale-
+            # session reaper; surface the delete here in logs so its
+            # absence is visible during teardown debugging.
+            with contextlib.suppress(Exception):
+                await self._brain.store.delete(self._session_id)
 
     async def _publish_state(self, state: AiState) -> None:
         """Tell the browser which phase the agent is in.
@@ -249,6 +526,38 @@ class MentorAgent(Agent):
         self._ledger_tasks.add(task)
         task.add_done_callback(self._ledger_tasks.discard)
 
+    def schedule_snapshot(self, coro: Any) -> None:
+        """Router-side callback — schedule a snapshot POST + track it.
+
+        The router calls this synchronously from its dispatch loop; we
+        wrap the coroutine in a task so the dispatch doesn't block on
+        the POST, and retain the task so `shutdown()` can drain it.
+        """
+        task = asyncio.create_task(coro)
+        self._snapshot_tasks.add(task)
+        task.add_done_callback(self._snapshot_tasks.discard)
+
+    def log_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Router → ledger shim.
+
+        The router's `LedgerLogger` protocol passes `dict[str, Any]`;
+        `_log` accepts the wider `dict[str, object]`. Exposing the shim
+        keeps the type narrowing explicit at the call site rather than
+        pushing `cast(...)` into production code.
+        """
+        self._log(event_type, dict(payload))
+
+    @property
+    def session_id(self) -> UUID:
+        """Read-only session id for the brain wiring helper."""
+        return self._session_id
+
+    def now_relative_ms(self) -> int:
+        """Public alias of `_now_relative_ms` so the router closures keep
+        bindings that don't start with an underscore (ty's "private from
+        outside module" diagnostic fires otherwise)."""
+        return self._now_relative_ms()
+
     def _now_relative_ms(self) -> int:
         """Milliseconds since session start, clamped to a non-negative int.
 
@@ -259,6 +568,46 @@ class MentorAgent(Agent):
         if self._t0_ms is None:
             return 0
         return max(0, int(time.monotonic() * 1000) - self._t0_ms)
+
+
+def build_brain_wiring(
+    agent: MentorAgent,
+    *,
+    brain: BrainClient,
+    store: RedisSessionStore,
+    snapshot_client: SnapshotClient,
+) -> _BrainWiring:
+    """Construct the per-session brain collaborators.
+
+    Separated from `entrypoint` so tests can assemble the same wiring
+    against fakes without duplicating router construction. The
+    singleton `BrainClient` and `RedisSessionStore` are passed in
+    rather than fetched here — tests can pass mock implementations,
+    and production's `entrypoint` resolves them via the `get_*`
+    helpers before calling.
+    """
+    queue = UtteranceQueue(agent.now_relative_ms)
+    gate = SpeechCheckGate(agent.now_relative_ms)
+
+    router = EventRouter(
+        session_id=agent.session_id,
+        brain=brain,
+        store=store,
+        snapshot_client=snapshot_client,
+        snapshot_scheduler=agent.schedule_snapshot,
+        utterance_queue=queue,
+        gate=gate,
+        log_event=agent.log_event,
+        now_ms=agent.now_relative_ms,
+    )
+    return _BrainWiring(
+        brain=brain,
+        store=store,
+        snapshot_client=snapshot_client,
+        router=router,
+        queue=queue,
+        gate=gate,
+    )
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -284,6 +633,7 @@ def prewarm(proc: JobProcess) -> None:
         "agent.prewarm.begin",
         whisper_model=settings.whisper_model,
         tts_voice=settings.tts_voice,
+        brain_enabled=settings.brain_enabled,
     )
     proc.userdata["vad"] = silero.VAD.load()
     # Construct + eagerly load the whisper model so the first live
@@ -307,7 +657,12 @@ def prewarm(proc: JobProcess) -> None:
 async def entrypoint(ctx: JobContext) -> None:
     """Per-room entrypoint — one instance per session dispatch."""
     session_id = _session_id_from_ctx(ctx)
+    settings = get_settings()
     ledger = LedgerClient(_ledger_config())
+
+    # Snapshot client lives for the duration of the session; shared
+    # pool covers the fire-and-forget POST traffic from the router.
+    snapshot_client = SnapshotClient(_snapshot_client_config())
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -316,16 +671,40 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    log.info("agent.connected", room=ctx.room.name, session_id=str(session_id))
+    log.info(
+        "agent.connected",
+        room=ctx.room.name,
+        session_id=str(session_id),
+        brain_enabled=settings.brain_enabled,
+    )
 
-    mentor = MentorAgent(session_id=session_id, ledger=ledger, room=ctx.room)
+    mentor = MentorAgent(
+        session_id=session_id,
+        ledger=ledger,
+        room=ctx.room,
+        brain_enabled=settings.brain_enabled,
+        brain=None,
+    )
+    if settings.brain_enabled:
+        from archmentor_agent.brain.client import get_brain_client
+        from archmentor_agent.state.redis_store import get_redis_store
+
+        mentor.attach_brain(
+            build_brain_wiring(
+                mentor,
+                brain=get_brain_client(settings),
+                store=get_redis_store(settings),
+                snapshot_client=snapshot_client,
+            )
+        )
 
     # Keep strong refs to spawned tasks so the GC doesn't cancel them
     # mid-flight (ruff RUF006).
     input_tasks: set[asyncio.Task[None]] = set()
+    interim_tasks: set[asyncio.Task[None]] = set()
 
     def _on_user_input(ev: _UserInputEvent) -> None:
-        # Framework emits interim + final transcripts; only respond to final.
+        # Framework emits interim + final transcripts; we react to both.
         is_final = bool(ev.is_final)
         text = (ev.transcript or "").strip()
         log.info(
@@ -335,6 +714,11 @@ async def entrypoint(ctx: JobContext) -> None:
             session_id=str(session_id),
         )
         if not is_final:
+            if not mentor.opening_complete.is_set() or not text:
+                return
+            task = asyncio.create_task(mentor.handle_interim_transcript(text))
+            interim_tasks.add(task)
+            task.add_done_callback(interim_tasks.discard)
             return
         if not mentor.opening_complete.is_set():
             # STT fired during the opening line — almost always whisper
@@ -376,24 +760,23 @@ async def entrypoint(ctx: JobContext) -> None:
         # Close the session first so no new user_input_transcribed
         # events get dispatched (and no new `input_tasks` are created).
         await session.aclose()
-        # Drain any in-flight handle_user_input tasks. STT can produce
-        # a final transcript up to a second after the user disconnects,
-        # and handle_user_input schedules fire-and-forget ledger writes
-        # whose lifecycle outlives the coroutine that started them.
+        # Drain any in-flight handle_user_input + handle_interim tasks.
+        # STT can produce a final transcript up to a second after the
+        # user disconnects, and both handlers schedule fire-and-forget
+        # work (ledger writes, snapshot posts) whose lifecycle outlives
+        # the coroutine that started them.
         if input_tasks:
             log.info("agent.shutdown.drain_input_tasks", count=len(input_tasks))
             await asyncio.gather(*input_tasks, return_exceptions=True)
-        # Now drain the ledger writes themselves — these tasks were
-        # scheduled from within handle_user_input (and on_enter) and
-        # can still be mid-request even after handle_user_input has
-        # returned. Finishing them before closing the httpx client
-        # prevents `client has been closed` errors and lost events.
-        if mentor._ledger_tasks:
-            log.info(
-                "agent.shutdown.drain_ledger_tasks",
-                count=len(mentor._ledger_tasks),
-            )
-            await asyncio.gather(*mentor._ledger_tasks, return_exceptions=True)
+        if interim_tasks:
+            log.info("agent.shutdown.drain_interim_tasks", count=len(interim_tasks))
+            await asyncio.gather(*interim_tasks, return_exceptions=True)
+        # MentorAgent.shutdown() drains the router, snapshot tasks, and
+        # ledger tasks in the correct order, then deletes the Redis
+        # session key. Keep this call idempotent — `_brain is None` on
+        # the kill-switch path, in which case only ledger drains run.
+        await mentor.shutdown()
+        await snapshot_client.aclose()
         await ledger.aclose()
 
 
@@ -429,6 +812,35 @@ def _ledger_config() -> LedgerConfig:
         base_url=settings.api_url,
         agent_token=settings.agent_ingest_token.get_secret_value(),
     )
+
+
+def _snapshot_client_config() -> SnapshotClientConfig:
+    """Build the snapshot client config from `Settings`.
+
+    Shares the `agent_ingest_token` with the ledger — the events and
+    snapshots ingest routes live on the same trust boundary and M2
+    intentionally does not split them (see plan "Deferred Production
+    Concerns").
+    """
+    settings = get_settings()
+    return SnapshotClientConfig(
+        base_url=settings.api_url,
+        agent_token=settings.agent_ingest_token.get_secret_value(),
+    )
+
+
+# Re-exposed for tests that only need a fresh `PendingUtterance`.
+__all__ = [
+    "AI_STATE_TOPIC",
+    "OPENING_UTTERANCE",
+    "TURN_ACK_UTTERANCE",
+    "MentorAgent",
+    "PendingUtterance",
+    "build_initial_session_state",
+    "entrypoint",
+    "main",
+    "prewarm",
+]
 
 
 def main() -> None:

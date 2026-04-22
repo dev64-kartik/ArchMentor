@@ -188,6 +188,29 @@ class EventRouter:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
+    async def wait_for_idle(self) -> None:
+        """Wait until the current dispatch drains `pending` to empty.
+
+        Unlike `drain()`, this does NOT clear pending — it lets the
+        in-flight loop process whatever's queued and exit naturally.
+        `MentorAgent.handle_user_input` calls this after
+        `router.handle(turn_end)` so it can pop a decision from the
+        utterance queue once the brain call has finished.
+        """
+        while True:
+            task = self._in_flight
+            async with self._lock:
+                idle = task is None and not self._dispatching and not self._pending
+            if idle:
+                return
+            if task is not None and not task.done():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                continue
+            # Task is done or absent but dispatching flag not yet cleared —
+            # yield once so the `_dispatch_loop`'s finally-like flip runs.
+            await asyncio.sleep(0)
+
     async def _dispatch_loop(self) -> None:
         """Drain `pending` one batch at a time until empty.
 
