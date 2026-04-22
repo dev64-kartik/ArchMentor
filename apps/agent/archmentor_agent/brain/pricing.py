@@ -30,11 +30,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Keep the model id as a single module-level constant. The plan pins
-# `claude-opus-4-7` as the M2 starting model (current GA Opus); 4.6 is
-# listed under legacy. Swapping models should be a one-line edit here,
-# not a grep-and-replace across the codebase.
-BRAIN_MODEL = "claude-opus-4-7"
+# Keep the model id as a single module-level constant. Default is the
+# Unbound provider-prefixed form (`anthropic/claude-opus-4-7`) because
+# this repo ships against an Anthropic-API-compatible gateway (Unbound)
+# that uses LiteLLM-style `provider/model` routing. Direct Anthropic
+# callers can set `ARCHMENTOR_BRAIN_MODEL=claude-opus-4-7`; both forms
+# are registered in `BRAIN_RATES` below.
+BRAIN_MODEL = "anthropic/claude-opus-4-7"
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,8 +61,14 @@ OPUS_4_7_RATES = TokenRates(
 )
 
 
+# Register both the provider-prefixed and bare Opus 4.7 ids so a snapshot
+# captured against one gateway still prices correctly when replayed
+# against another. Keep this list explicit rather than stripping the
+# prefix at lookup time — a silent prefix strip would also mask a real
+# typo in the configured model id.
 BRAIN_RATES: dict[str, TokenRates] = {
-    BRAIN_MODEL: OPUS_4_7_RATES,
+    "anthropic/claude-opus-4-7": OPUS_4_7_RATES,
+    "claude-opus-4-7": OPUS_4_7_RATES,
 }
 
 

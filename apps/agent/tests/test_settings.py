@@ -8,6 +8,7 @@ process env and can assert against source defaults deterministically.
 from __future__ import annotations
 
 import pytest
+from archmentor_agent.brain.pricing import BRAIN_MODEL
 from archmentor_agent.config import Settings, get_settings, reset_settings_cache
 from pydantic import SecretStr, ValidationError
 from pydantic_settings import SettingsConfigDict
@@ -48,6 +49,8 @@ def test_source_defaults_resolve_when_env_file_disabled() -> None:
     assert settings.env == "dev"
     assert settings.brain_enabled is True
     assert settings.hinglish_fallback is True
+    assert settings.anthropic_base_url is None
+    assert settings.brain_model == BRAIN_MODEL
 
 
 def test_credentials_are_wrapped_in_secret_str() -> None:
@@ -128,3 +131,13 @@ def test_unknown_env_vars_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LIVEKIT_URL", "ws://localhost:7880")
     monkeypatch.setenv("ARCHMENTOR_NOT_A_REAL_FIELD", "garbage")
     Settings()  # ty: ignore[missing-argument]  # constructs without error
+
+
+def test_anthropic_base_url_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARCHMENTOR_ANTHROPIC_BASE_URL", "https://api.getunbound.ai")
+    assert Settings().anthropic_base_url == "https://api.getunbound.ai"  # ty: ignore[missing-argument]
+
+
+def test_brain_model_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARCHMENTOR_BRAIN_MODEL", "claude-opus-4-7")
+    assert Settings().brain_model == "claude-opus-4-7"  # ty: ignore[missing-argument]

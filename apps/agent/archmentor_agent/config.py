@@ -23,6 +23,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from archmentor_agent.brain.pricing import BRAIN_MODEL
+
 # config.py -> archmentor_agent -> apps/agent -> apps -> repo root
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -72,11 +74,25 @@ class Settings(BaseSettings):
         "no default.",
     )
 
-    # ─── Anthropic ──────────────────────────────────────────────────────
+    # ─── Anthropic / Anthropic-compatible gateway ───────────────────────
     anthropic_api_key: SecretStr = Field(
-        description="Anthropic API key for the brain client. Required — "
-        "no default. Wrapped in SecretStr so a stray repr/log call can't "
-        "leak the raw value.",
+        description="API key for the brain client. Accepts a direct "
+        "Anthropic key or a gateway key (Unbound, LiteLLM, etc. that "
+        "expose the Anthropic Messages API). Required — no default. "
+        "Wrapped in SecretStr so a stray repr/log call can't leak it.",
+    )
+    anthropic_base_url: str | None = Field(
+        default=None,
+        description="Override the Anthropic SDK's default base URL. Set "
+        "to e.g. `https://api.getunbound.ai` to route through Unbound. "
+        "When None, the SDK talks to api.anthropic.com directly.",
+    )
+    brain_model: str = Field(
+        default=BRAIN_MODEL,
+        description="Model id passed to `messages.create(model=...)`. "
+        "Default matches the Unbound provider-prefixed form; set to "
+        "`claude-opus-4-7` for direct Anthropic. Must be a key in "
+        "`brain/pricing.py::BRAIN_RATES` or cost estimation raises.",
     )
 
     # ─── Redis ──────────────────────────────────────────────────────────

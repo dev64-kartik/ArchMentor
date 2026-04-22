@@ -68,8 +68,13 @@ class BrainClient:
         # AsyncAnthropic with a mocked transport. Production callers
         # omit it and we build one from settings.
         self._model = model
+        # `base_url=None` is the SDK's own default (routes to
+        # api.anthropic.com). Passing it through unconditionally keeps
+        # the constructor behaviour identical to the pre-gateway path
+        # when no override is set.
         self._client = client or AsyncAnthropic(
             api_key=settings.anthropic_api_key.get_secret_value(),
+            base_url=settings.anthropic_base_url,
             # SDK-level retry covers 429 + 5xx + APIConnectionError
             # with exponential backoff. 2 retries = 3 total attempts.
             max_retries=2,
@@ -259,8 +264,12 @@ def get_brain_client(settings: Settings | None = None) -> BrainClient:
         if _CLIENT_SINGLETON is not None:
             return _CLIENT_SINGLETON
         cfg = settings or get_settings()
-        log.info("brain.client.init", model=BRAIN_MODEL)
-        _CLIENT_SINGLETON = BrainClient(cfg)
+        log.info(
+            "brain.client.init",
+            model=cfg.brain_model,
+            base_url=cfg.anthropic_base_url,
+        )
+        _CLIENT_SINGLETON = BrainClient(cfg, model=cfg.brain_model)
         return _CLIENT_SINGLETON
 
 
