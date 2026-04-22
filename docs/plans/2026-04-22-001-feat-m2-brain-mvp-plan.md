@@ -26,13 +26,13 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 | 3. Brain client (Anthropic tool-use + jsonschema) | ✅ Done | `04a4dc9` |
 | 4. Brain snapshot API + agent client | ✅ Done | `aee37b5` |
 | 5. Utterance queue + speech-check gate | ✅ Done | `be72d73` |
-| 6. Event router + coalescer (test-first) | ⬜ Pending | — |
+| 6. Event router + coalescer (test-first) | ✅ Done | `2d74ae7` |
 | 7. Wire brain loop into `MentorAgent` | ⬜ Pending | — |
 | 8. Hinglish STT config + STT-errors clause | ⬜ Pending | — |
 | 9. `scripts/replay.py --snapshot` CLI | ⬜ Pending | — |
 | 10. Dev seed + smoke harness + CLAUDE.md | ⬜ Pending | — |
 
-**Test status at last update:** 195 passed / 1 deselected (the real-Redis integration test). All `ruff check`, `ruff format --check`, `ty check apps/api apps/agent`, and `pnpm -r lint/typecheck/test` pass. CI parity command from CLAUDE.md is green.
+**Test status at last update:** 235 passed / 1 deselected (the real-Redis integration test). All `ruff check`, `ruff format --check`, `ty check apps/api apps/agent`, and `pnpm -r lint/typecheck/test` pass. CI parity command from CLAUDE.md is green.
 
 **Resolved during execution that's worth remembering for the rest of M2:**
 - Both `apps/api/tests/__init__.py` and `apps/agent/tests/__init__.py` make pytest treat conftests as `tests.conftest` and collide. Agent conftest now lives at `apps/agent/conftest.py` (one level up); pytest still discovers it for tests under `apps/agent/tests/` because conftest discovery walks upward.
@@ -41,6 +41,7 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 - `BrainClient.__init__` takes an optional `client: AsyncAnthropic | None` test seam (mirroring `LedgerClient`'s `httpx.AsyncClient` seam). Tests pass a `_FakeAnthropic` that quacks like `AsyncAnthropic.messages.create(...)`; casting through `Any`/`cast(AsyncAnthropic, ...)` satisfies ty without loosening the production signature. Subsequent units (router, replay) should follow the same pattern rather than introducing a new BrainClient protocol.
 - `build_call_kwargs(..., tool: Mapping[str, Any])` accepts `INTERVIEW_DECISION_TOOL` (TypedDict) directly; wrapping in `dict(...)` at the call site trips ty's TypedDict overload resolution. Callers must pass the TypedDict untouched.
 - Cost-guard decision lives in Unit 6 (router), not Unit 3 (client). `BrainClient.decide` only reports the one-call cost delta in `BrainUsage`; the router sums it into `SessionState.cost_usd_total` under the CAS loop.
+- Shared test fakes for the router (and Unit 7) live at `apps/agent/tests/_helpers/` rather than `tests/fakes/` — pytest's `--import-mode=importlib` plus the cross-app `tests` package name (apps/api/tests vs apps/agent/tests) collide on the `tests.fakes` lookup. `apps/agent/conftest.py` injects `apps/agent/tests/` into `sys.path` so test files import as `from _helpers import ...`; `[tool.ty.environment] extra-paths` in root `pyproject.toml` makes ty agree.
 
 ## Problem Frame
 
@@ -518,7 +519,7 @@ on_turn_end:
 
 ---
 
-- [ ] **Unit 6: Event router + coalescer**
+- [x] **Unit 6: Event router + coalescer** — landed 2026-04-22 on `feat/m2-brain-mvp` (commit `2d74ae7`). Notes: invariant I1 enforced by atomic `dispatching=False` flip inside the same lock-acquired pending check (NOT in finally — releasing outside the lock-guarded check creates a window where a new handle() can be lost). Cost guard added `SessionState.cost_cap_usd: float = 5.0` (mirrors API column default). Shared test fakes live at `apps/agent/tests/_helpers/` with `apps/agent/conftest.py` injecting that path into `sys.path` and `[tool.ty.environment] extra-paths` mirroring it for ty — pytest's importlib mode + the cross-app `tests` package collision blocked the simpler subpackage layout. Unit 7 will reuse the same `_helpers` fakes directly.
 
 **Goal:** Serialized async router that guarantees one brain call in flight at a time, coalesces concurrent triggers into a single call, and cancels in-flight calls on candidate speech resume.
 
