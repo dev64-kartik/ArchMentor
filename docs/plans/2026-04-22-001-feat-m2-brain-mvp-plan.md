@@ -24,7 +24,7 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 | 1. Agent `Settings` module | ✅ Done | `5a37d7b` |
 | 2. Redis session state store | ✅ Done | `a87d799` |
 | 3. Brain client (Anthropic tool-use + jsonschema) | ✅ Done | `04a4dc9` |
-| 4. Brain snapshot API + agent client | ✅ Done | pending commit |
+| 4. Brain snapshot API + agent client | ✅ Done | `aee37b5` |
 | 5. Utterance queue + speech-check gate | ⬜ Pending | — |
 | 6. Event router + coalescer (test-first) | ⬜ Pending | — |
 | 7. Wire brain loop into `MentorAgent` | ⬜ Pending | — |
