@@ -25,7 +25,7 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 | 2. Redis session state store | ✅ Done | `a87d799` |
 | 3. Brain client (Anthropic tool-use + jsonschema) | ✅ Done | `04a4dc9` |
 | 4. Brain snapshot API + agent client | ✅ Done | `aee37b5` |
-| 5. Utterance queue + speech-check gate | ⬜ Pending | — |
+| 5. Utterance queue + speech-check gate | ✅ Done | `be72d73` |
 | 6. Event router + coalescer (test-first) | ⬜ Pending | — |
 | 7. Wire brain loop into `MentorAgent` | ⬜ Pending | — |
 | 8. Hinglish STT config + STT-errors clause | ⬜ Pending | — |
@@ -477,7 +477,7 @@ on_turn_end:
 
 ---
 
-- [ ] **Unit 5: Utterance queue + speech-check gate**
+- [x] **Unit 5: Utterance queue + speech-check gate** — landed 2026-04-22 on `feat/m2-brain-mvp` (commit `be72d73`). Notes: queue's `clear_stale_on_new_turn` reuses the same `on_stale` callback the TTL path uses (one drop hook per call site). Gate's `mark_done_speaking()` without a prior `mark_speaking()` still triggers the grace window — defends against framework emitting a final without an interim.
 
 **Goal:** Implement the queue + gate that sits between the brain's `decision=speak` and `session.say()`, honoring TTL and candidate-speaking state.
 

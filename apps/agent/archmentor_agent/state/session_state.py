@@ -125,3 +125,8 @@ class SessionState(BaseModel):
     tokens_input_total: int = 0
     tokens_output_total: int = 0
     cost_usd_total: float = 0.0
+    # Per-session cap, seeded from `sessions.cost_cap_usd` at on_enter.
+    # The router short-circuits to `BrainDecision.cost_capped()` once
+    # `cost_usd_total >= cost_cap_usd`. Default mirrors the API column
+    # default ($5 / session).
+    cost_cap_usd: float = 5.0
