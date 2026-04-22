@@ -16,6 +16,12 @@ dependencies = [
     "httpx==0.28.1",
     "pyyaml==6.0.3",
     "numpy==2.4.4",
+    # jsonschema validates Anthropic tool_use output against
+    # INTERVIEW_DECISION_TOOL["input_schema"]. The SDK does not validate
+    # model-produced JSON, so a malformed `confidence` or missing
+    # `reasoning` would otherwise reach the voice loop. Pinned exact —
+    # see global CLAUDE.md: pin exact versions.
+    "jsonschema==4.26.0",
     # The livekit-agents CLI reads config from os.environ and does not
     # load .env itself. The API layer gets this for free via pydantic-
     # settings; the agent needs to load .env explicitly at main().

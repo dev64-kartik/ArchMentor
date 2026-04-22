@@ -209,6 +209,7 @@ source = { editable = "apps/agent" }
 dependencies = [
     { name = "anthropic" },
     { name = "httpx" },
+    { name = "jsonschema" },
     { name = "livekit-agents" },
     { name = "livekit-plugins-silero" },
     { name = "numpy" },
@@ -244,6 +245,7 @@ requires-dist = [
     { name = "audioop-lts", marker = "extra == 'audio'", specifier = "==0.2.2" },
     { name = "en-core-web-sm", marker = "extra == 'audio'", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
     { name = "httpx", specifier = "==0.28.1" },
+    { name = "jsonschema", specifier = "==4.26.0" },
     { name = "livekit-agents", specifier = "==1.5.4" },
     { name = "livekit-plugins-silero", specifier = "==1.5.4" },
     { name = "numpy", specifier = "==2.4.4" },

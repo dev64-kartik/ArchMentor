@@ -23,7 +23,7 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 |------|--------|--------|
 | 1. Agent `Settings` module | ✅ Done | `5a37d7b` |
 | 2. Redis session state store | ✅ Done | `a87d799` |
-| 3. Brain client (Anthropic tool-use + jsonschema) | 🔜 In progress | — |
+| 3. Brain client (Anthropic tool-use + jsonschema) | ✅ Done | pending commit |
 | 4. Brain snapshot API + agent client | ⬜ Pending | — |
 | 5. Utterance queue + speech-check gate | ⬜ Pending | — |
 | 6. Event router + coalescer (test-first) | ⬜ Pending | — |
@@ -32,12 +32,15 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 | 9. `scripts/replay.py --snapshot` CLI | ⬜ Pending | — |
 | 10. Dev seed + smoke harness + CLAUDE.md | ⬜ Pending | — |
 
-**Test status at last update:** 127 passed / 1 deselected (the real-Redis integration test). All `ruff check`, `ruff format --check`, and `ty check apps/api apps/agent` pass. CI parity command from CLAUDE.md is green.
+**Test status at last update:** 179 passed / 1 deselected (the real-Redis integration test). All `ruff check`, `ruff format --check`, `ty check apps/api apps/agent`, and `pnpm -r lint/typecheck/test` pass. CI parity command from CLAUDE.md is green.
 
 **Resolved during execution that's worth remembering for the rest of M2:**
 - Both `apps/api/tests/__init__.py` and `apps/agent/tests/__init__.py` make pytest treat conftests as `tests.conftest` and collide. Agent conftest now lives at `apps/agent/conftest.py` (one level up); pytest still discovers it for tests under `apps/agent/tests/` because conftest discovery walks upward.
 - The dev `.env` interferes with `monkeypatch.delenv` and source-default assertions because pydantic-settings re-reads `.env` after env-var deletions. Tests bypass this by replacing `Settings.model_config` with a copy that has `env_file=None`. New unit tests should follow the same pattern (`apps/agent/tests/test_settings.py::_isolated_env`).
 - Root `pyproject.toml` `[tool.pytest.ini_options]` now defaults to `-m "not integration"` so the integration marker registered in unit 2 is opt-in. Integration tests added in later units must use `@pytest.mark.integration` to stay out of the default CI run.
+- `BrainClient.__init__` takes an optional `client: AsyncAnthropic | None` test seam (mirroring `LedgerClient`'s `httpx.AsyncClient` seam). Tests pass a `_FakeAnthropic` that quacks like `AsyncAnthropic.messages.create(...)`; casting through `Any`/`cast(AsyncAnthropic, ...)` satisfies ty without loosening the production signature. Subsequent units (router, replay) should follow the same pattern rather than introducing a new BrainClient protocol.
+- `build_call_kwargs(..., tool: Mapping[str, Any])` accepts `INTERVIEW_DECISION_TOOL` (TypedDict) directly; wrapping in `dict(...)` at the call site trips ty's TypedDict overload resolution. Callers must pass the TypedDict untouched.
+- Cost-guard decision lives in Unit 6 (router), not Unit 3 (client). `BrainClient.decide` only reports the one-call cost delta in `BrainUsage`; the router sums it into `SessionState.cost_usd_total` under the CAS loop.
 
 ## Problem Frame
 
@@ -373,7 +376,7 @@ on_turn_end:
 
 ---
 
-- [ ] **Unit 3: Brain client (Anthropic tool-use + cost guard)**
+- [x] **Unit 3: Brain client (Anthropic tool-use + cost guard)** — landed 2026-04-22 on `feat/m2-brain-mvp`. Notes: `jsonschema==4.26.0` pinned; `BrainClient.__init__` exposes an `AsyncAnthropic | None` test seam; cost guard deferred to Unit 6 (router) as planned; `BrainDecision` sanitizes utterance at `from_tool_block` so router + replay share one defense.
 
 **Goal:** Fill in `brain/client.py` with a non-streaming `AsyncAnthropic` wrapper that takes `SessionState` + event payload and returns a validated `BrainDecision`.
 
