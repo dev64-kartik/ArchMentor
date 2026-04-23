@@ -51,6 +51,7 @@ from livekit.agents import (
     cli,
 )
 
+from archmentor_agent.audio.stt import _WHISPER_PROMPT_ECHO_STEMS
 from archmentor_agent.brain.bootstrap import (
     DEV_PROMPT_VERSION,
     build_dev_problem_card,
@@ -134,6 +135,13 @@ def _is_whisper_hallucination(text: str) -> bool:
     if not stripped:
         return True
     if stripped in _HALLUCINATION_TAGS or (stripped.startswith("[") and stripped.endswith("]")):
+        return True
+    # Whisper regurgitates its `initial_prompt` on short/quiet/ambiguous
+    # buffers. Any transcript containing a sentence-stem from the prompt
+    # is an echo, not candidate speech — drop it before it reaches the
+    # brain (otherwise the mentor burns tokens responding to its own
+    # priming text). See `audio/stt._WHISPER_PROMPT_ECHO_STEMS`.
+    if any(stem in stripped for stem in _WHISPER_PROMPT_ECHO_STEMS):
         return True
     return any(phrase in stripped for phrase in _HALLUCINATION_PHRASES)
 

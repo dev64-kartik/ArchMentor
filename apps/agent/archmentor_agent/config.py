@@ -23,7 +23,13 @@ from pathlib import Path
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from archmentor_agent.brain.pricing import BRAIN_MODEL
+# Default model id is duplicated from `brain.pricing.BRAIN_MODEL` rather
+# than imported: `brain/__init__.py` transitively pulls `state` →
+# `redis_store` → `config`, which re-enters this module mid-load and
+# triggers a circular import. `test_settings.py::test_source_defaults…`
+# asserts `Settings().brain_model == brain.pricing.BRAIN_MODEL` so drift
+# between the two strings is caught by CI.
+_DEFAULT_BRAIN_MODEL = "anthropic/claude-opus-4-7"
 
 # config.py -> archmentor_agent -> apps/agent -> apps -> repo root
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -88,7 +94,7 @@ class Settings(BaseSettings):
         "When None, the SDK talks to api.anthropic.com directly.",
     )
     brain_model: str = Field(
-        default=BRAIN_MODEL,
+        default=_DEFAULT_BRAIN_MODEL,
         description="Model id passed to `messages.create(model=...)`. "
         "Default matches the Unbound provider-prefixed form; set to "
         "`claude-opus-4-7` for direct Anthropic. Must be a key in "

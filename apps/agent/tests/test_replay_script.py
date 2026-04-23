@@ -65,7 +65,19 @@ def _load_replay_module() -> Any:
     # `AttributeError: 'NoneType' object has no attribute '__dict__'`
     # from `dataclasses._is_type`.
     sys.modules["_replay_cli"] = module
-    spec.loader.exec_module(module)
+    # `replay.py` calls `load_dotenv(repo_root/.env)` at module top so
+    # the CLI works from any shell. During test collection that's
+    # pollution: every `.env` value would land in os.environ for the
+    # rest of the session and break tests asserting source defaults
+    # (notably `test_settings.test_source_defaults_resolve_when_env_file_disabled`).
+    # Snapshot/restore keeps module loading hermetic while letting the
+    # module finish initialising normally.
+    env_snapshot = dict(os.environ)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        os.environ.clear()
+        os.environ.update(env_snapshot)
     return module
 
 

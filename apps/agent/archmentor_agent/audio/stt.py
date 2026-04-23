@@ -137,6 +137,20 @@ _WHISPER_INITIAL_PROMPT = (
     "(matlab, yaani, theek hai)."
 )
 
+
+# Whisper occasionally emits the `initial_prompt` verbatim when the audio
+# buffer is short, quiet, or the decoder is otherwise uncertain — a
+# well-documented fallback behaviour. We fingerprint each sentence stem
+# so the hallucination filter in `main.py` can drop prompt echoes
+# regardless of which sentence leaked. Lowercased to match the filter's
+# case-normalised input. Any edit to `_WHISPER_INITIAL_PROMPT` above
+# must re-verify these stems still cover its sentences.
+_WHISPER_PROMPT_ECHO_STEMS: tuple[str, ...] = (
+    "system design interview with an indian engineer",
+    "technical discussion of distributed systems",
+    "discussion may switch between english and romanized hindi",
+)
+
 # Short-buffer misdetect fallback threshold. Whisper.cpp occasionally
 # labels sub-3s Indian-accented English as Welsh, Irish, or Nynorsk
 # when auto-detect has thin audio to work with. Longer utterances

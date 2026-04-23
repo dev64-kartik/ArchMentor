@@ -113,3 +113,20 @@ def test_partial_phrase_inside_real_answer_still_flags() -> None:
     pleasantries.
     """
     assert _is_whisper_hallucination("thanks for watching this talk") is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Exact leak observed 2026-04-23 on a 2.42s, RMS=0.06 buffer.
+        "Discussion may switch between English and romanized Hindi�",
+        # Other sentence stems of `_WHISPER_INITIAL_PROMPT`.
+        "System design interview with an Indian engineer",
+        "Technical discussion of distributed systems, databases, and APIs",
+        # Mixed case + trailing garbage still flagged.
+        "DISCUSSION MAY SWITCH between English and romanized hindi and stuff",
+    ],
+)
+def test_initial_prompt_echo_is_hallucination(text: str) -> None:
+    """Whisper echoes `initial_prompt` on short/quiet buffers — drop it."""
+    assert _is_whisper_hallucination(text) is True
