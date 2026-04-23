@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -131,21 +132,62 @@ _HALLUCINATION_PHRASES = (
     "bye bye",
 )
 
+# Short stock phrases whisper regurgitates on silence / low-SNR audio,
+# observed repeatedly in a noisy-environment manual test (2026-04-23).
+# These are matched against the WHOLE normalized transcript, not as a
+# substring — "thank you" inside "thank you, so the capacity is…" is
+# legitimate and must reach the brain; "Thank you." as the entire
+# transcript on a quiet 2-second buffer is almost always hallucination.
+#
+# Only entries here that are almost never a standalone meaningful
+# candidate turn in a system design interview. "ok" / "okay" / "yes"
+# / "no" / "right" deliberately NOT included — those are legitimate
+# short acks and are covered by
+# `test_legitimate_technical_utterances_are_not_hallucinations`.
+_HALLUCINATION_EXACT_PHRASES = frozenset(
+    {
+        "thank you",
+        "thanks",
+        "thank you very much",
+        "thank you so much",
+        "bye",
+        "goodbye",
+        "bye bye",
+        "you",
+    }
+)
+
+# Runs of whitespace + the punctuation characters listed below get
+# collapsed to a single space during normalization. Covers trailing
+# periods/commas, hyphens + Unicode dashes (whisper emits "-" / "—"
+# on short ambiguous buffers), and ellipsis. A regex rather than
+# `str.strip(...)` so internal patterns like ". . ." also collapse.
+# Intentional em-dash (U+2014) and en-dash (U+2013) — whisper emits
+# both; the ruff ambiguous-dash warning is expected here.
+_PUNCT_WS = re.compile(r"[\s.!?,;:\-—–…]+")  # noqa: RUF001
+
 
 def _is_whisper_hallucination(text: str) -> bool:
-    stripped = text.strip().lower().rstrip(".!?,")
-    if not stripped:
+    lowered = text.strip().lower()
+    if not lowered:
         return True
-    if stripped in _HALLUCINATION_TAGS or (stripped.startswith("[") and stripped.endswith("]")):
+    # Bracketed tags ([Music], [BLANK_AUDIO], …) — check before the
+    # punctuation normalization chews the brackets.
+    if lowered in _HALLUCINATION_TAGS or (lowered.startswith("[") and lowered.endswith("]")):
+        return True
+    normalized = _PUNCT_WS.sub(" ", lowered).strip()
+    if not normalized:
         return True
     # Whisper regurgitates its `initial_prompt` on short/quiet/ambiguous
     # buffers. Any transcript containing a sentence-stem from the prompt
     # is an echo, not candidate speech — drop it before it reaches the
     # brain (otherwise the mentor burns tokens responding to its own
     # priming text). See `audio/stt._WHISPER_PROMPT_ECHO_STEMS`.
-    if any(stem in stripped for stem in _WHISPER_PROMPT_ECHO_STEMS):
+    if any(stem in normalized for stem in _WHISPER_PROMPT_ECHO_STEMS):
         return True
-    return any(phrase in stripped for phrase in _HALLUCINATION_PHRASES)
+    if normalized in _HALLUCINATION_EXACT_PHRASES:
+        return True
+    return any(phrase in normalized for phrase in _HALLUCINATION_PHRASES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +273,18 @@ class MentorAgent(Agent):
         # drain order (snapshots after router.drain, before client
         # aclose) is explicit in `entrypoint`.
         self._snapshot_tasks: set[asyncio.Task[bool]] = set()
+        # Serializes `_drain_utterance_queue` across concurrent
+        # `_run_brain_turn` tasks. Without this, two rapid turn_end
+        # finals (e.g. the noisy-room "Thank you." hallucination
+        # cascade) each `wait_for_idle` + drain simultaneously, and
+        # the pops race — observed as two back-to-back
+        # `queue.delivered` events in the same log second and a
+        # half-spoken utterance being cut off by the next `say()`.
+        # A new drain that finds the lock held skips its pop entirely
+        # (the in-flight say is the user's most recent utterance; its
+        # own utterance, if any, gets dropped by TTL or by a later
+        # `clear_stale_on_new_turn`).
+        self._say_lock = asyncio.Lock()
 
     def attach_brain(self, wiring: _BrainWiring) -> None:
         """Inject the brain collaborators after construction.
@@ -260,7 +314,14 @@ class MentorAgent(Agent):
             await self._initialize_brain_state()
             await self._publish_state("speaking")
             log.info("agent.opening.say.begin", text=OPENING_UTTERANCE)
-            handle = self.session.say(OPENING_UTTERANCE)
+            # `allow_interruptions=False` keeps the intro playing through
+            # LiveKit's built-in VAD barge-in. Without this, a noisy
+            # room (keyboard clatter, ambient voices) triggers VAD >3s
+            # into the opening — past the AEC warmup window — and cuts
+            # the intro mid-sentence. Barge-in is re-enabled by default
+            # for every subsequent `session.say(...)` on the turn_end
+            # path, where the candidate SHOULD be able to interrupt.
+            handle = self.session.say(OPENING_UTTERANCE, allow_interruptions=False)
             await handle.wait_for_playout()
             log.info("agent.opening.say.end")
             self._log("utterance_ai", {"text": OPENING_UTTERANCE, "speaker": "ai"})
@@ -409,25 +470,40 @@ class MentorAgent(Agent):
         the interim handler, not here. The gate becomes load-bearing
         in M3+ when `long_silence` and `canvas_change` events can push
         utterances outside a natural turn-end.
+
+        Concurrency: two rapid `handle_user_input` finals can each
+        land here simultaneously (the router is serialized; the
+        handler tasks are not). ``_say_lock`` ensures only one
+        ``session.say`` runs at a time. If the lock is already held,
+        we skip the pop entirely — the in-flight say is the caller's
+        most recent output; popping our own would cut it off with
+        another ``say`` that in a noisy-room hallucination cascade is
+        almost always stale.
         """
         if self._brain is None:
             raise RuntimeError("_drain_utterance_queue called with no brain wiring")
         brain = self._brain
 
-        utterance = brain.queue.pop_if_fresh()
-        if utterance is None:
+        if self._say_lock.locked():
+            log.info("agent.drain.skipped_concurrent")
             await self._publish_state("listening")
             return
 
-        await self._publish_state("speaking")
-        try:
-            await self._say(utterance.text)
-        except RuntimeError as exc:
-            log.warning("agent.say_skipped", reason=str(exc))
+        async with self._say_lock:
+            utterance = brain.queue.pop_if_fresh()
+            if utterance is None:
+                await self._publish_state("listening")
+                return
+
+            await self._publish_state("speaking")
+            try:
+                await self._say(utterance.text)
+            except RuntimeError as exc:
+                log.warning("agent.say_skipped", reason=str(exc))
+                await self._publish_state("listening")
+                return
+            self._log("utterance_ai", {"text": utterance.text, "speaker": "ai"})
             await self._publish_state("listening")
-            return
-        self._log("utterance_ai", {"text": utterance.text, "speaker": "ai"})
-        await self._publish_state("listening")
 
     async def _say(self, text: str) -> None:
         """TTS hand-off seam.
