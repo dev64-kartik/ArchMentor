@@ -125,6 +125,13 @@ class Settings(BaseSettings):
         description="Kokoro device override (e.g. `mps`). When None, "
         "streaming-tts picks per its own default.",
     )
+    tts_speed: float = Field(
+        default=0.9,
+        description="Kokoro `default_speed` — 1.0 is native cadence; "
+        "0.9 is ~10% slower, which listeners report as calmer and more "
+        "interviewer-like. Lower bound is streaming-tts's own floor; "
+        "values below ~0.7 distort vowel formants.",
+    )
     hinglish_fallback: bool = Field(
         default=True,
         description="When True (M2 default), short whisper buffers "

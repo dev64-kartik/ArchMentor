@@ -46,6 +46,7 @@ def test_source_defaults_resolve_when_env_file_disabled() -> None:
     assert settings.whisper_dir == ".model-cache/whisper"
     assert settings.tts_voice == "af_bella"
     assert settings.tts_device is None
+    assert settings.tts_speed == 0.9
     assert settings.env == "dev"
     assert settings.brain_enabled is True
     assert settings.hinglish_fallback is True

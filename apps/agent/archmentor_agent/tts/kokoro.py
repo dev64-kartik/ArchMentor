@@ -44,9 +44,11 @@ def _load_engine() -> Any:
             module = importlib.import_module("streaming_tts")
         except ImportError as exc:
             raise AudioExtrasMissingError() from exc
-        voice = get_settings().tts_voice
-        log.info("kokoro.load", voice=voice, sample_rate=KOKORO_SAMPLE_RATE)
-        _ENGINE_SINGLETON = module.KokoroEngine(voice=voice)
+        settings = get_settings()
+        voice = settings.tts_voice
+        speed = settings.tts_speed
+        log.info("kokoro.load", voice=voice, speed=speed, sample_rate=KOKORO_SAMPLE_RATE)
+        _ENGINE_SINGLETON = module.KokoroEngine(voice=voice, default_speed=speed)
         return _ENGINE_SINGLETON
 
 
