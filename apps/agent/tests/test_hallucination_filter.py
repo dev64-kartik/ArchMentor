@@ -113,3 +113,75 @@ def test_partial_phrase_inside_real_answer_still_flags() -> None:
     pleasantries.
     """
     assert _is_whisper_hallucination("thanks for watching this talk") is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Exact leak observed 2026-04-23 on a 2.42s, RMS=0.06 buffer.
+        "Discussion may switch between English and romanized Hindi�",
+        # Other sentence stems of `_WHISPER_INITIAL_PROMPT`.
+        "System design interview with an Indian engineer",
+        "Technical discussion of distributed systems, databases, and APIs",
+        # Mixed case + trailing garbage still flagged.
+        "DISCUSSION MAY SWITCH between English and romanized hindi and stuff",
+    ],
+)
+def test_initial_prompt_echo_is_hallucination(text: str) -> None:
+    """Whisper echoes `initial_prompt` on short/quiet buffers — drop it."""
+    assert _is_whisper_hallucination(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Noisy-room manual test (2026-04-23) emitted "Thank you."
+        # repeatedly on quiet/non-speech buffers. Every instance
+        # triggered a brain call before this filter landed.
+        "Thank you.",
+        "thank you",
+        "Thanks.",
+        "  thanks  ",
+        "Bye.",
+        "Goodbye",
+        "bye bye",
+        # Single-word transcripts that pass empty-check but aren't
+        # speech. "you" is a common one-word whisper filler; "yes" /
+        # "no" / "ok" / "right" are explicitly kept legitimate (see
+        # test_legitimate_technical_utterances_are_not_hallucinations).
+        "you",
+    ],
+)
+def test_exact_stock_phrases_are_hallucinations(text: str) -> None:
+    """Whole-transcript stock phrases are almost always hallucination."""
+    assert _is_whisper_hallucination(text) is True
+
+
+def test_stock_phrase_inside_real_answer_is_not_dropped() -> None:
+    """Exact-phrase matching must NOT fire when the phrase is embedded in
+    a longer legitimate utterance. "Thank you" at the start of a real
+    candidate response is fine; only the whole-transcript match counts.
+    """
+    assert (
+        _is_whisper_hallucination("Thank you, I think we should use consistent hashing.") is False
+    )
+    assert _is_whisper_hallucination("ok so first let me think about capacity.") is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "-",
+        "—",  # em-dash U+2014 — intentional; whisper emits this on short buffers.
+        "–",  # noqa: RUF001 - en-dash U+2013 — intentional; paired with em-dash above.
+        "...",
+        ".",
+        "..",
+        ". . .",
+    ],
+)
+def test_dash_and_punctuation_only_transcripts_are_hallucinations(text: str) -> None:
+    """Hyphens, em/en-dashes, and ellipsis-only transcripts are
+    whisper's "I have no signal" output — drop instead of dispatching.
+    """
+    assert _is_whisper_hallucination(text) is True

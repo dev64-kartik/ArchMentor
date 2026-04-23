@@ -67,9 +67,23 @@ docstring-code-format = true
 [tool.ty.rules]
 # Strict defaults; tune per-project as needed.
 
+[tool.ty.environment]
+# `apps/agent/tests/_helpers/` holds the shared FakeBrainClient /
+# FakeSessionStore / FakeSnapshotClient that test_event_router.py
+# (and Unit 7's test_main_entrypoint.py, when it lands) import as a
+# top-level `_helpers` module. The agent's `conftest.py` injects this
+# directory into `sys.path`; ty cannot see the conftest manipulation,
+# so we surface it here too.
+extra-paths = ["apps/agent/tests"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests", "apps/api/tests", "apps/agent/tests"]
 # `importlib` mode lets each app's `tests/` live independently without
 # colliding on the shared `tests` package name when pytest runs from root.
-addopts = "--import-mode=importlib"
+# `-m "not integration"` keeps CI green without a docker-compose Redis;
+# integration tests opt in via `pytest -m integration`.
+addopts = "--import-mode=importlib -m 'not integration'"
+markers = [
+    "integration: requires the docker-compose stack (Redis, Postgres) — opt in with -m integration",
+]

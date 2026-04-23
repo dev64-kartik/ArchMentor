@@ -79,4 +79,4 @@ if lsof -ti:3000,8000 >/dev/null 2>&1; then
 fi
 
 echo "✓ archmentor app processes stopped"
-echo "  docker containers left running — use \`docker compose -f infra/docker-compose.yml down\` to stop them too"
+echo "  docker containers left running — use \`docker compose -f infra/docker-compose.yml --env-file .env down\` to stop them too"

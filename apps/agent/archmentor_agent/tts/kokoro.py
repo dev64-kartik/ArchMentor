@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import os
 import threading
 from collections.abc import AsyncIterator
 from queue import Empty
@@ -23,6 +22,7 @@ import numpy as np
 import structlog
 
 from archmentor_agent.audio.stt import AudioExtrasMissingError
+from archmentor_agent.config import get_settings
 
 log = structlog.get_logger(__name__)
 
@@ -44,9 +44,11 @@ def _load_engine() -> Any:
             module = importlib.import_module("streaming_tts")
         except ImportError as exc:
             raise AudioExtrasMissingError() from exc
-        voice = os.environ.get("ARCHMENTOR_TTS_VOICE", "af_bella")
-        log.info("kokoro.load", voice=voice, sample_rate=KOKORO_SAMPLE_RATE)
-        _ENGINE_SINGLETON = module.KokoroEngine(voice=voice)
+        settings = get_settings()
+        voice = settings.tts_voice
+        speed = settings.tts_speed
+        log.info("kokoro.load", voice=voice, speed=speed, sample_rate=KOKORO_SAMPLE_RATE)
+        _ENGINE_SINGLETON = module.KokoroEngine(voice=voice, default_speed=speed)
         return _ENGINE_SINGLETON
 
 

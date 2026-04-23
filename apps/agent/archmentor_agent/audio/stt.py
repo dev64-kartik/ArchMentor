@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import os
 import threading
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
 import numpy as np
 import structlog
+
+from archmentor_agent.config import get_settings
 
 log = structlog.get_logger(__name__)
 
@@ -73,11 +74,12 @@ def _load_model() -> Any:
         except ImportError as exc:
             raise AudioExtrasMissingError() from exc
 
-        model_name = os.environ.get("ARCHMENTOR_WHISPER_MODEL", "large-v3")
+        settings = get_settings()
+        model_name = settings.whisper_model
         # pywhispercpp defaults to `~/Library/Application Support/pywhispercpp`
         # which the Claude sandbox denies writes to. Route the model cache
         # to the repo-local `.model-cache/whisper/` (sandbox-writable).
-        models_dir = os.environ.get("ARCHMENTOR_WHISPER_DIR", ".model-cache/whisper")
+        models_dir = settings.whisper_dir
         from pathlib import Path
 
         Path(models_dir).mkdir(parents=True, exist_ok=True)
@@ -123,11 +125,39 @@ _WHISPER_INITIAL_PROMPT = (
     # enumerating technical terms is whack-a-mole and can miscorrect
     # legitimate utterances elsewhere. The real disambiguation happens
     # downstream in the brain, where Claude has the full session
-    # context ("lasting first out" after 3 min of cache discussion is
-    # obviously LIFO). This prompt just establishes English + register.
-    "System design interview in English with an Indian accent. "
-    "Technical discussion of distributed systems, databases, and APIs."
+    # context (`lasting first out` after 3 min of cache discussion is
+    # obviously LIFO). This prompt just establishes register —
+    # including the fact that discussion may switch between English
+    # and romanized Hindi so whisper doesn't treat common Hinglish
+    # connectors (`matlab`, `yaani`, `theek hai`) as mis-segmented
+    # English.
+    "System design interview with an Indian engineer. "
+    "Technical discussion of distributed systems, databases, and APIs. "
+    "Discussion may switch between English and romanized Hindi "
+    "(matlab, yaani, theek hai)."
 )
+
+
+# Whisper occasionally emits the `initial_prompt` verbatim when the audio
+# buffer is short, quiet, or the decoder is otherwise uncertain — a
+# well-documented fallback behaviour. We fingerprint each sentence stem
+# so the hallucination filter in `main.py` can drop prompt echoes
+# regardless of which sentence leaked. Lowercased to match the filter's
+# case-normalised input. Any edit to `_WHISPER_INITIAL_PROMPT` above
+# must re-verify these stems still cover its sentences.
+_WHISPER_PROMPT_ECHO_STEMS: tuple[str, ...] = (
+    "system design interview with an indian engineer",
+    "technical discussion of distributed systems",
+    "discussion may switch between english and romanized hindi",
+)
+
+# Short-buffer misdetect fallback threshold. Whisper.cpp occasionally
+# labels sub-3s Indian-accented English as Welsh, Irish, or Nynorsk
+# when auto-detect has thin audio to work with. Longer utterances
+# rarely mis-identify, and a deliberate Hindi switch is more plausible
+# on a longer segment, so we only re-run short buffers.
+_HINGLISH_FALLBACK_MAX_SAMPLES = 3 * 16_000  # 3 seconds at 16 kHz
+_HINGLISH_EXPECTED_LANGS = frozenset({"en", "hi"})
 
 
 # Below this RMS (measured before normalization) we assume the
@@ -168,9 +198,10 @@ def _run_inference(samples: np.ndarray) -> list[_WhisperSegment]:
 
     raw = model.transcribe(
         samples,
-        # Pin language. Multilingual models auto-detect on every buffer
-        # and on short/quiet turns sometimes mis-identify → garbage.
-        language="en",
+        # No `language=` pin: multilingual large-v3 handles the
+        # Hinglish code-switching this project targets. Short-buffer
+        # auto-detect mis-identifications (Welsh / Nynorsk on Indian-
+        # accented English) are handled by the fallback below.
         # Domain + accent hint. Whisper trained heavily on YouTube;
         # short or ambiguous inputs tend to collapse to generic
         # filler ("thanks for watching", "I'll see you in the next
@@ -186,4 +217,50 @@ def _run_inference(samples: np.ndarray) -> list[_WhisperSegment]:
         # rejects them as silence.
         no_speech_thold=0.8,
     )
+    raw = _maybe_hinglish_fallback(model, samples, raw)
     return [{"text": s.text, "t0": s.t0, "t1": s.t1} for s in raw]
+
+
+def _maybe_hinglish_fallback(
+    model: Any,
+    samples: np.ndarray,
+    segments: Any,
+) -> Any:
+    """Re-run short buffers with `language='en'` if auto-detect went astray.
+
+    Whisper's auto-detect on <3s Indian-accented English occasionally
+    tags the buffer as Welsh / Nynorsk / Irish, producing garbage
+    segments. Re-running with an English pin on exactly those short
+    buffers corrects the misdetect without interfering with legitimate
+    longer Hindi switches.
+
+    Gated on `Settings.hinglish_fallback` so the behavior is
+    user-toggleable — if it proves too aggressive in prod we can
+    disable it per-deploy without re-releasing the agent.
+    """
+    if not get_settings().hinglish_fallback:
+        return segments
+    if samples.size > _HINGLISH_FALLBACK_MAX_SAMPLES:
+        return segments
+
+    detected = getattr(model, "language", None)
+    if detected is None:
+        # pywhispercpp build doesn't expose the detected language —
+        # skip the fallback rather than re-running blindly.
+        return segments
+    if detected in _HINGLISH_EXPECTED_LANGS:
+        return segments
+
+    log.info(
+        "whisper.hinglish_fallback.retry",
+        detected=detected,
+        samples=int(samples.size),
+    )
+    return model.transcribe(
+        samples,
+        language="en",
+        initial_prompt=_WHISPER_INITIAL_PROMPT,
+        temperature=0.0,
+        temperature_inc=0.0,
+        no_speech_thold=0.8,
+    )

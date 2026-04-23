@@ -96,7 +96,7 @@ When adding dependencies, look up the current stable version — never assume fr
 
 ## Current milestone
 
-M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) ✅ done 2026-04-21 on `feat/m1-voice-loop` (PR #2), including live mic verification on Apple Silicon and a post-review hardening pass (commit `3ef2206`). **Next:** M2 — Claude Opus tool-use brain, event router with serialization gate, utterance queue, decisions log, Hinglish STT config.
+M0 (foundation) landed 2026-04-19. M1 (voice loop skeleton) ✅ done 2026-04-21. M2 (brain MVP + session persistence) ✅ landed 2026-04-22 on `feat/m2-brain-mvp` — Opus tool-use brain, serialized event router with coalescer, utterance queue + speech-check gate, Redis `SessionState` with no-TTL + CAS, `brain_snapshots` ingest route + replay CLI, Hinglish-friendly STT. See `docs/plans/2026-04-22-001-feat-m2-brain-mvp-plan.md` for the execution checkpoint and deferred work. **Next:** M3 — `POST /sessions`, Excalidraw canvas + canvas_change event priority, streaming LLM→TTS preamble.
 
 ### M1 audio extras + manual mic test
 
@@ -106,7 +106,15 @@ The agent ships Metal/MPS-only audio deps (`pywhispercpp`, `streaming-tts`) behi
 uv sync --all-packages --extra audio   # macOS only
 ```
 
-Use `/session/dev-test` (fixed room `session-dev-test`) to smoke-test the browser → LiveKit → agent path before M2 ships real session creation. See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` for the full M0…M6 breakdown.
+Use `/session/dev-test` (fixed room `session-dev-test`) to smoke-test the browser → LiveKit → agent path — M2 still runs through this route; `POST /sessions` lands in M3. See `docs/plans/2026-04-17-001-feat-ai-system-design-mentor-plan.md` for the full M0…M6 breakdown and `docs/plans/2026-04-22-001-feat-m2-brain-mvp-plan.md` for the M2 execution checkpoint.
+
+After running `scripts/dev.sh` and `alembic upgrade head`, seed the dev problem + session:
+
+```bash
+uv run python scripts/seed_dev_session.py --email you@example.com
+```
+
+This writes the URL-shortener problem + rubric from `apps/agent/archmentor_agent/brain/bootstrap.py` to Postgres so the agent's in-memory `ProblemCard` matches the stored row byte-for-byte.
 
 ## Gotchas
 
@@ -122,5 +130,11 @@ Use `/session/dev-test` (fixed room `session-dev-test`) to smoke-test the browse
 - **`load_dotenv(override=True)` is dev-only.** Agent `main.py` gates override on `ARCHMENTOR_ENV=dev`; any other value runs shell-wins so orchestrator-injected secrets aren't silently overwritten by a stale `.env`.
 - **`.env.example` placeholders are rejected at startup.** `Settings` refuses any secret containing the `replace_with_` marker. Copying `.env.example` without editing fails loudly.
 - **`WhisperCppSTT._resample_to_whisper_rate` raises on empty output.** Never fall back to the original wrong-rate buffer — whisper turns it into fabricated transcripts.
+- **`_MIN_SPEECH_RMS` is a noise-floor calibration knob, not a feature flag.** `apps/agent/archmentor_agent/audio/stt.py::_MIN_SPEECH_RMS = 0.015` skips whisper inference on buffers below that pre-normalization RMS. It's the cheap first line of defence against whisper-on-silence hallucinations (no inference, no cost, no "Thank you." passing through). In the noisy-room manual test (2026-04-23), buffers at RMS 0.02–0.03 slipped past the gate and produced "Thank you." hallucinations; `main._is_whisper_hallucination` catches those downstream, but the RMS gate is the cheaper filter. Tuning: raise toward 0.02–0.025 for noisy environments (trade-off: drops very quiet candidate speech); lower toward 0.010 for studio-quiet setups (trade-off: more hallucinations reach the text filter). Not exposed as an env var today — if operator-level tuning becomes common, wire it through `Settings.whisper_min_rms` rather than importing the constant from main. Related: `_NORMALIZE_TARGET_RMS = 0.15` is the whisper-training-match gain target and must not be changed without re-validating inference quality.
 - **Model singletons use `threading.Lock`.** `audio/stt.py::_load_model` and `tts/kokoro.py::_load_engine` double-check-lock because they run on the default thread-pool executor. New singletons must follow the same pattern.
 - **`scripts/kill.sh` for full teardown.** `pkill -f archmentor_agent.main` misses the `multiprocessing.spawn` workers livekit-agents dispatches; `kill.sh` sweeps orphans by venv path + websocket fingerprint.
+- **Redis session keys have NO TTL by design.** `MentorAgent.shutdown()` calls `store.delete(session_id)` explicitly; a crashed worker leaves an orphan `session:<id>:state` key until M6's stale-session reaper. Manual cleanup: `redis-cli KEYS 'session:*:state' | xargs redis-cli DEL`.
+- **`queue.dropped_stale` at push time = slow brain, not queue bug.** `t_ms` is assigned at dispatch entry (router invariant I3), before the Opus await. When a brain call takes ≥10s (7–15s per call observed on Opus 4.7 via Unbound), the utterance's `generated_at_ms` is already past TTL when `queue.push` runs, and the next `pop_if_fresh` drops it on first inspection. Signature in logs: `age_ms ≈ ttl_ms + brain_latency`. Bumping `PendingUtterance.ttl_ms` is the M2 knob; M4's streaming path is the real fix.
+- **Dev ProblemCard is in two places deliberately.** `apps/agent/archmentor_agent/brain/bootstrap.py` defines the URL-shortener problem in-process (agent hands it to the brain at `on_enter`), and `scripts/seed_dev_session.py` writes the same strings to Postgres. Both read the same module constants — any edit must land in `bootstrap.py` and be followed by a re-seed. M3's `POST /sessions` replaces the in-process path with an API fetch.
+- **`scripts/replay.py --snapshot` needs BOTH API and agent env vars.** The script imports `archmentor_api.db.engine` (reads `API_*`) and `archmentor_agent.brain.client` (reads `ARCHMENTOR_*`). It calls `load_dotenv(repo_root/.env)` at module top before those imports, so running from any shell works as long as `.env` is populated; an explicit export still wins (shell-wins, no `override=True`). Tests under `apps/agent/tests/` seed both sets directly — they don't go through `.env`.
+- **Brain client runs against Anthropic-compatible gateways, not just direct Anthropic.** `ARCHMENTOR_ANTHROPIC_BASE_URL` routes through a proxy (e.g. `https://api.getunbound.ai`); the Anthropic SDK auto-appends `/v1/messages`. Unbound (and LiteLLM-style gateways generally) use provider-prefixed model ids — default `ARCHMENTOR_BRAIN_MODEL` is `anthropic/claude-opus-4-7` for that reason. For direct Anthropic, set `ARCHMENTOR_BRAIN_MODEL=claude-opus-4-7`. Both ids are registered in `brain/pricing.py::BRAIN_RATES`; adding a new model id requires a new row there or `estimate_cost_usd` hard-raises `KeyError`.

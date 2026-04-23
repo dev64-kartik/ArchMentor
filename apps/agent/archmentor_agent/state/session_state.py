@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -125,3 +126,66 @@ class SessionState(BaseModel):
     tokens_input_total: int = 0
     tokens_output_total: int = 0
     cost_usd_total: float = 0.0
+    # Per-session cap, seeded from `sessions.cost_cap_usd` at on_enter.
+    # The router short-circuits to `BrainDecision.cost_capped()` once
+    # `cost_usd_total >= cost_cap_usd`. Default mirrors the API column
+    # default ($5 / session).
+    cost_cap_usd: float = 5.0
+
+    def with_state_updates(self, updates: dict[str, Any]) -> SessionState:
+        """Apply a brain-emitted ``state_updates`` payload.
+
+        The brain's tool schema uses sub-keys that do NOT match
+        ``SessionState`` field names 1:1 — ``phase_advance``,
+        ``rubric_coverage_delta``, ``new_decision``,
+        ``new_active_argument``, ``session_summary_append``. Passing the
+        dict through ``model_copy(update=...)`` would silently drop all
+        of them because they're not real fields, leaving the decisions
+        log empty and phase stuck at ``INTRO`` for the whole session.
+
+        This method performs the explicit translation and re-validates
+        the result through Pydantic so a malformed sub-value (e.g.,
+        ``phase_advance="bogus"``) raises instead of corrupting state.
+
+        An absent or ``None`` value for any sub-key means "no change"
+        — this preserves backward-compatibility with partial updates.
+
+        Args:
+            updates: The ``state_updates`` dict from ``BrainDecision``.
+
+        Returns:
+            A new ``SessionState`` with the updates applied. Returns
+            ``self`` unchanged if ``updates`` is empty.
+        """
+        if not updates:
+            return self
+
+        data = self.model_dump()
+
+        phase_advance = updates.get("phase_advance")
+        if phase_advance is not None:
+            data["phase"] = phase_advance
+
+        rubric_delta = updates.get("rubric_coverage_delta")
+        if rubric_delta:
+            merged = dict(data.get("rubric_coverage") or {})
+            merged.update(rubric_delta)
+            data["rubric_coverage"] = merged
+
+        new_decision = updates.get("new_decision")
+        if new_decision:
+            decisions = list(data.get("decisions") or [])
+            decisions.append(new_decision)
+            data["decisions"] = decisions
+
+        new_active_argument = updates.get("new_active_argument")
+        if new_active_argument is not None:
+            data["active_argument"] = new_active_argument
+
+        summary_append = updates.get("session_summary_append")
+        if summary_append:
+            existing = data.get("session_summary") or ""
+            sep = "\n\n" if existing else ""
+            data["session_summary"] = f"{existing}{sep}{summary_append}"
+
+        return SessionState.model_validate(data)
