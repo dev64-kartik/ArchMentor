@@ -27,20 +27,32 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from dotenv import load_dotenv
+
+# Load repo-root `.env` before importing `archmentor_*`. Both the API
+# and agent Settings classes run placeholder-rejection at import time;
+# without this, running the script from a shell that hasn't already
+# exported `.env` keys fails with a confusing "missing placeholder"
+# error. Shell-wins (no `override=True`) so an explicit export still
+# beats the file — matches the non-dev posture in `main.py`.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(_REPO_ROOT / ".env")
+
 # Registers SQLModel metadata + pulls the API's Settings singleton.
-import archmentor_api.models  # noqa: F401 — register tables on metadata
-from archmentor_agent.brain.client import BrainClient, get_brain_client
-from archmentor_agent.brain.decision import BrainDecision
-from archmentor_agent.brain.pricing import BRAIN_MODEL
-from archmentor_agent.brain.prompt_builder import build_call_kwargs
-from archmentor_agent.brain.tools import INTERVIEW_DECISION_TOOL
-from archmentor_agent.state.session_state import SessionState
-from archmentor_api.db import engine
-from archmentor_api.models.brain_snapshot import BrainSnapshot
-from sqlmodel import Session
+import archmentor_api.models  # noqa: F401, E402 — register tables on metadata
+from archmentor_agent.brain.client import BrainClient, get_brain_client  # noqa: E402
+from archmentor_agent.brain.decision import BrainDecision  # noqa: E402
+from archmentor_agent.brain.pricing import BRAIN_MODEL  # noqa: E402
+from archmentor_agent.brain.prompt_builder import build_call_kwargs  # noqa: E402
+from archmentor_agent.brain.tools import INTERVIEW_DECISION_TOOL  # noqa: E402
+from archmentor_agent.state.session_state import SessionState  # noqa: E402
+from archmentor_api.db import engine  # noqa: E402
+from archmentor_api.models.brain_snapshot import BrainSnapshot  # noqa: E402
+from sqlmodel import Session  # noqa: E402
 
 # Mirrors `archmentor_agent.brain.client._MAX_TOKENS`. Keeping it
 # duplicated (not imported) keeps the replay path deterministic even if
