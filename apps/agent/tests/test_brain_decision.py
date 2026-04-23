@@ -183,3 +183,19 @@ class TestBrainDecisionFactories:
         assert d.decision == "stay_silent"
         assert d.reason == "cost_capped"
         assert d.confidence == 1.0
+
+    def test_all_silent_factories_share_skeleton(self) -> None:
+        """The three stay-silent constructors route through a single
+        `_silent` helper. Locking in the shape means a future field
+        added to `BrainDecision` only has to be threaded once, not
+        three times.
+        """
+        schema = BrainDecision.schema_violation(None)
+        generic = BrainDecision.stay_silent("network_error")
+        capped = BrainDecision.cost_capped()
+
+        for d in (schema, generic, capped):
+            assert d.decision == "stay_silent"
+            assert d.priority == "low"
+            assert d.utterance is None
+            assert d.reasoning == ""

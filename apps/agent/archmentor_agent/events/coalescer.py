@@ -66,8 +66,14 @@ def coalesce(events: list[RouterEvent]) -> RouterEvent:
             payload=merged_payload,
         )
 
-    # No turn_end → the latest event wins. M2 has only LONG_SILENCE and
-    # PHASE_TIMER landing here; payload comes through verbatim.
+    # No turn_end → the latest event wins (priority is undefined for a
+    # no-speech batch in M2; see the module docstring "priority is
+    # undefined" note). M2 has only LONG_SILENCE and PHASE_TIMER
+    # landing here; payload comes through verbatim. M3 introduces a
+    # priority field on RouterEvent so `canvas_change` can preempt —
+    # that change will replace this latest-wins branch with a
+    # priority-aware merge, so a future reader tracing a weird merge
+    # outcome should start here.
     latest = max(events, key=lambda e: e.t_ms)
     return RouterEvent(
         type=latest.type,

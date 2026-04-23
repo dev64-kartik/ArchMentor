@@ -32,6 +32,7 @@ import importlib
 import threading
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 import structlog
@@ -62,14 +63,57 @@ def _state_key(session_id: UUID) -> str:
     return f"session:{session_id}:state"
 
 
+def _redact_redis_url(url: str) -> str:
+    """Strip userinfo from a Redis URL for structured logs.
+
+    ``redis://:hunter2@host:6379/0`` becomes ``redis://host:6379/0``.
+    Kept separate from ``SecretStr`` — the URL itself must stay plain
+    for ``redis.from_url`` to consume, but a stray log of the full
+    string would leak the password embedded in the userinfo component.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<invalid-url>"
+    if not parts.hostname:
+        return "<invalid-url>"
+    netloc = parts.hostname
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+_REDIS_ASYNC_MODULE: Any | None = None
+_WATCH_ERROR_CLS: type[Exception] | None = None
+
+
 def _get_redis_module() -> Any:
     """Lazy import of `redis.asyncio`.
 
     Resolved on first call from any RedisSessionStore method. Mirrors
     `audio/stt.py::_load_model`'s pattern so `pytest` collection on
     machines without a Redis client wheel doesn't blow up at import.
+    Cached after first resolution so the hot CAS path doesn't re-run
+    `importlib.import_module` on every `apply()` call.
     """
-    return importlib.import_module("redis.asyncio")
+    global _REDIS_ASYNC_MODULE
+    if _REDIS_ASYNC_MODULE is None:
+        _REDIS_ASYNC_MODULE = importlib.import_module("redis.asyncio")
+    return _REDIS_ASYNC_MODULE
+
+
+def _get_watch_error_cls() -> type[Exception]:
+    """Lazy, cached access to ``redis.exceptions.WatchError``.
+
+    Called inside every ``apply()`` to identify concurrent-write
+    conflicts. ``WatchError`` is module-stable, so caching the class
+    reference on first resolution is safe and avoids a per-call
+    ``importlib.import_module`` on the CAS hot path.
+    """
+    global _WATCH_ERROR_CLS
+    if _WATCH_ERROR_CLS is None:
+        _WATCH_ERROR_CLS = importlib.import_module("redis.exceptions").WatchError
+    return _WATCH_ERROR_CLS
 
 
 class RedisSessionStore:
@@ -131,7 +175,7 @@ class RedisSessionStore:
         key = _state_key(session_id)
         # `redis.exceptions.WatchError` is the canonical signal that a
         # concurrent writer modified the key between our WATCH and EXEC.
-        watch_error_cls = importlib.import_module("redis.exceptions").WatchError
+        watch_error_cls = _get_watch_error_cls()
 
         async with self._client.pipeline(transaction=True) as pipe:
             for attempt in range(max_retries + 1):
@@ -196,7 +240,7 @@ def get_redis_store(settings: Settings | None = None) -> RedisSessionStore:
         if _STORE_SINGLETON is not None:
             return _STORE_SINGLETON
         cfg = settings or get_settings()
-        log.info("redis.store.init", url=cfg.redis_url)
+        log.info("redis.store.init", url=_redact_redis_url(cfg.redis_url))
         _STORE_SINGLETON = RedisSessionStore(cfg.redis_url)
         return _STORE_SINGLETON
 

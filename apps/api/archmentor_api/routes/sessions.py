@@ -192,11 +192,14 @@ def append_brain_snapshot(
     # Aggregate byte check across all four JSON blobs + reasoning text.
     # A session_state_json that's narrowly under cap but combined with
     # a reasoning_text blob pushes total storage over — checking the
-    # sum is what actually bounds the row size at rest.
+    # sum is what actually bounds the row size at rest. All four
+    # measurements use UTF-8 byte length so multi-byte Unicode (e.g.
+    # the Hinglish transcript path) is counted accurately instead of
+    # being undercounted by `len(str)`.
     total_bytes = (
-        len(json.dumps(body.session_state_json))
-        + len(json.dumps(body.event_payload_json))
-        + len(json.dumps(body.brain_output_json))
+        len(json.dumps(body.session_state_json).encode("utf-8"))
+        + len(json.dumps(body.event_payload_json).encode("utf-8"))
+        + len(json.dumps(body.brain_output_json).encode("utf-8"))
         + len(body.reasoning_text.encode("utf-8"))
     )
     if total_bytes > _MAX_SNAPSHOT_PAYLOAD_BYTES:

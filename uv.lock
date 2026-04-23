@@ -263,7 +263,7 @@ provides-extras = ["audio"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "fakeredis", specifier = ">=2.33" },
+    { name = "fakeredis", specifier = "==2.35.1" },
     { name = "pytest", specifier = "==9.0.3" },
     { name = "pytest-asyncio", specifier = "==1.3.0" },
     { name = "ruff", specifier = "==0.15.11" },

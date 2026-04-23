@@ -30,6 +30,7 @@ import threading
 from typing import Any
 
 import anthropic
+import httpx
 import structlog
 from anthropic import AsyncAnthropic
 from anthropic.types import Message, ToolUseBlock, Usage
@@ -45,6 +46,15 @@ from archmentor_agent.state import SessionState
 log = structlog.get_logger(__name__)
 
 _MAX_TOKENS = 1024
+
+# Bounds a single Anthropic call. Without this, the SDK default of 600 s
+# combined with `max_retries=2` (= 3 total attempts) would let a hung
+# gateway hold the router's serialization gate for ~30 min. Opus
+# latency observed in M2 is 7-15 s per call, so a 120 s read timeout
+# leaves ~100 s headroom. `connect`/`write`/`pool` are tight because
+# those phases shouldn't need more than a few seconds on any healthy
+# network.
+_BRAIN_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
 
 # `Draft202012Validator(schema)` is compiled once per process; reusing
 # it avoids re-parsing the schema on every brain call. The schema is a
@@ -78,6 +88,7 @@ class BrainClient:
             # SDK-level retry covers 429 + 5xx + APIConnectionError
             # with exponential backoff. 2 retries = 3 total attempts.
             max_retries=2,
+            timeout=_BRAIN_TIMEOUT,
         )
 
     async def decide(

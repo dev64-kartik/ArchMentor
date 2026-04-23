@@ -26,11 +26,31 @@ from archmentor_agent.state import (
     RedisSessionStore,
     SessionState,
 )
+from archmentor_agent.state.redis_store import _redact_redis_url
 from archmentor_agent.state.session_state import (
     DesignDecision,
     InterviewPhase,
     ProblemCard,
 )
+
+
+def test_redact_redis_url_strips_password() -> None:
+    """Userinfo (including the embedded password) must be dropped so
+    ``redis.store.init`` log lines don't leak credentials from the
+    URL-encoded form of the config. The returned URL still identifies
+    the host so logs remain useful.
+    """
+    assert (
+        _redact_redis_url("redis://:hunter2@redis.internal:6379/0")
+        == "redis://redis.internal:6379/0"
+    )
+    # user-only (no password) and plain URLs round-trip.
+    assert (
+        _redact_redis_url("redis://admin@redis.internal:6379/0") == "redis://redis.internal:6379/0"
+    )
+    assert _redact_redis_url("redis://localhost:6379/0") == "redis://localhost:6379/0"
+    # Malformed input fails closed rather than leaking a half-parsed URL.
+    assert _redact_redis_url("not a url") == "<invalid-url>"
 
 
 def _make_state(*, decisions: list[DesignDecision] | None = None) -> SessionState:

@@ -64,6 +64,10 @@ _REPLAY_MAX_TOKENS = 1024
 EXIT_MATCH = 0
 EXIT_DIVERGED = 1
 EXIT_NOT_FOUND = 2
+# Distinct from NOT_FOUND so an automated caller can tell "I invoked
+# the script wrong" (missing/invalid args) from "the snapshot UUID
+# resolved but no matching row exists in Postgres."
+EXIT_USAGE = 3
 
 
 BrainClientFactory = Callable[[], BrainClient]
@@ -106,7 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--session",
         metavar="UUID",
-        help="Session id for multi-snapshot replay (deferred to a later milestone).",
+        help="(RESERVED — not yet implemented) Session id for multi-snapshot replay.",
     )
     parser.add_argument(
         "--run",
@@ -125,10 +129,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def _reject_session_mode(args: argparse.Namespace) -> None:
     """Multi-snapshot replay is reserved — bail loudly if attempted."""
     if args.session is not None:
-        raise SystemExit(
+        print(
             "`--session` replay is reserved for a later milestone. "
-            "Use `--snapshot <uuid>` to replay a single row."
+            "Use `--snapshot <uuid>` to replay a single row.",
+            file=sys.stderr,
         )
+        raise SystemExit(EXIT_USAGE)
 
 
 def _load_snapshot(session_id: str) -> BrainSnapshot | None:
@@ -335,7 +341,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _reject_session_mode(args)
     if args.snapshot is None:
-        parser.error("--snapshot <uuid> is required (--session is reserved).")
+        # Distinct from EXIT_NOT_FOUND: an automated caller that sees
+        # exit 3 knows it invoked the script wrong, not that the UUID
+        # resolved but is absent from Postgres.
+        print(
+            "--snapshot <uuid> is required (--session is reserved).",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
     # Redundant but explicit: only enforce --yes once `--session` is
     # actually wired. Preserved here so the argparse flag isn't dead.
     _ = args.yes

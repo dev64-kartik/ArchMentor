@@ -40,7 +40,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -78,14 +77,6 @@ class LedgerLogger(Protocol):
     """
 
     def __call__(self, event_type: str, payload: dict[str, Any]) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class _SnapshotPost:
-    t_ms: int
-    state: SessionState
-    event_payload: dict[str, Any]
-    decision: BrainDecision
 
 
 SnapshotScheduler = Callable[[Awaitable[bool]], None]
@@ -338,11 +329,13 @@ class EventRouter:
                     "cost_usd_total": base.cost_usd_total + usage.cost_usd,
                 }
             )
-            # `state_updates` is a brain-controlled dict mirroring
-            # SessionState fields; Pydantic re-validates so a malformed
-            # update raises rather than silently corrupting state.
+            # `state_updates` sub-keys (phase_advance, rubric_coverage_delta,
+            # new_decision, new_active_argument, session_summary_append) do
+            # NOT match SessionState field names. `with_state_updates`
+            # translates them and re-validates — a direct `model_copy`
+            # would silently drop them.
             if decision.state_updates:
-                updated = updated.model_copy(update=dict(decision.state_updates))
+                updated = updated.with_state_updates(dict(decision.state_updates))
             return updated
 
         try:

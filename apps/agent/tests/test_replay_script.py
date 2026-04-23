@@ -10,7 +10,7 @@ via SQLModel) and the agent (runs the fresh decision through
   Anthropic calls leak out of the test run.
 
 Covers the four documented exit codes (`EXIT_MATCH`, `EXIT_DIVERGED`,
-`EXIT_NOT_FOUND`) plus the placeholder-key fail-closed path.
+`EXIT_NOT_FOUND`, `EXIT_USAGE`) plus the placeholder-key fail-closed path.
 """
 
 from __future__ import annotations
@@ -270,11 +270,14 @@ def test_missing_snapshot_returns_exit_2(
 
 def test_session_mode_is_refused(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """`--session` replay is reserved — argparse must bail with SystemExit."""
+    """`--session` replay is reserved — bail with a usage-error exit code."""
     monkeypatch.setenv("ARCHMENTOR_ANTHROPIC_API_KEY", "sk-ant-test-fixture-not-a-real-key")
-    with pytest.raises(SystemExit, match="reserved"):
+    with pytest.raises(SystemExit) as excinfo:
         replay.main(["--session", str(uuid4())])
+    assert excinfo.value.code == replay.EXIT_USAGE
+    assert "reserved" in capsys.readouterr().err
 
 
 def test_run_refuses_placeholder_api_key(

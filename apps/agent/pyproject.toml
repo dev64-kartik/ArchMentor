@@ -59,8 +59,9 @@ dev = [
     "ty==0.0.31",
     # In-process Redis fake for `RedisSessionStore` tests. 2.33+ ships
     # `FakeAsyncRedis` parity with redis-py 7.x and the shared
-    # `FakeServer` pattern needed for concurrent CAS tests.
-    "fakeredis>=2.33",
+    # `FakeServer` pattern needed for concurrent CAS tests. Pinned
+    # exact — see global CLAUDE.md: pin exact versions.
+    "fakeredis==2.35.1",
 ]
 
 [build-system]

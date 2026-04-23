@@ -479,7 +479,16 @@ async def test_coalesced_batch_writes_single_snapshot() -> None:
 
 @pytest.mark.asyncio
 async def test_state_updates_persist_to_store() -> None:
-    """A `state_updates` dict from the brain rolls into the next state."""
+    """A `state_updates` dict from the brain rolls into the next state.
+
+    The tool schema's sub-keys (``phase_advance``, ``new_decision``,
+    ``session_summary_append``…) don't match ``SessionState`` field
+    names 1:1 — the router routes them through
+    ``SessionState.with_state_updates`` which translates + validates.
+    This test locks in that a realistic brain payload actually lands
+    in the real fields (prior to the translator, this silently dropped
+    every update).
+    """
     brain = FakeBrainClient()
     brain.enqueue(
         BrainDecision(
@@ -487,7 +496,16 @@ async def test_state_updates_persist_to_store() -> None:
             priority="low",
             confidence=0.9,
             reasoning="track summary",
-            state_updates={"session_summary": "candidate clarified scope"},
+            state_updates={
+                "phase_advance": "requirements",
+                "session_summary_append": "candidate clarified scope",
+                "new_decision": {
+                    "t_ms": 42000,
+                    "decision": "Use consistent hashing",
+                    "reasoning": "even distribution across shards",
+                    "alternatives": ["mod-n"],
+                },
+            },
             usage=BrainUsage(input_tokens=10, output_tokens=2, cost_usd=0.001),
         )
     )
@@ -498,7 +516,10 @@ async def test_state_updates_persist_to_store() -> None:
     await _await_snapshots(snap_tasks)
 
     state_after = store._states[SESSION_ID]
+    assert state_after.phase.value == "requirements"
     assert state_after.session_summary == "candidate clarified scope"
+    assert len(state_after.decisions) == 1
+    assert state_after.decisions[0].decision == "Use consistent hashing"
     assert state_after.cost_usd_total == pytest.approx(0.001)
     assert state_after.tokens_input_total == 10
     assert state_after.tokens_output_total == 2

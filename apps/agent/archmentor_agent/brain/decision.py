@@ -32,9 +32,15 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from archmentor_agent.brain import pricing
+
+# Mirrors the enum values in INTERVIEW_DECISION_TOOL["input_schema"]. A
+# type-checker catches a drift here at compile time instead of the
+# router hitting a surprise string at runtime.
+DecisionKind = Literal["speak", "stay_silent", "update_only"]
+PriorityKind = Literal["high", "medium", "low"]
 
 # Prompt-injection belt: if the model emits a pathologically long
 # utterance (e.g. a prompt-injection payload echoing back), drop it.
@@ -50,6 +56,13 @@ def _utterance_has_control_chars(text: str) -> bool:
     Newline, carriage return, and tab are allowed — Kokoro tokenizes on
     whitespace, and the brain legitimately emits multi-sentence
     utterances with a newline between them.
+
+    This explicitly catches Unicode category ``Cf`` (format) — that
+    bucket contains bidi overrides (U+202A..U+202E, U+2066..U+2069)
+    and zero-width joiners used in visual spoofing / bidi-exploit
+    payloads. Do NOT widen the exemption list beyond the three
+    whitespace characters above without revisiting the injection-
+    defence posture in ``brain/prompts/system.md`` ``[Security]``.
     """
     for ch in text:
         if ch in ("\n", "\r", "\t"):
@@ -107,8 +120,8 @@ class BrainDecision:
     into `brain_snapshots.brain_output_json` for exact replay.
     """
 
-    decision: str  # "speak" | "stay_silent" | "update_only"
-    priority: str  # "high" | "medium" | "low"
+    decision: DecisionKind
+    priority: PriorityKind
     confidence: float
     reasoning: str
     utterance: str | None = None
@@ -166,6 +179,32 @@ class BrainDecision:
         )
 
     @classmethod
+    def _silent(
+        cls,
+        *,
+        reason: str,
+        confidence: float,
+        usage: BrainUsage | None = None,
+        raw_input: dict[str, Any] | None = None,
+    ) -> BrainDecision:
+        """Shared skeleton for every ``decision="stay_silent"`` factory.
+
+        Keeps the three public constructors below — ``schema_violation``,
+        ``stay_silent``, ``cost_capped`` — as one-liners so adding a
+        field to ``BrainDecision`` is a single edit here, not three.
+        """
+        return cls(
+            decision="stay_silent",
+            priority="low",
+            confidence=confidence,
+            reasoning="",
+            utterance=None,
+            reason=reason,
+            usage=usage or BrainUsage(),
+            raw_input=dict(raw_input or {}),
+        )
+
+    @classmethod
     def schema_violation(
         cls,
         raw_input: dict[str, Any] | None,
@@ -178,15 +217,11 @@ class BrainDecision:
         consecutive schema violations trigger the
         `brain.schema_violation.escalated` log + ledger event.
         """
-        return cls(
-            decision="stay_silent",
-            priority="low",
-            confidence=0.0,
-            reasoning="",
-            utterance=None,
+        return cls._silent(
             reason="schema_violation",
-            usage=usage or BrainUsage(),
-            raw_input=dict(raw_input or {}),
+            confidence=0.0,
+            usage=usage,
+            raw_input=raw_input,
         )
 
     @classmethod
@@ -201,15 +236,7 @@ class BrainDecision:
         Used for unexpected `stop_reason`, post-retry Anthropic failures,
         and any other "voice loop must not break" path.
         """
-        return cls(
-            decision="stay_silent",
-            priority="low",
-            confidence=0.0,
-            reasoning="",
-            utterance=None,
-            reason=reason,
-            usage=usage or BrainUsage(),
-        )
+        return cls._silent(reason=reason, confidence=0.0, usage=usage)
 
     @classmethod
     def cost_capped(cls) -> BrainDecision:
@@ -219,20 +246,14 @@ class BrainDecision:
         no ambiguity). Still has `reason=cost_capped` so the router
         writes a snapshot + ledger event for operator visibility.
         """
-        return cls(
-            decision="stay_silent",
-            priority="low",
-            confidence=1.0,
-            reasoning="",
-            utterance=None,
-            reason="cost_capped",
-            usage=BrainUsage(),
-        )
+        return cls._silent(reason="cost_capped", confidence=1.0)
 
 
 __all__ = [
     "BrainDecision",
     "BrainUsage",
+    "DecisionKind",
+    "PriorityKind",
     "pricing",
     "sanitize_utterance",
 ]

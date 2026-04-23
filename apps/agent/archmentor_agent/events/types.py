@@ -3,8 +3,11 @@
 `RouterEvent` is the only shape the router consumes. M2 wires
 `turn_end`, `long_silence`, and `phase_timer`; `canvas_change` is
 declared so the M3 implementation can flip from the
-`NotImplementedError` guard without renaming. `session_start`,
-`wrapup_timer`, and `session_end` are placeholders for later milestones.
+`NotImplementedError` guard without renaming. Later-milestone event
+types (session_start, wrapup_timer, session_end) are intentionally NOT
+declared here — they'll land alongside the code that consumes them so
+an accidental dispatch can't silently fall through a handler-less
+enum value.
 
 `payload` is intentionally typed as `dict[str, Any]`. Each event type
 puts a different shape inside (transcript text, silence duration,
@@ -25,9 +28,6 @@ class EventType(StrEnum):
     LONG_SILENCE = "long_silence"
     CANVAS_CHANGE = "canvas_change"
     PHASE_TIMER = "phase_timer"
-    SESSION_START = "session_start"
-    WRAPUP_TIMER = "wrapup_timer"
-    SESSION_END = "session_end"
 
 
 @dataclass(frozen=True, slots=True)

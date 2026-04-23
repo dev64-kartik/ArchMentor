@@ -33,6 +33,8 @@ import contextlib
 import json
 import os
 import time
+from collections.abc import Awaitable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -57,7 +59,7 @@ from archmentor_agent.brain.bootstrap import (
     build_dev_problem_card,
 )
 from archmentor_agent.brain.client import BrainClient
-from archmentor_agent.config import get_settings
+from archmentor_agent.config import Settings, get_settings
 from archmentor_agent.events.router import EventRouter
 from archmentor_agent.events.types import EventType, RouterEvent
 from archmentor_agent.ledger import LedgerClient, LedgerConfig
@@ -146,6 +148,7 @@ def _is_whisper_hallucination(text: str) -> bool:
     return any(phrase in stripped for phrase in _HALLUCINATION_PHRASES)
 
 
+@dataclass(frozen=True, slots=True)
 class _BrainWiring:
     """Bundle of per-session brain collaborators.
 
@@ -154,22 +157,12 @@ class _BrainWiring:
     components) rather than threading six kwargs through every test.
     """
 
-    def __init__(
-        self,
-        *,
-        brain: BrainClient,
-        store: RedisSessionStore,
-        snapshot_client: SnapshotClient,
-        router: EventRouter,
-        queue: UtteranceQueue,
-        gate: SpeechCheckGate,
-    ) -> None:
-        self.brain = brain
-        self.store = store
-        self.snapshot_client = snapshot_client
-        self.router = router
-        self.queue = queue
-        self.gate = gate
+    brain: BrainClient
+    store: RedisSessionStore
+    snapshot_client: SnapshotClient
+    router: EventRouter
+    queue: UtteranceQueue
+    gate: SpeechCheckGate
 
 
 def build_initial_session_state(
@@ -359,7 +352,8 @@ class MentorAgent(Agent):
 
     async def _run_brain_turn(self, *, text: str, turn_t_ms: int) -> None:
         """Brain path: dispatch to router, wait for decision, speak if any."""
-        assert self._brain is not None  # narrowed by caller
+        if self._brain is None:
+            raise RuntimeError("_run_brain_turn called with no brain wiring")
         brain = self._brain
 
         # The interim handler already flipped the gate to "done
@@ -367,6 +361,12 @@ class MentorAgent(Agent):
         # here in case the final came in without a matching interim
         # (whisper sometimes skips interims on short buffers).
         brain.gate.mark_done_speaking()
+
+        # Drop any utterance still queued from a PREVIOUS brain dispatch
+        # that predates this turn. The 10 s TTL is the fallback; a new
+        # turn is the primary freshness signal — the candidate has now
+        # added context that may have invalidated the older reply.
+        brain.queue.clear_stale_on_new_turn(turn_t_ms)
 
         await self._publish_state("thinking")
 
@@ -410,7 +410,8 @@ class MentorAgent(Agent):
         in M3+ when `long_silence` and `canvas_change` events can push
         utterances outside a natural turn-end.
         """
-        assert self._brain is not None
+        if self._brain is None:
+            raise RuntimeError("_drain_utterance_queue called with no brain wiring")
         brain = self._brain
 
         utterance = brain.queue.pop_if_fresh()
@@ -534,14 +535,17 @@ class MentorAgent(Agent):
         self._ledger_tasks.add(task)
         task.add_done_callback(self._ledger_tasks.discard)
 
-    def schedule_snapshot(self, coro: Any) -> None:
+    def schedule_snapshot(self, coro: Awaitable[bool]) -> None:
         """Router-side callback — schedule a snapshot POST + track it.
 
         The router calls this synchronously from its dispatch loop; we
         wrap the coroutine in a task so the dispatch doesn't block on
         the POST, and retain the task so `shutdown()` can drain it.
+
+        The parameter type mirrors the router's ``SnapshotScheduler``
+        alias so a type-checker catches a mismatched callback shape.
         """
-        task = asyncio.create_task(coro)
+        task = asyncio.ensure_future(coro)
         self._snapshot_tasks.add(task)
         task.add_done_callback(self._snapshot_tasks.discard)
 
@@ -666,11 +670,11 @@ async def entrypoint(ctx: JobContext) -> None:
     """Per-room entrypoint — one instance per session dispatch."""
     session_id = _session_id_from_ctx(ctx)
     settings = get_settings()
-    ledger = LedgerClient(_ledger_config())
+    ledger = LedgerClient(_ledger_config(settings))
 
     # Snapshot client lives for the duration of the session; shared
     # pool covers the fire-and-forget POST traffic from the router.
-    snapshot_client = SnapshotClient(_snapshot_client_config())
+    snapshot_client = SnapshotClient(_snapshot_client_config(settings))
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -806,7 +810,7 @@ def _session_id_from_ctx(ctx: JobContext) -> UUID:
         ) from exc
 
 
-def _ledger_config() -> LedgerConfig:
+def _ledger_config(settings: Settings | None = None) -> LedgerConfig:
     """Build the ledger client config from `Settings`.
 
     Settings construction itself enforces presence + non-placeholder on
@@ -814,26 +818,32 @@ def _ledger_config() -> LedgerConfig:
     `get_settings()` raises `pydantic.ValidationError` at import time
     when the env var is missing. Tests that exercise the missing-token
     failure mode now assert against `ValidationError`, not `RuntimeError`.
+
+    Passing ``settings`` explicitly lets the entrypoint reuse the
+    object it already resolved; the default path falls back to the
+    cached singleton so existing callers (tests, legacy call sites)
+    don't have to thread it through.
     """
-    settings = get_settings()
+    cfg = settings or get_settings()
     return LedgerConfig(
-        base_url=settings.api_url,
-        agent_token=settings.agent_ingest_token.get_secret_value(),
+        base_url=cfg.api_url,
+        agent_token=cfg.agent_ingest_token.get_secret_value(),
     )
 
 
-def _snapshot_client_config() -> SnapshotClientConfig:
+def _snapshot_client_config(settings: Settings | None = None) -> SnapshotClientConfig:
     """Build the snapshot client config from `Settings`.
 
     Shares the `agent_ingest_token` with the ledger — the events and
     snapshots ingest routes live on the same trust boundary and M2
     intentionally does not split them (see plan "Deferred Production
-    Concerns").
+    Concerns"). When M3 splits the tokens this function and
+    ``_ledger_config`` become the single place to diverge them.
     """
-    settings = get_settings()
+    cfg = settings or get_settings()
     return SnapshotClientConfig(
-        base_url=settings.api_url,
-        agent_token=settings.agent_ingest_token.get_secret_value(),
+        base_url=cfg.api_url,
+        agent_token=cfg.agent_ingest_token.get_secret_value(),
     )
 
 
