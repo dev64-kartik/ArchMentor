@@ -15,11 +15,11 @@ Replace M1's static turn-end acknowledgement with the real interview brain: a no
 
 Scope deliberately trimmed from the origin plan's M2 bullet list: Langfuse wiring, `POST /sessions`, streaming LLM→TTS, Haiku summary compression, and content-based phase transitions all defer to later milestones. M2 proves the brain loop end-to-end on the existing `/session/dev-test` flow.
 
-**Status:** ✅ All 10 units landed 2026-04-22 on `feat/m2-brain-mvp`.
+**Status:** ✅ All 10 units landed 2026-04-22 on `feat/m2-brain-mvp`. Post-landing hardening from the ce-review pass landed 2026-04-23 in `009677d` (see "Post-landing hardening" below).
 
 ## Execution Checkpoint
 
-Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
+Last updated 2026-04-23. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 
 | Unit | Status | Commit |
 |------|--------|--------|
@@ -44,6 +44,46 @@ Last updated 2026-04-22. Branch: `feat/m2-brain-mvp` (off `origin/main`).
 - `build_call_kwargs(..., tool: Mapping[str, Any])` accepts `INTERVIEW_DECISION_TOOL` (TypedDict) directly; wrapping in `dict(...)` at the call site trips ty's TypedDict overload resolution. Callers must pass the TypedDict untouched.
 - Cost-guard decision lives in Unit 6 (router), not Unit 3 (client). `BrainClient.decide` only reports the one-call cost delta in `BrainUsage`; the router sums it into `SessionState.cost_usd_total` under the CAS loop.
 - Shared test fakes for the router (and Unit 7) live at `apps/agent/tests/_helpers/` rather than `tests/fakes/` — pytest's `--import-mode=importlib` plus the cross-app `tests` package name (apps/api/tests vs apps/agent/tests) collide on the `tests.fakes` lookup. `apps/agent/conftest.py` injects `apps/agent/tests/` into `sys.path` so test files import as `from _helpers import ...`; `[tool.ty.environment] extra-paths` in root `pyproject.toml` makes ty agree.
+
+### Post-landing hardening (ce-review, commit `009677d`, 2026-04-23)
+
+The ce-review pass (PR #3) surfaced four findings that required code changes before merge. All landed in a single follow-up commit; tests now cover each regression path.
+
+**Correctness blockers**
+
+- **R4 was structurally broken by a translator gap.** Brain `state_updates` sub-keys (`phase_advance`, `rubric_coverage_delta`, `new_decision`, `new_active_argument`, `session_summary_append`) do NOT match `SessionState` field names. The router was applying them via `model_copy(update=...)`, which silently dropped every one — decisions log stayed empty, phase stuck at `INTRO`, rubric coverage never updated. The live test hit the happy path because none of the failing paths are observable in a short session. Fix: `SessionState.with_state_updates(...)` translator that maps sub-keys → real fields and re-validates through Pydantic. Regression test `test_state_updates_persist_to_store` now uses the realistic tool-schema sub-keys so this can't regress silently. Reusable lesson: **test the translator against the schema the brain actually emits, not the one you wish it emitted.**
+- **Missing primary-freshness signal.** `UtteranceQueue.clear_stale_on_new_turn` was defined as the primary freshness signal (10 s TTL was the fallback) but never called — a brain utterance from a cancelled turn could leak into the next turn's pause. Now called at the start of `_run_brain_turn`.
+
+**Reliability**
+
+- **No timeout on `AsyncAnthropic`.** SDK default is 600 s, and with `max_retries=2` that chains to ~30 min of blocked serialization gate on a hung gateway. Added `httpx.Timeout(connect=5, read=120, write=10, pool=5)` — bounds a single hang. A per-session deadline on the full retry chain is deferred (see PR #3 comment).
+
+**Hygiene / quick wins**
+
+- `redis.store.init` log now strips userinfo from `redis_url` so passwords in `redis://:pw@host` URLs don't leak into structured logs.
+- `_BrainWiring` is a proper `@dataclass(frozen=True, slots=True)`.
+- Dead `_SnapshotPost` dataclass removed.
+- Speculative `SESSION_START` / `WRAPUP_TIMER` / `SESSION_END` enum members removed — they had no consumers and no `NotImplementedError` guard.
+- `schema_violation` / `stay_silent` / `cost_capped` factories now share a `_silent(...)` helper; adding a `BrainDecision` field is a single edit.
+- `BrainDecision.decision` / `.priority` narrowed from `str` to `Literal[...]`.
+- Snapshot route byte cap measures UTF-8 bytes consistently across all four payloads (was mixing `len(str)` with `.encode('utf-8')`).
+- `fakeredis` pinned exact (`==2.35.1`, was `>=2.33`).
+- `replay.py` added `EXIT_USAGE = 3` so `--session` refusal / missing `--snapshot` exit distinctly from `EXIT_NOT_FOUND`.
+
+**Deferred — carried into M3+ planning**
+
+Full list in the PR comment. Highlights:
+
+- **Post-parse body-size DoS on `/events` and `/snapshots`** — 16 KiB / 256 KiB caps run after Pydantic deserializes. Needs an ASGI body-size middleware upstream of Pydantic.
+- **Retry-chain budget on the Anthropic client** — per-call timeout is bounded; `max_retries=2` can still chain to ~360 s. Consider `max_retries=0` on `APITimeoutError` or wrap `decide(...)` in an `asyncio.wait_for(...)` deadline.
+- **Hallucination-filter substring match** — could drop real candidate speech that happens to contain a prompt-stem phrase. Needs a ratio-based match.
+- **Cost-cap gap after CAS exhaustion** — if a brain call's CAS update fails, Redis stays stale while real Anthropic spend already happened; the router's `_cost_capped` flag never flips. Narrow (requires concurrent writers; M2 is single-user), but worth a fix when multi-session-per-worker lands.
+- **TOCTOU on snapshot ingest** — SELECT-then-INSERT race on the `ACTIVE` check. Only manifests once M3's `POST /sessions/{id}/end` exists.
+
+**Adversarial P1s reviewed and downgraded** (line-by-line trace does not reproduce):
+
+- "Double-cancel wedge → mute" — `wait_for_idle` correctly re-reads `_in_flight` each iteration and awaits Task B; no stuck-forever state.
+- "Double-apply cost on Redis network drop after EXEC" — requires re-prepend via `except CancelledError`, but network errors hit `except Exception` which drops the batch. No re-dispatch, no double-apply.
 
 ## Problem Frame
 
@@ -164,7 +204,7 @@ Already-built pieces M2 plugs into (do not rewrite):
 - Exact method names on `BrainClient` (e.g., `decide()` vs `call()`) — decide at implementation time based on readability at call sites.
 - Whether `SessionState` persistence uses one big Redis key or splits into hot (`transcript_window`, `pending_utterance`) and cold (`problem`, `system_prompt_version`) keys. Start with one key; split only if single-key CAS contention shows up in logs.
 - Whether `replay.py` diffs JSON side-by-side or summarizes (e.g., decision+confidence+priority only). Depends on how noisy reasoning-text diffs are — decide after first real replay.
-- Cost table (input/output/cache token prices) for Opus 4.6 — fetch current pricing at implementation time and store in `brain/pricing.py`. Pricing drifts; do not hardcode from plan memory.
+- Cost table (input/output/cache token prices) for the Opus model M2 actually lands on — fetch current pricing at implementation time and store in `brain/pricing.py`. Pricing drifts; do not hardcode from plan memory. (Resolved: landed on `anthropic/claude-opus-4-7` + `claude-opus-4-7` with both rows in `BRAIN_RATES`.)
 - Whether to gate brain loop behind a `ARCHMENTOR_BRAIN_ENABLED` kill switch for faster iteration on STT/TTS. Decide once the first integration test passes.
 
 ## High-Level Technical Design
@@ -175,7 +215,7 @@ Already-built pieces M2 plugs into (do not rewrite):
 
 ```text
 AsyncAnthropic.messages.create(
-  model="claude-opus-4-6",
+  model="anthropic/claude-opus-4-7",  # gateway-prefixed; bare id for direct Anthropic
   system=[
     { "type": "text",
       "text": <system.md> + "\n\n" + <problem.statement_md> + "\n\n" + <rubric_yaml>,
@@ -390,7 +430,7 @@ on_turn_end:
 **Files:**
 - Modify: `apps/agent/archmentor_agent/brain/client.py`
 - Create: `apps/agent/archmentor_agent/brain/decision.py` (BrainDecision dataclass + `from_tool_block` constructor)
-- Create: `apps/agent/archmentor_agent/brain/pricing.py` (per-token rates for Opus 4.6; fetch current at implementation time)
+- Create: `apps/agent/archmentor_agent/brain/pricing.py` (per-token rates for the chosen Opus model; fetch current at implementation time — landed as Opus 4.7 per-million rates)
 - Create: `apps/agent/archmentor_agent/brain/prompt_builder.py` (messages + system block composition, pulls `prompts/system.md`)
 - Modify: `apps/agent/archmentor_agent/brain/prompts/system.md` (add `[STT errors]` clause per origin plan line 552, add output-shape reminder)
 - Modify: `apps/agent/pyproject.toml` (add `jsonschema>=4.23` for tool_use.input validation)

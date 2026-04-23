@@ -37,7 +37,7 @@ Real system design interview practice is hard to access: senior engineers willin
 
 - **Whiteboard = embedded Excalidraw, no screen share.** We get structured scene JSON, not pixels. Eliminates vision-model cost, OCR error, and privacy concerns. Screen-share is v2.
 - **Event-driven brain, not polled.** Brain calls triggered at natural discourse boundaries (VAD turn-end, silence threshold, canvas change, periodic timer). Single brain call in flight at a time via serialization gate.
-- **Opus 4.6 for the live brain.** The product *is* staff-level reasoning; we spend here. Haiku for summary compression only. Opus offline for reports.
+- **Opus 4.7 for the live brain.** The product *is* staff-level reasoning; we spend here. Haiku for summary compression only. Opus offline for reports. Model ID lives in `apps/agent/archmentor_agent/brain/pricing.py::BRAIN_MODEL` as a single pin; pricing rows exist for both the provider-prefixed `anthropic/claude-opus-4-7` (for LiteLLM/Unbound gateways) and the bare `claude-opus-4-7` (direct Anthropic).
 - **Tool-use mode for brain output.** Guarantees structured schema compliance; eliminates JSON parse failures that would freeze the mentor mid-session.
 - **Content-based phase transitions, not fixed time windows.** Brain detects topic shifts via rubric coverage and transcript signals. Time used as soft budgets with verbal warnings, not hard walls.
 - **Structured decisions log.** Never-compressed, always-in-context list of candidate's design decisions with reasoning. Prevents "mentor forgot what I said" from Haiku compression loss.
@@ -77,7 +77,7 @@ LiveKit Agent Worker (Python 3.13)
   └─────────────────────────┬───────────────────────────────┘
                             ▼
   ┌─────────────────────────────────────────────────────────┐
-  │ Interview Brain (Claude Opus 4.6, streaming, tool-use)  │
+  │ Interview Brain (Claude Opus 4.7, tool-use)             │
   │   Reads: SessionState (Redis) + event payload           │
   │   Outputs: decision + utterance + state_updates         │
   │   via Anthropic tool_use (guaranteed schema)            │
@@ -93,7 +93,7 @@ FastAPI (control plane)           Redis (hot state)
   + Supabase Auth                 Postgres via Supabase (durable)
         │                         MinIO/S3 (artifacts)
         ▼
-  Report Job (async, Opus 4.6)
+  Report Job (async, Opus 4.7)
 ```
 
 ---
@@ -118,9 +118,9 @@ Pin the *current stable* of each at M0 — look up at install time, never assume
 | VAD | Silero VAD | Via `livekit-agents`; pre-filter with noise gate |
 | STT | whisper.cpp (Metal backend) | Via `pywhispercpp`; NOT faster-whisper |
 | TTS | Kokoro via `streaming-tts` (MPS) | `TTSConfig(device="mps")`, async generator |
-| Live brain | Claude Opus 4.6 | Streaming, tool-use mode, prompt cached |
-| Summary compressor | Claude Haiku 4.5 | Every 2-3 min |
-| Report | Claude Opus 4.6 | Offline, single call |
+| Live brain | Claude Opus 4.7 | Non-streaming in M2; tool-use mode; prompt cached. Streaming LLM → sentence-chunked TTS is M4. |
+| Summary compressor | Claude Haiku 4.5 | Every 2-3 min (lands in M4 alongside content-based phase transitions). |
+| Report | Claude Opus 4.7 | Offline, single call |
 | Observability | Langfuse (self-hosted) + OpenTelemetry | LLM traces + latency metrics |
 | Local orchestration | Docker Compose | One-command local stack |
 
@@ -510,7 +510,7 @@ Includes basic spatial information (grouping, relative position) to preserve lay
 On `session_end`:
 1. Enqueue report job.
 2. Worker loads: full event ledger, canvas snapshots, decisions log, rubric final state, phase timings.
-3. Single Opus 4.6 call with structured prompt → multi-section JSON report.
+3. Single Opus 4.7 call with structured prompt → multi-section JSON report.
 4. Stored in `reports` table; surfaced in-app. Retries 3x on failure.
 
 Report sections:
@@ -635,26 +635,38 @@ Built-in via LiveKit Agents `session.say()`. Framework auto-pauses TTS on candid
 
 **Verify:** candidate joins room, speaks, agent logs transcript to event ledger, agent speaks back static line at turn-end. Keyboard sounds don't trigger VAD. ✓
 
-**Known M1 limitations (carried into M2):**
-- Whisper occasionally mangles compound technical terms ("LIFO" → "Lasting first out") and drops words on short/quiet buffers. The fix is downstream — the brain's system prompt includes an `[STT errors]` clause telling Claude to interpret in context. Deliberately avoided scaling the STT `initial_prompt` with a vocab list (doesn't scale past a handful of terms, risks miscorrecting elsewhere).
-- `WhisperCppSTT.__init__` doesn't actually warm whisper — first live STT call pays the model-init cost. Move to prewarm in M2.
-- `scripts/warm_models.py` defaults to `base.en` while `audio/stt.py` defaults to `large-v3` — align in M2.
+**Known M1 limitations — all resolved in M2:**
+- Whisper term mangling on Indian English / Hinglish — addressed by the brain's `[STT errors]` system-prompt clause (M2 Unit 8). Language pin dropped; auto-detect per buffer with a sub-3 s misdetect fallback behind `ARCHMENTOR_HINGLISH_FALLBACK`.
+- Whisper prewarm — M2 Unit 8 locked in eager prewarm via `scripts/warm_models.py`, and that script now cross-checks its `large-v3` default against the agent `Settings` so defaults can't silently diverge.
+- `scripts/warm_models.py` ↔ `audio/stt.py` default mismatch — both pinned to `large-v3` with a runtime assertion at warm time.
 
-### M2 — Brain MVP + session persistence (week 3)
+### M2 — Brain MVP + session persistence (week 3) ✅ done 2026-04-23
 
-- Claude API client with streaming + **tool-use mode** (not raw JSON)
-- Brain tool schema (`interview_decision`)
-- Event router with **serialization gate** + event coalescing
-- **Utterance queue with speech-check gate** (no Haiku relevance check)
-- **SessionState with decisions log** (never compressed)
-- Redis atomic state updates (Lua script, no TTL on session keys)
-- Postgres session + session_events write-through
-- **Brain snapshot serialization** at every decision point
-- Langfuse trace per brain call
-- `scripts/replay.py --snapshot <id>` CLI
-- **Hinglish-friendly STT config** (deferred from M1). M1 pins `language="en"` + uses `large-v3-turbo`, which mangles Hindi words ("matlab", "yaani", "theek hai", etc.) mid-sentence — common in Indian English. In M2, combine: (a) drop the language pin in `audio/stt.py` so whisper auto-detects per buffer; (b) switch `ARCHMENTOR_WHISPER_MODEL` to `large-v3` (full, not turbo — turbo was fine-tuned mostly on English and has weaker Hindi coverage; ~1.8x slower inference, still real-time on M5); (c) expand `_WHISPER_INITIAL_PROMPT` with Hinglish filler words so the decoder emits romanized Hindi instead of English garbage. Claude handles mixed-script input natively, so no translation layer needed.
+See `docs/plans/2026-04-22-001-feat-m2-brain-mvp-plan.md` for the execution-level plan, unit-by-unit checkpoint, and post-landing hardening notes.
 
-**Verify:** 5-min session on seeded problem; brain interrupts at least once via tool-use; state and events persisted; snapshot replay works; Langfuse trace inspectable.
+- [x] Claude API client with **non-streaming** tool-use mode (not raw JSON). Streaming LLM → sentence-chunked TTS deferred to M4 — no latency win until Kokoro streaming lands.
+- [x] Brain tool schema (`interview_decision`)
+- [x] Event router with **serialization gate** (invariants I1/I2/I3) + event coalescing (turn_end-wins)
+- [x] **Utterance queue with speech-check gate** (no Haiku relevance check); `clear_stale_on_new_turn` wired as the primary freshness signal, TTL as fallback
+- [x] **SessionState with decisions log** (never compressed). `SessionState.with_state_updates(...)` translates tool-schema sub-keys (phase_advance, new_decision, rubric_coverage_delta, ...) into real fields.
+- [x] Redis atomic state updates via **WATCH/MULTI/EXEC CAS** (Lua script deferred — WATCH retry rate hasn't warranted it), no TTL on session keys
+- [x] Postgres session + session_events write-through
+- [x] **Brain snapshot serialization** at every decision point; new `POST /sessions/{id}/snapshots` route (256 KiB cap, UTF-8 byte count)
+- [x] `scripts/replay.py --snapshot <id>` CLI with dry-run default, distinct exit codes (MATCH/DIVERGED/NOT_FOUND/USAGE)
+- [x] **Gateway support** — `ARCHMENTOR_ANTHROPIC_BASE_URL` routes through Anthropic-compatible proxies (Unbound, LiteLLM); `ARCHMENTOR_BRAIN_MODEL` defaults to provider-prefixed `anthropic/claude-opus-4-7`.
+- [x] **Kill switch** — `ARCHMENTOR_BRAIN_ENABLED=false` preserves the M1 static-ack path as an explicit fallback (not a log-only stub).
+- [x] **Hinglish-friendly STT config** — dropped `language="en"` pin, expanded `_WHISPER_INITIAL_PROMPT` with Hinglish register note, added short-buffer fallback behind `ARCHMENTOR_HINGLISH_FALLBACK`. `large-v3` confirmed as the default (M1 never switched to turbo — the original plan note was stale).
+- [x] Brain system prompt includes `[STT errors]` + `[Speech form]` + `[Security]` clauses; `BrainDecision.utterance` sanitized (≤600 chars, strips Cc/Cf/Cs/Co/Cn control chars so bidi-override injection payloads can't reach TTS).
+- [x] `AsyncAnthropic` bounded by `httpx.Timeout(connect=5, read=120, write=10, pool=5)` so a hung gateway can't hold the serialization gate for the SDK's 600 s default.
+
+**Explicitly deferred from M2** (to M4 unless noted):
+- Langfuse per-call tracing — `brain_snapshots` rows + structlog cover M2 debugging; Langfuse lands alongside phase/confidence telemetry that needs a UI.
+- Haiku session-summary compression.
+- Content-based phase transitions.
+- Streaming LLM → TTS (paired with M4 Kokoro sentence-chunking).
+- `POST /sessions` / `POST /sessions/{id}/end` / `/session/new` UI → M3 alongside canvas.
+
+**Verify (post-landing):** 5-min `/session/dev-test` on the seeded URL-shortener problem; brain interrupts at least once via tool-use; state + events persisted; snapshot replay reproduces the decision; cost cap short-circuits once `state.cost_usd_total >= state.cost_cap_usd`; kill-switch skips the Anthropic call cleanly.
 
 ### M3 — Excalidraw canvas (week 4)
 
