@@ -12,7 +12,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from archmentor_api.db import get_db_session
 from archmentor_api.deps import CurrentUser, require_agent
@@ -41,15 +41,24 @@ _MAX_SNAPSHOT_PAYLOAD_BYTES = 256 * 1024
 
 
 def _require_active_session(db: Session, session_id: UUID) -> InterviewSession:
-    """Fetch + validate a session row for agent ingest.
+    """Fetch + validate a session row for agent ingest, taking a row lock.
 
     404 if missing, 409 if not ACTIVE. Both the events and snapshots
     routes need the identical check; hoisting it keeps the two routes
     structurally parallel — a drift here would create an asymmetric
     trust boundary between events and snapshots, which is exactly the
     kind of bug that survives review by being "obvious."
+
+    Uses `SELECT ... FOR UPDATE` so the same-transaction insert that
+    follows is protected against a concurrent `POST /sessions/{id}/end`
+    flipping the row to ENDED between this gate and the INSERT — the
+    classic TOCTOU window. SQLite silently ignores FOR UPDATE; the test
+    harness still exercises the code path even though the lock is a
+    no-op there. On Postgres the row lock holds until commit.
     """
-    session_row = db.get(InterviewSession, session_id)
+    session_row = db.exec(
+        select(InterviewSession).where(InterviewSession.id == session_id).with_for_update()
+    ).first()
     if session_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     if session_row.status is not SessionStatus.ACTIVE:

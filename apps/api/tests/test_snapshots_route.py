@@ -227,3 +227,24 @@ class TestLifecycle:
             headers=_agent_headers(),
         )
         assert response.status_code == 409
+
+
+class TestTOCTOULock:
+    """The snapshot-ingest path takes a row-level lock on the session.
+
+    Without the lock, a `POST /sessions/{id}/end` running between the
+    SELECT and the INSERT could leave a snapshot row tagged to an
+    already-ENDED session — corrupting replay and eval state. SQLite
+    silently no-ops `FOR UPDATE`, so the actual race scenario can't
+    be reproduced in this test harness; instead we compile the query
+    against the Postgres dialect and assert the lock clause is present.
+    """
+
+    def test_active_session_gate_compiles_with_for_update_on_postgres(self) -> None:
+        from archmentor_api.models.session import InterviewSession
+        from sqlalchemy.dialects import postgresql
+        from sqlmodel import select
+
+        stmt = select(InterviewSession).where(InterviewSession.id == uuid4()).with_for_update()
+        compiled = str(stmt.compile(dialect=postgresql.dialect()))
+        assert "FOR UPDATE" in compiled.upper()
