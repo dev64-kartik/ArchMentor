@@ -372,9 +372,7 @@ _LIFECYCLE_CASCADE_TABLES = (
 
 def _gotrue_url() -> str:
     """Resolve the GoTrue base URL from the same env var the web uses."""
-    url = os.environ.get("NEXT_PUBLIC_GOTRUE_URL") or os.environ.get(
-        "GOTRUE_API_EXTERNAL_URL"
-    )
+    url = os.environ.get("NEXT_PUBLIC_GOTRUE_URL") or os.environ.get("GOTRUE_API_EXTERNAL_URL")
     if not url:
         raise SystemExit(
             "NEXT_PUBLIC_GOTRUE_URL (or GOTRUE_API_EXTERNAL_URL) is not set; "

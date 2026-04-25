@@ -142,7 +142,7 @@ class BrainClient:
                 self._client.messages.create(**kwargs),
                 timeout=_BRAIN_DEADLINE_S,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # `wait_for` cancels the inner coroutine, which the SDK
             # converts to a clean abort. We degrade rather than raise so
             # the voice loop keeps running; the router's `_dispatch`

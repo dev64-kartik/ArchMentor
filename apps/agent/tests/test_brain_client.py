@@ -474,9 +474,7 @@ class TestErrorTaxonomy:
         through R27's synthetic-recovery emitter."""
         # Squeeze the deadline so the test runs fast; the real value is
         # 180 s.
-        monkeypatch.setattr(
-            "archmentor_agent.brain.client._BRAIN_DEADLINE_S", 0.05
-        )
+        monkeypatch.setattr("archmentor_agent.brain.client._BRAIN_DEADLINE_S", 0.05)
 
         async def hang(_k: dict[str, Any]) -> Message:
             await asyncio.sleep(10)
@@ -495,18 +493,14 @@ class TestErrorTaxonomy:
         I2 (re-prepend pending batch on cancel) depends on this."""
         # Long deadline so the test relies on the external cancel, not
         # the timeout.
-        monkeypatch.setattr(
-            "archmentor_agent.brain.client._BRAIN_DEADLINE_S", 30.0
-        )
+        monkeypatch.setattr("archmentor_agent.brain.client._BRAIN_DEADLINE_S", 30.0)
 
         async def hang(_k: dict[str, Any]) -> Message:
             await asyncio.sleep(10)
             raise AssertionError("should not reach")
 
         client = _client(hang)
-        task = asyncio.create_task(
-            client.decide(state=_state(), event={}, t_ms=0)
-        )
+        task = asyncio.create_task(client.decide(state=_state(), event={}, t_ms=0))
         # Yield once so the wait_for-wrapped coroutine starts.
         await asyncio.sleep(0)
         task.cancel()
