@@ -20,7 +20,7 @@ class BrainSnapshot(SQLModel, table=True):
     id: UUID = Field(default_factory=pk_uuid, primary_key=True)
     # Composite index (session_id, t_ms) lives in the migration — see session.py
     # for the rationale on why single-column index=True is omitted here.
-    session_id: UUID = Field(foreign_key="sessions.id")
+    session_id: UUID = Field(foreign_key="sessions.id", ondelete="CASCADE")
     t_ms: int = Field(nullable=False)
 
     session_state_json: dict[str, object] = Field(sa_column=jsonb_column())

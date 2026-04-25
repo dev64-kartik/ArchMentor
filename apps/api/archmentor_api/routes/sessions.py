@@ -1,24 +1,31 @@
 """Session lifecycle + agent ingest.
 
-User-facing endpoints (list/create/get/end/delete) are M2; only the
-agent ingest endpoints are live in M1/M2.
+User-facing endpoints (create/list/get/end/delete) call into
+`services.sessions`; agent ingest endpoints (events, snapshots) live
+beside them so the body-size middleware and `_require_active_session`
+gate stay one read away.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
+from archmentor_api.config import Settings, get_settings
 from archmentor_api.db import get_db_session
 from archmentor_api.deps import CurrentUser, require_agent
+from archmentor_api.models.problem import Problem
 from archmentor_api.models.session import InterviewSession, SessionStatus
 from archmentor_api.models.session_event import SessionEventType
 from archmentor_api.services.event_ledger import append_event
+from archmentor_api.services.sessions import create_session, get_owned_session
 from archmentor_api.services.snapshots import append_snapshot
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -69,39 +76,166 @@ def _require_active_session(db: Session, session_id: UUID) -> InterviewSession:
     return session_row
 
 
-@router.get("/")
-def list_sessions(user: CurrentUser) -> list[dict[str, object]]:
-    # TODO(M2): query `sessions` for this user_id.
-    _ = user
-    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented")
+class ProblemRef(BaseModel):
+    slug: str
+    version: int
+    title: str
+    difficulty: str
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
-def create_session(user: CurrentUser) -> dict[str, object]:
-    # TODO(M2): create session row, mint LiveKit token, dispatch agent worker.
-    _ = user
-    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented")
+class SessionView(BaseModel):
+    """Response shape for create/list/get/end.
+
+    Mirrors the columns the frontend's session dashboard + LiveKit join
+    flow need; intentionally omits cost columns + token totals (replay
+    + eval read those directly from Postgres).
+    """
+
+    session_id: UUID
+    livekit_room: str
+    livekit_url: str
+    status: SessionStatus
+    started_at: datetime | None
+    ended_at: datetime | None
+    problem: ProblemRef
 
 
-@router.get("/{session_id}")
-def get_session(session_id: UUID, user: CurrentUser) -> dict[str, object]:
-    _ = user
-    _ = session_id
-    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented")
+def _build_view(db: Session, row: InterviewSession, livekit_url: str) -> SessionView:
+    problem = db.get(Problem, row.problem_id)
+    if problem is None:
+        # Defensive: a session row exists with an FK to a problem that's
+        # been deleted. Surface as 500 — manual intervention needed.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Session references a missing problem",
+        )
+    return SessionView(
+        session_id=row.id,
+        livekit_room=row.livekit_room,
+        livekit_url=livekit_url,
+        status=row.status,
+        started_at=row.started_at,
+        ended_at=row.ended_at,
+        problem=ProblemRef(
+            slug=problem.slug,
+            version=problem.version,
+            title=problem.title,
+            difficulty=problem.difficulty,
+        ),
+    )
 
 
-@router.post("/{session_id}/end")
-def end_session(session_id: UUID, user: CurrentUser) -> dict[str, object]:
-    _ = user
-    _ = session_id
-    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented")
+def _user_uuid(user: CurrentUser) -> UUID:
+    """Coerce the JWT subject string into a UUID for FK comparisons."""
+    try:
+        return UUID(user.user_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token subject is not a valid user id",
+        ) from exc
+
+
+class CreateSessionBody(BaseModel):
+    problem_slug: str = Field(min_length=1, max_length=100)
+
+
+@router.post("", status_code=status.HTTP_201_CREATED, response_model=SessionView)
+@router.post(
+    "/", status_code=status.HTTP_201_CREATED, response_model=SessionView, include_in_schema=False
+)
+def create_session_endpoint(
+    body: CreateSessionBody,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> SessionView:
+    user_id = _user_uuid(user)
+    row = create_session(db, user_id=user_id, problem_slug=body.problem_slug)
+    db.commit()
+    db.refresh(row)
+    return _build_view(db, row, settings.livekit_url)
+
+
+@router.get("", response_model=list[SessionView])
+@router.get("/", response_model=list[SessionView], include_in_schema=False)
+def list_sessions(
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> list[SessionView]:
+    user_id = _user_uuid(user)
+    rows = db.exec(
+        select(InterviewSession)
+        .where(InterviewSession.user_id == user_id)
+        # ty sees the field's Python type (datetime | None) rather than the
+        # SQLAlchemy column descriptor; the runtime InstrumentedAttribute
+        # is what `sa.desc` actually receives.
+        .order_by(sa.desc(InterviewSession.started_at))  # ty: ignore[invalid-argument-type]
+    ).all()
+    return [_build_view(db, row, settings.livekit_url) for row in rows]
+
+
+@router.get("/{session_id}", response_model=SessionView)
+def get_session(
+    session_id: UUID,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> SessionView:
+    user_id = _user_uuid(user)
+    row = get_owned_session(db, session_id=session_id, user_id=user_id)
+    return _build_view(db, row, settings.livekit_url)
+
+
+@router.post("/{session_id}/end", response_model=SessionView)
+def end_session(
+    session_id: UUID,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> SessionView:
+    """Flip an ACTIVE session to ENDED.
+
+    The LiveKit room is NOT closed here; closing it mid-session would
+    force-disconnect the candidate's mic before the agent's closing
+    utterance plays. The agent's room-emptied callback handles cleanup.
+    """
+    user_id = _user_uuid(user)
+    # Take the row lock first so a racing /events ingest sees the new
+    # status under the same TOCTOU contract as `_require_active_session`.
+    locked = db.exec(
+        select(InterviewSession).where(InterviewSession.id == session_id).with_for_update()
+    ).first()
+    if locked is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    if locked.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your session")
+    if locked.status is not SessionStatus.ACTIVE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Session is not active (status={locked.status.value})",
+        )
+
+    locked.status = SessionStatus.ENDED
+    locked.ended_at = datetime.now(UTC)
+    db.add(locked)
+    db.commit()
+    db.refresh(locked)
+    return _build_view(db, locked, settings.livekit_url)
 
 
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_session(session_id: UUID, user: CurrentUser) -> None:
-    _ = user
-    _ = session_id
-    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented")
+def delete_session(
+    session_id: UUID,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> None:
+    """Hard-delete the session; child rows cascade via Postgres ON DELETE CASCADE."""
+    user_id = _user_uuid(user)
+    row = get_owned_session(db, session_id=session_id, user_id=user_id)
+    db.delete(row)
+    db.commit()
 
 
 class AppendEventBody(BaseModel):
