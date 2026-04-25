@@ -469,14 +469,17 @@ async def _run_lifecycle(email: str, password: str) -> int:
         session_id = create_resp.json()["session_id"]
         _print_step("POST /sessions", True, f"id={session_id}")
 
-        # Step 4: agent appends a turn_end event.
+        # Step 4: agent appends a candidate-utterance event. We pick
+        # `utterance_candidate` because it's the highest-volume row in a
+        # real session — exercising it here catches schema drift the
+        # agent would hit on the very first transcript.
         event_resp = await http.post(
             f"{api_url}/sessions/{session_id}/events",
             headers=agent_headers,
             json={
                 "t_ms": 1_000,
-                "type": "turn_end",
-                "payload_json": {"transcripts": ["hello mentor"]},
+                "type": "utterance_candidate",
+                "payload_json": {"text": "hello mentor"},
             },
         )
         if event_resp.status_code != 201:
