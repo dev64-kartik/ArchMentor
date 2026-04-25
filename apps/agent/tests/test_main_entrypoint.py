@@ -17,9 +17,15 @@ from uuid import UUID
 
 import anthropic
 import pytest
-from _helpers import FakeBrainClient, FakeSessionStore, FakeSnapshotClient
+from _helpers import (
+    FakeBrainClient,
+    FakeCanvasSnapshotClient,
+    FakeSessionStore,
+    FakeSnapshotClient,
+)
 from archmentor_agent.brain.client import BrainClient
 from archmentor_agent.brain.decision import BrainDecision, BrainUsage
+from archmentor_agent.canvas.client import CanvasSnapshotClient
 from archmentor_agent.config import reset_settings_cache
 from archmentor_agent.main import (
     MentorAgent,
@@ -216,6 +222,7 @@ def _build_agent_under_test(
     brain: FakeBrainClient | None = None,
     store: FakeSessionStore | None = None,
     snapshots: FakeSnapshotClient | None = None,
+    canvas_snapshots: FakeCanvasSnapshotClient | None = None,
     seed_state: SessionState | None = None,
     session_raises: bool = False,
 ) -> tuple[
@@ -225,6 +232,7 @@ def _build_agent_under_test(
     FakeBrainClient,
     FakeSessionStore,
     FakeSnapshotClient,
+    FakeCanvasSnapshotClient,
 ]:
     fake_session = _FakeAgentSession(raise_on_say=session_raises)
     ledger = _FakeLedger()
@@ -233,6 +241,7 @@ def _build_agent_under_test(
     brain = brain or FakeBrainClient()
     store = store or FakeSessionStore()
     snapshots = snapshots or FakeSnapshotClient()
+    canvas_snapshots = canvas_snapshots or FakeCanvasSnapshotClient()
 
     state = seed_state or _seed_state()
     store._states[SESSION_ID] = state
@@ -250,6 +259,7 @@ def _build_agent_under_test(
             brain=cast(BrainClient, brain),
             store=cast(RedisSessionStore, store),
             snapshot_client=cast(SnapshotClient, snapshots),
+            canvas_snapshot_client=cast(CanvasSnapshotClient, canvas_snapshots),
         )
         agent.attach_brain(wiring)
 
@@ -265,7 +275,7 @@ def _build_agent_under_test(
     # Prime the t0 clock so `_now_relative_ms` returns deterministic
     # values. `on_enter` would normally do this.
     agent._t0_ms = 0
-    return agent, fake_session, ledger, brain, store, snapshots
+    return agent, fake_session, ledger, brain, store, snapshots, canvas_snapshots
 
 
 async def _drain_tasks(agent: MentorAgent) -> None:
@@ -279,7 +289,7 @@ async def _drain_tasks(agent: MentorAgent) -> None:
 async def test_brain_enabled_speaks_brain_utterance_not_static_ack() -> None:
     brain = FakeBrainClient()
     brain.enqueue_speak("Tell me how you'd index the short codes.")
-    agent, fake_session, ledger, _, _, snapshots = _build_agent_under_test(
+    agent, fake_session, ledger, _, _, snapshots, _ = _build_agent_under_test(
         brain_enabled=True, brain=brain
     )
 
@@ -298,7 +308,7 @@ async def test_brain_enabled_speaks_brain_utterance_not_static_ack() -> None:
 async def test_brain_enabled_stay_silent_means_no_tts() -> None:
     brain = FakeBrainClient()
     brain.enqueue_stay_silent("not_an_interruption_moment")
-    agent, fake_session, ledger, _, _, snapshots = _build_agent_under_test(
+    agent, fake_session, ledger, _, _, snapshots, _ = _build_agent_under_test(
         brain_enabled=True, brain=brain
     )
 
@@ -317,7 +327,7 @@ async def test_brain_enabled_stay_silent_means_no_tts() -> None:
 async def test_kill_switch_uses_static_ack_and_bypasses_brain() -> None:
     brain = FakeBrainClient()
     brain.enqueue_speak("this must not be spoken")
-    agent, fake_session, ledger, _, _, snapshots = _build_agent_under_test(
+    agent, fake_session, ledger, _, _, snapshots, _ = _build_agent_under_test(
         brain_enabled=False, brain=brain
     )
 
@@ -339,7 +349,7 @@ async def test_kill_switch_uses_static_ack_and_bypasses_brain() -> None:
 async def test_hallucination_filter_drops_before_brain_call() -> None:
     brain = FakeBrainClient()
     brain.enqueue_speak("this should never be reached")
-    agent, fake_session, ledger, _, _, snapshots = _build_agent_under_test(
+    agent, fake_session, ledger, _, _, snapshots, _ = _build_agent_under_test(
         brain_enabled=True, brain=brain
     )
 
@@ -361,7 +371,7 @@ async def test_low_confidence_brain_decision_does_not_speak() -> None:
     """
     brain = FakeBrainClient()
     brain.enqueue_speak("below_confidence_threshold", confidence=0.55)
-    agent, fake_session, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
 
     await agent.handle_user_input("Capacity estimate first.")
     await _drain_tasks(agent)
@@ -373,7 +383,7 @@ async def test_low_confidence_brain_decision_does_not_speak() -> None:
 async def test_interim_transcript_marks_gate_and_cancels_in_flight() -> None:
     brain = FakeBrainClient(delay_s=0.1)
     brain.enqueue_speak("late utterance")
-    agent, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
     assert agent._brain is not None
 
     # Start a turn so a dispatch is running.
@@ -400,7 +410,7 @@ async def test_interim_transcript_marks_gate_and_cancels_in_flight() -> None:
 async def test_shutdown_drains_snapshot_and_ledger_tasks() -> None:
     brain = FakeBrainClient()
     brain.enqueue_speak("final thought")
-    agent, _, _, _, store, snapshots = _build_agent_under_test(brain_enabled=True, brain=brain)
+    agent, _, _, _, store, snapshots, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
 
     await agent.handle_user_input("what's left before we wrap up?")
     await agent.shutdown()
@@ -416,7 +426,7 @@ async def test_shutdown_drains_snapshot_and_ledger_tasks() -> None:
 
 @pytest.mark.asyncio
 async def test_shutdown_on_kill_switch_only_drains_ledger() -> None:
-    agent, _, _, _, _, snapshots = _build_agent_under_test(brain_enabled=False)
+    agent, _, _, _, _, snapshots, _ = _build_agent_under_test(brain_enabled=False)
 
     await agent.handle_user_input("quick thought")
     await agent.shutdown()
@@ -451,7 +461,7 @@ async def test_anthropic_authentication_error_does_not_hang_session() -> None:
             body=None,
         )
     )
-    agent, fake_session, _, _, _, snapshots = _build_agent_under_test(
+    agent, fake_session, _, _, _, snapshots, _ = _build_agent_under_test(
         brain_enabled=True, brain=brain
     )
 
@@ -473,7 +483,7 @@ async def test_scripted_multi_turn_session_records_all_decisions() -> None:
     brain.enqueue_speak("probe 2")
     brain.enqueue_stay_silent("ok")
     brain.enqueue_speak("probe 3")
-    agent, fake_session, ledger, _, _, snapshots = _build_agent_under_test(
+    agent, fake_session, ledger, _, _, snapshots, _ = _build_agent_under_test(
         brain_enabled=True, brain=brain
     )
 
@@ -505,7 +515,7 @@ async def test_cost_cap_hit_flips_to_capped_path_after_session_ages() -> None:
     brain = FakeBrainClient()
     brain.enqueue_speak("this should not be called")
     seed = _seed_state(cost_usd_total=5.01, cost_cap_usd=5.0)
-    agent, fake_session, ledger, _, _, snapshots = _build_agent_under_test(
+    agent, fake_session, ledger, _, _, snapshots, _ = _build_agent_under_test(
         brain_enabled=True, brain=brain, seed_state=seed
     )
 

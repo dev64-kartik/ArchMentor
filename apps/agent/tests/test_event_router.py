@@ -346,13 +346,132 @@ async def test_low_confidence_speak_abstains() -> None:
 
 
 @pytest.mark.asyncio
-async def test_canvas_change_rejected_at_handle_entry() -> None:
-    router, brain, _, _, _, _, _ = _make_router()
-    with pytest.raises(NotImplementedError, match="canvas_change"):
-        await router.handle(RouterEvent(EventType.CANVAS_CHANGE, t_ms=100))
-    assert router._dispatching is False
-    assert len(router._pending) == 0
+async def test_canvas_change_dispatches_through_router() -> None:
+    """M3: canvas_change events flow through the dispatcher (no NotImplementedError)."""
+    brain = FakeBrainClient()
+    brain.enqueue_speak("That box is mislabeled.", confidence=0.85)
+    router, _, _, snapshots, _queue, log_events, snap_tasks = _make_router(brain=brain)
+
+    from archmentor_agent.events.types import Priority
+
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=2_000,
+            payload={"scene_text": "Components: <label>API</label>"},
+            priority=Priority.HIGH,
+        )
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(brain.calls) == 1
+    assert brain.calls[0].event["type"] == "canvas_change"
+    assert len(snapshots.posts) == 1
+    decisions = [e for e in log_events if e[0] == "brain_decision"]
+    assert len(decisions) == 1
+
+
+@pytest.mark.asyncio
+async def test_synthetic_recovery_fires_once_on_brain_timeout() -> None:
+    """R27: brain_timeout decision fires the synthetic recovery utterance
+    exactly once per session."""
+    brain = FakeBrainClient()
+    # Enqueue two stay_silent decisions whose reason marks them as
+    # brain_timeout — Unit 12 wraps the live client to actually emit
+    # this reason; the router-side wiring under test is the same.
+    for _ in range(2):
+        brain.enqueue_stay_silent("brain_timeout")
+    emissions: list[tuple[str, str]] = []
+
+    def emit(*, text: str, reason: str) -> None:
+        emissions.append((text, reason))
+
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain)
+    router._emit_synthetic = emit  # inject post-construction; mirrors entrypoint wiring
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "a"}))
+    await _await_loop(router)
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=2_000, payload={"text": "b"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(emissions) == 1
+    text, reason = emissions[0]
+    assert reason == "brain_timeout"
+    assert text == "Let me come back to that — please continue."
+    assert router._apology_used is True
+
+
+@pytest.mark.asyncio
+async def test_synthetic_recovery_skipped_when_no_emitter_wired() -> None:
+    """Tests / kill-switch paths construct routers without an emitter.
+    The router must stay callable; the apology branch must no-op."""
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("brain_timeout")
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain)
+    assert router._emit_synthetic is None
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+    # No crash, no apology issued.
+    assert router._apology_used is False
+
+
+@pytest.mark.asyncio
+async def test_synthetic_recovery_not_fired_for_other_reasons() -> None:
+    """Only `brain_timeout` triggers R27 — other stay_silent reasons
+    (api_error, schema_violation, cost_capped) do not."""
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("api_error")
+    brain.enqueue_stay_silent("low_confidence")
+    emissions: list[tuple[str, str]] = []
+
+    def emit(*, text: str, reason: str) -> None:
+        emissions.append((text, reason))
+
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain)
+    router._emit_synthetic = emit
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "a"}))
+    await _await_loop(router)
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=2_000, payload={"text": "b"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert emissions == []
+
+
+@pytest.mark.asyncio
+async def test_cost_capped_on_canvas_change_still_emits_snapshot_and_decision() -> None:
+    """R22: HIGH priority does NOT bypass the cost cap. Canvas events on a
+    capped session produce no Anthropic call but still snapshot + ledger."""
+    state = _make_state(cost_usd_total=5.01, cost_cap_usd=5.0)
+    brain = FakeBrainClient()
+    # Even though we enqueue a decision, the cost guard short-circuits
+    # before the brain is called — so this entry is never consumed.
+    brain.enqueue_speak("would not run")
+    router, _, _, snapshots, _, log_events, snap_tasks = _make_router(brain=brain, seed_state=state)
+
+    from archmentor_agent.events.types import Priority
+
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=2_000,
+            payload={"scene_text": "Components: <label>API</label>"},
+            priority=Priority.HIGH,
+        )
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
     assert len(brain.calls) == 0
+    assert router._cost_capped is True
+    assert len(snapshots.posts) == 1
+    decisions = [e for e in log_events if e[0] == "brain_decision"]
+    assert decisions[0][1]["reason"] == "cost_capped"
 
 
 @pytest.mark.asyncio

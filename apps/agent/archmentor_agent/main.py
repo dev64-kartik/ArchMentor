@@ -60,14 +60,16 @@ from archmentor_agent.brain.bootstrap import (
     build_dev_problem_card,
 )
 from archmentor_agent.brain.client import BrainClient
+from archmentor_agent.canvas import CanvasSnapshotClient, CanvasSnapshotClientConfig, parse_scene
 from archmentor_agent.config import Settings, get_settings
 from archmentor_agent.events.router import EventRouter
-from archmentor_agent.events.types import EventType, RouterEvent
+from archmentor_agent.events.types import EventType, RouterEvent, default_priority
 from archmentor_agent.ledger import LedgerClient, LedgerConfig
 from archmentor_agent.queue import SpeechCheckGate, UtteranceQueue
 from archmentor_agent.snapshots.client import SnapshotClient, SnapshotClientConfig
-from archmentor_agent.state.redis_store import RedisSessionStore
+from archmentor_agent.state.redis_store import RedisCasExhaustedError, RedisSessionStore
 from archmentor_agent.state.session_state import (
+    CanvasState,
     PendingUtterance,
     SessionState,
 )
@@ -96,9 +98,35 @@ log = structlog.get_logger(__name__)
 
 OPENING_UTTERANCE = (
     "Hi — I'm your interviewer today. Take a moment to read the problem, "
-    "and when you're ready, walk me through your approach."
+    "and when you're ready, walk me through your approach. "
+    "I'll take a moment to think between turns — feel free to keep talking "
+    "if I'm quiet."
 )
 TURN_ACK_UTTERANCE = "Got it. Keep going when you're ready."
+
+# Recovery utterance the agent attempts at most once per session when the
+# brain times out (R27). Persona-consistent: no "sorry", no "I lost my
+# train of thought" — both came up as junior-engineer voice in the
+# refinements review (Q2). Routes through the speech-check gate; if the
+# candidate is mid-speech, dropped silently and R24's elapsed-time copy
+# carries the visible signal.
+SYNTHETIC_RECOVERY_UTTERANCE = "Let me come back to that — please continue."
+
+# LiveKit text-stream topic the browser publishes Excalidraw scenes on.
+# `ai_state` stays on `publishData` because its payload is fixed-size
+# (~30 bytes); canvas scenes use text streams because LiveKit chunks them
+# transparently above the SCTP per-frame limit (~16 KiB). See plan Key
+# Technical Decisions: "fixed-size telemetry → publishData; bounded-but-
+# can-grow content → text streams."
+CANVAS_SCENE_TOPIC = "canvas-scene"
+
+# Canvas event rate limit per R22 / Q9 — 60 events/min/session, applied
+# whether or not the session is cost-capped. Defends the ledger against
+# a flooded publisher (a misbehaving browser or scripted client). The
+# cap is generous: at the 1-second `onChange` throttle the browser ships,
+# a candidate would have to draw continuously for 60 seconds to hit it.
+CANVAS_RATE_LIMIT_EVENTS = 60
+CANVAS_RATE_LIMIT_WINDOW_S = 60.0
 
 
 # Whisper emits bracketed sound tags on silence/non-speech:
@@ -202,6 +230,7 @@ class _BrainWiring:
     brain: BrainClient
     store: RedisSessionStore
     snapshot_client: SnapshotClient
+    canvas_snapshot_client: CanvasSnapshotClient
     router: EventRouter
     queue: UtteranceQueue
     gate: SpeechCheckGate
@@ -273,6 +302,22 @@ class MentorAgent(Agent):
         # drain order (snapshots after router.drain, before client
         # aclose) is explicit in `entrypoint`.
         self._snapshot_tasks: set[asyncio.Task[bool]] = set()
+        # Canvas snapshot task set — separate from brain snapshots so
+        # the entrypoint can drain them independently and the failure
+        # mode for one can't poison the other.
+        self._canvas_tasks: set[asyncio.Task[bool]] = set()
+        # Sliding-window rate limiter for canvas events (R22 / Q9). A
+        # `time.monotonic()` timestamp goes in on every text-stream
+        # message; entries older than the window are dropped on each
+        # check. 60 events / 60 s by default. The list grows linearly
+        # with publish rate but is bounded by the window — under normal
+        # operation it stays at most a few dozen entries long.
+        self._canvas_event_history: list[float] = []
+        # Synthetic recovery utterance tasks (R27). Tracked separately
+        # from `_ledger_tasks` because the task return type differs
+        # (`None`, not `bool`) and shutdown drains them in their own
+        # asyncio.gather to keep the typing tight.
+        self._synthetic_tasks: set[asyncio.Task[None]] = set()
         # Serializes `_drain_utterance_queue` across concurrent
         # `_run_brain_turn` tasks. Without this, two rapid turn_end
         # finals (e.g. the noisy-room "Thank you." hallucination
@@ -548,6 +593,18 @@ class MentorAgent(Agent):
                     count=len(self._snapshot_tasks),
                 )
                 await asyncio.gather(*self._snapshot_tasks, return_exceptions=True)
+            if self._canvas_tasks:
+                log.info(
+                    "agent.shutdown.drain_canvas_tasks",
+                    count=len(self._canvas_tasks),
+                )
+                await asyncio.gather(*self._canvas_tasks, return_exceptions=True)
+            if self._synthetic_tasks:
+                log.info(
+                    "agent.shutdown.drain_synthetic_tasks",
+                    count=len(self._synthetic_tasks),
+                )
+                await asyncio.gather(*self._synthetic_tasks, return_exceptions=True)
 
         if self._ledger_tasks:
             log.info(
@@ -625,6 +682,221 @@ class MentorAgent(Agent):
         self._snapshot_tasks.add(task)
         task.add_done_callback(self._snapshot_tasks.discard)
 
+    def schedule_canvas_snapshot(self, coro: Awaitable[bool]) -> None:
+        """Track a fire-and-forget canvas snapshot POST."""
+        task = asyncio.ensure_future(coro)
+        self._canvas_tasks.add(task)
+        task.add_done_callback(self._canvas_tasks.discard)
+
+    def emit_synthetic(self, *, text: str, reason: str) -> None:
+        """Router → agent synthetic-utterance hand-off (R27).
+
+        Spawns `_emit_synthetic_async` as a task because the router
+        calls this synchronously (its dispatch loop's last step) and we
+        must not block it on a TTS playout. The task tracks against
+        `_synthetic_tasks` so shutdown drains it.
+        """
+        task = asyncio.create_task(self._emit_synthetic_async(text=text, reason=reason))
+        self._synthetic_tasks.add(task)
+        task.add_done_callback(self._synthetic_tasks.discard)
+
+    async def _emit_synthetic_async(self, *, text: str, reason: str) -> None:
+        """Run the speech-check gate + say + ledger-write for R27.
+
+        Gate-blocked path is silent: R24's elapsed-time copy already
+        carries the visible signal, so layering a barge-in apology on
+        top would land mid-sentence.
+        """
+        if self._brain is None:
+            return
+        if self._brain.gate.is_candidate_speaking():
+            log.info("agent.synthetic.gate_blocked", reason=reason, text=text)
+            return
+        await self._publish_state("speaking")
+        try:
+            await self._say(text)
+        except RuntimeError as exc:
+            log.warning("agent.synthetic.say_skipped", reason=str(exc))
+            await self._publish_state("listening")
+            return
+        # `synthetic: true` + `reason` discriminators let M5 reports +
+        # the M6 eval harness filter synthetic speech out of candidate-
+        # facing utterance metrics.
+        self._log(
+            "utterance_ai",
+            {"text": text, "speaker": "ai", "synthetic": True, "reason": reason},
+        )
+        await self._publish_state("listening")
+
+    async def on_canvas_scene_payload(self, raw: str) -> None:
+        """Handle a single `canvas-scene` text-stream message from the browser.
+
+        Pipeline (R7-R23 / R17):
+
+        1. Bounded JSON parse — `ValueError` / `RecursionError` becomes a
+           `canvas_parse_error` ledger row, no router dispatch.
+        2. Server-side `files` strip (R17 defense-in-depth — the browser
+           also strips, but a scripted client might forget).
+        3. Sliding-window rate-limit (R22 / Q9).
+        4. `parse_scene` produces the fenced text the brain reads.
+        5. CAS apply `canvas_state.description` BEFORE dispatching the
+           router event (R23) so the brain typically sees the canvas it's
+           reasoning about.
+        6. Dispatch `RouterEvent(CANVAS_CHANGE, HIGH)` so the coalescer
+           preempts a concurrent turn_end (R11).
+        7. Schedule fire-and-forget canvas-snapshot POST (R10).
+        8. Write a `canvas_change` ledger event with `parsed_text` (R21).
+
+        Never raises — canvas-scene errors must not break the voice loop.
+        """
+        if not self._brain_enabled or self._brain is None:
+            log.info("agent.canvas.dropped_brain_disabled")
+            return
+
+        try:
+            payload = json.loads(raw)
+        except (ValueError, RecursionError) as exc:
+            self._log(
+                "canvas_parse_error",
+                {"error": exc.__class__.__name__, "detail": str(exc)[:200]},
+            )
+            log.warning("agent.canvas.parse_error", error=str(exc)[:200])
+            return
+
+        if not isinstance(payload, dict):
+            self._log(
+                "canvas_parse_error",
+                {"error": "TypeError", "detail": f"top-level is {type(payload).__name__}"},
+            )
+            return
+
+        scene_json = payload.get("scene_json")
+        if not isinstance(scene_json, dict):
+            self._log(
+                "canvas_parse_error",
+                {"error": "TypeError", "detail": "missing scene_json"},
+            )
+            return
+
+        # R17 server-side enforcement — a future client that forgets to
+        # strip `files` would otherwise leak image data into the snapshot
+        # row + the brain prompt. The route schema's `extra="forbid"`
+        # would also catch it on the snapshot POST, but we'd rather not
+        # ship the bytes that far.
+        if "files" in scene_json:
+            log.warning("agent.canvas.files_stripped_server_side")
+            scene_json = {k: v for k, v in scene_json.items() if k != "files"}
+
+        if not self._allow_canvas_event():
+            log.warning(
+                "agent.canvas.rate_limited",
+                window_s=CANVAS_RATE_LIMIT_WINDOW_S,
+                cap=CANVAS_RATE_LIMIT_EVENTS,
+            )
+            return
+
+        t_ms_raw = payload.get("t_ms")
+        t_ms = int(t_ms_raw) if isinstance(t_ms_raw, int | float) else self._now_relative_ms()
+        scene_fingerprint = payload.get("scene_fingerprint")
+
+        try:
+            parsed_text = parse_scene(scene_json)
+        except Exception as exc:
+            self._log(
+                "canvas_parse_error",
+                {"error": exc.__class__.__name__, "detail": str(exc)[:200]},
+            )
+            log.exception("agent.canvas.parser_error")
+            return
+
+        # R23: apply canvas_state to Redis BEFORE dispatching the router
+        # event. The brain call inside the router loads SessionState
+        # after this CAS, so it typically sees the canvas it's reasoning
+        # about. CAS exhaustion is non-fatal — the router writes a
+        # canvas_change ledger row regardless, so replay can reconstruct
+        # the timeline.
+        await self._apply_canvas_state(description=parsed_text, t_ms=t_ms)
+
+        canvas_event = RouterEvent(
+            type=EventType.CANVAS_CHANGE,
+            t_ms=t_ms,
+            payload={
+                "scene_text": parsed_text,
+                "scene_fingerprint": scene_fingerprint,
+                "t_ms": t_ms,
+            },
+            priority=default_priority(EventType.CANVAS_CHANGE),
+        )
+        try:
+            await self._brain.router.handle(canvas_event)
+        except Exception:
+            log.exception("agent.canvas.router_handle_failed")
+            return
+
+        self.schedule_canvas_snapshot(
+            self._brain.canvas_snapshot_client.append(
+                session_id=self._session_id,
+                t_ms=t_ms,
+                scene_json=scene_json,
+            )
+        )
+
+        self._log(
+            "canvas_change",
+            {
+                "t_ms": t_ms,
+                "scene_fingerprint": scene_fingerprint,
+                "parsed_text": parsed_text,
+            },
+        )
+
+    def _allow_canvas_event(self) -> bool:
+        """Sliding-window rate limit — 60 events / 60 s / session."""
+        now = time.monotonic()
+        cutoff = now - CANVAS_RATE_LIMIT_WINDOW_S
+        # Drop entries older than the window. Linear scan; the list
+        # never grows beyond ~60 entries under nominal operation.
+        self._canvas_event_history = [t for t in self._canvas_event_history if t > cutoff]
+        if len(self._canvas_event_history) >= CANVAS_RATE_LIMIT_EVENTS:
+            return False
+        self._canvas_event_history.append(now)
+        return True
+
+    async def _apply_canvas_state(self, *, description: str, t_ms: int) -> None:
+        if self._brain is None:
+            return
+        store = self._brain.store
+
+        last_change_s = max(0, t_ms // 1000)
+
+        def _mutator(current: SessionState | None) -> SessionState:
+            if current is None:
+                # No baseline state in Redis (eviction or pre-init); skip
+                # — the next brain call will load whatever's there. We
+                # intentionally don't synthesize a fresh SessionState
+                # here because the canvas description alone isn't enough
+                # to seed problem + prompt_version + cost cap.
+                raise RedisCasExhaustedError("no baseline state for canvas_state apply")
+            return current.model_copy(
+                update={
+                    "canvas_state": CanvasState(
+                        description=description, last_change_s=last_change_s
+                    ),
+                }
+            )
+
+        try:
+            await store.apply(self._session_id, _mutator)
+        except RedisCasExhaustedError:
+            # Non-fatal: the canvas_change ledger row + snapshot still
+            # land, so replay reconstructs the timeline. The brain may
+            # see one-cycle-stale canvas_state for this single dispatch.
+            log.warning(
+                "agent.canvas.cas_exhausted",
+                session_id=str(self._session_id),
+                t_ms=t_ms,
+            )
+
     def log_event(self, event_type: str, payload: dict[str, Any]) -> None:
         """Router → ledger shim.
 
@@ -664,6 +936,7 @@ def build_brain_wiring(
     brain: BrainClient,
     store: RedisSessionStore,
     snapshot_client: SnapshotClient,
+    canvas_snapshot_client: CanvasSnapshotClient,
 ) -> _BrainWiring:
     """Construct the per-session brain collaborators.
 
@@ -687,11 +960,13 @@ def build_brain_wiring(
         gate=gate,
         log_event=agent.log_event,
         now_ms=agent.now_relative_ms,
+        synthetic_emitter=agent.emit_synthetic,
     )
     return _BrainWiring(
         brain=brain,
         store=store,
         snapshot_client=snapshot_client,
+        canvas_snapshot_client=canvas_snapshot_client,
         router=router,
         queue=queue,
         gate=gate,
@@ -751,6 +1026,12 @@ async def entrypoint(ctx: JobContext) -> None:
     # Snapshot client lives for the duration of the session; shared
     # pool covers the fire-and-forget POST traffic from the router.
     snapshot_client = SnapshotClient(_snapshot_client_config(settings))
+    # Canvas-snapshot client is structurally parallel to `snapshot_client`
+    # (same auth, same retry policy, same drop-on-4xx semantics). Two
+    # clients rather than one shared client because the per-session HTTP
+    # connection pool sizing differs by route — canvas events fire
+    # ~0-60/min during a session, brain snapshots fire 1 per dispatch.
+    canvas_snapshot_client = CanvasSnapshotClient(_canvas_snapshot_client_config(settings))
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -783,6 +1064,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 brain=get_brain_client(settings),
                 store=get_redis_store(settings),
                 snapshot_client=snapshot_client,
+                canvas_snapshot_client=canvas_snapshot_client,
             )
         )
 
@@ -818,6 +1100,37 @@ async def entrypoint(ctx: JobContext) -> None:
         task.add_done_callback(input_tasks.discard)
 
     session.on("user_input_transcribed", _on_user_input)
+
+    canvas_tasks: set[asyncio.Task[None]] = set()
+
+    async def _on_canvas_scene(reader: Any, _participant_identity: str) -> None:
+        """Receive one `canvas-scene` text-stream message + dispatch.
+
+        livekit-agents 0.20+ exposes `register_text_stream_handler` with
+        an async handler signature `(reader, participant_identity)`;
+        `reader.read_all()` yields the full assembled text. Older / newer
+        SDK variants may rename — adjust the import or the handler shape
+        if the SDK shifts.
+        """
+        try:
+            raw = await reader.read_all()
+        except Exception:
+            log.exception("agent.canvas.read_failed")
+            return
+        await mentor.on_canvas_scene_payload(raw)
+
+    def _on_canvas_scene_sync(reader: Any, participant_identity: str) -> None:
+        task = asyncio.create_task(_on_canvas_scene(reader, participant_identity))
+        canvas_tasks.add(task)
+        task.add_done_callback(canvas_tasks.discard)
+
+    # Register only when the brain is enabled; the kill-switch path has
+    # nowhere to dispatch canvas events to.
+    if settings.brain_enabled:
+        try:
+            ctx.room.register_text_stream_handler(CANVAS_SCENE_TOPIC, _on_canvas_scene_sync)
+        except Exception:
+            log.exception("agent.canvas.handler_registration_failed")
 
     # `AgentSession.wait_for_inactive()` returns the moment the speech
     # queue is idle AND the user hasn't spoken yet — which is true for
@@ -865,6 +1178,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # the kill-switch path, in which case only ledger drains run.
         await mentor.shutdown()
         await snapshot_client.aclose()
+        await canvas_snapshot_client.aclose()
         await ledger.aclose()
 
 
@@ -918,6 +1232,17 @@ def _snapshot_client_config(settings: Settings | None = None) -> SnapshotClientC
     """
     cfg = settings or get_settings()
     return SnapshotClientConfig(
+        base_url=cfg.api_url,
+        agent_token=cfg.agent_ingest_token.get_secret_value(),
+    )
+
+
+def _canvas_snapshot_client_config(
+    settings: Settings | None = None,
+) -> CanvasSnapshotClientConfig:
+    """Build the canvas-snapshot client config — same trust boundary."""
+    cfg = settings or get_settings()
+    return CanvasSnapshotClientConfig(
         base_url=cfg.api_url,
         agent_token=cfg.agent_ingest_token.get_secret_value(),
     )

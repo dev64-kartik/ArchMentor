@@ -10,7 +10,13 @@ global CLAUDE.md rule "Absolute imports only — no relative (`..`) paths".
 """
 
 from _helpers.brain import FakeBrainClient
+from _helpers.canvas import FakeCanvasSnapshotClient
 from _helpers.snapshots import FakeSnapshotClient
 from _helpers.store import FakeSessionStore
 
-__all__ = ["FakeBrainClient", "FakeSessionStore", "FakeSnapshotClient"]
+__all__ = [
+    "FakeBrainClient",
+    "FakeCanvasSnapshotClient",
+    "FakeSessionStore",
+    "FakeSnapshotClient",
+]
