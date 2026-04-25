@@ -15,7 +15,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 
 from archmentor_api.config import Settings, get_settings
@@ -24,6 +24,7 @@ from archmentor_api.deps import CurrentUser, require_agent
 from archmentor_api.models.problem import Problem
 from archmentor_api.models.session import InterviewSession, SessionStatus
 from archmentor_api.models.session_event import SessionEventType
+from archmentor_api.services.canvas_snapshots import append_canvas_snapshot
 from archmentor_api.services.event_ledger import append_event
 from archmentor_api.services.sessions import create_session, get_owned_session
 from archmentor_api.services.snapshots import append_snapshot
@@ -366,6 +367,65 @@ def append_brain_snapshot(
         reasoning_text=body.reasoning_text,
         tokens_input=body.tokens_input,
         tokens_output=body.tokens_output,
+    )
+    db.commit()
+    return AppendSnapshotResponse(id=snapshot.id, t_ms=snapshot.t_ms)
+
+
+class AppendCanvasSnapshotBody(BaseModel):
+    """Request body for `POST /sessions/{id}/canvas-snapshots`.
+
+    `extra="forbid"` enforces R17 server-side: the agent already strips
+    `files` from the scene, but a future client (replay harness, second
+    whiteboard) that forgets to do so will get a 422 here instead of
+    silently leaking image data into the database. Same gate at the
+    schema level so the protection is structural, not a code path the
+    handler can accidentally drop.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    t_ms: int = Field(ge=0, description="Milliseconds since session start")
+    scene_json: dict[str, object] = Field(default_factory=dict)
+
+
+@router.post(
+    "/{session_id}/canvas-snapshots",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_agent)],
+)
+def append_canvas_snapshot_endpoint(
+    session_id: UUID,
+    body: AppendCanvasSnapshotBody,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> AppendSnapshotResponse:
+    """Append a full Excalidraw scene snapshot row.
+
+    Same auth + active-session semantics as `/snapshots`. Body-size cap
+    (256 KiB) lives on the middleware; the in-handler check below is
+    defense-in-depth for the JSON blob (the middleware caps the entire
+    request body, the in-handler cap re-measures the parsed scene_json
+    in case headers misreport).
+
+    Schema explicitly forbids `files` per R17 — image data must not
+    cross the API boundary.
+    """
+    scene_bytes = len(json.dumps(body.scene_json).encode("utf-8"))
+    if scene_bytes > _MAX_SNAPSHOT_PAYLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=(
+                f"scene_json too large: {scene_bytes} bytes (max {_MAX_SNAPSHOT_PAYLOAD_BYTES})"
+            ),
+        )
+
+    _require_active_session(db, session_id)
+
+    snapshot = append_canvas_snapshot(
+        db,
+        session_id=session_id,
+        t_ms=body.t_ms,
+        scene_json=body.scene_json,
     )
     db.commit()
     return AppendSnapshotResponse(id=snapshot.id, t_ms=snapshot.t_ms)
