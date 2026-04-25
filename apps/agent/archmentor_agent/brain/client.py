@@ -210,10 +210,21 @@ class BrainClient:
 
         errors = sorted(_DECISION_VALIDATOR.iter_errors(tool_input), key=lambda e: e.path)
         if errors:
+            first = errors[0]
+            # Log the JSON pointer to the offending field plus a short
+            # snippet of the value. Without these the operator can't tell
+            # which sub-key the brain mangled — observed during the M3
+            # dogfood when Opus emitted `"\n"` for an object-typed field.
+            error_path = "/".join(str(part) for part in first.absolute_path) or "<root>"
+            offending = repr(first.instance)
+            if len(offending) > 80:
+                offending = offending[:80] + "…"
             log.warning(
                 "brain.schema_violation",
                 t_ms=t_ms,
-                first_error=errors[0].message,
+                first_error=first.message,
+                error_path=error_path,
+                offending_value=offending,
                 error_count=len(errors),
             )
             return BrainDecision.schema_violation(tool_input, usage=usage)

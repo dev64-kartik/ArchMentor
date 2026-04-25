@@ -827,6 +827,16 @@ class MentorAgent(Agent):
             },
             priority=default_priority(EventType.CANVAS_CHANGE),
         )
+        # Visible footprint for the happy path so brain.call.begin lines
+        # can be correlated with canvas activity. Without this the log
+        # looks like the brain wakes up on its own; the actual driver is
+        # one CANVAS_CHANGE event per browser publish.
+        log.info(
+            "agent.canvas.dispatch",
+            t_ms=t_ms,
+            scene_fingerprint=scene_fingerprint,
+            scene_text_len=len(parsed_text),
+        )
         try:
             await self._brain.router.handle(canvas_event)
         except Exception:
