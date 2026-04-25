@@ -464,3 +464,51 @@ class TestErrorTaxonomy:
         client = _client(responder)
         with pytest.raises(asyncio.CancelledError):
             await client.decide(state=_state(), event={}, t_ms=0)
+
+    async def test_brain_timeout_degrades_to_stay_silent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R16: when the SDK retry chain stalls past `_BRAIN_DEADLINE_S`
+        the wrap fires `asyncio.TimeoutError` and we degrade with
+        `reason="brain_timeout"`. Router's `_dispatch` then routes that
+        through R27's synthetic-recovery emitter."""
+        # Squeeze the deadline so the test runs fast; the real value is
+        # 180 s.
+        monkeypatch.setattr(
+            "archmentor_agent.brain.client._BRAIN_DEADLINE_S", 0.05
+        )
+
+        async def hang(_k: dict[str, Any]) -> Message:
+            await asyncio.sleep(10)
+            raise AssertionError("should not reach")
+
+        client = _client(hang)
+        decision = await client.decide(state=_state(), event={}, t_ms=0)
+        assert decision.decision == "stay_silent"
+        assert decision.reason == "brain_timeout"
+
+    async def test_external_cancel_propagates_over_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Router's `cancel_in_flight()` cancels the wrapping task; the
+        wait_for wrapper must NOT shadow that as a TimeoutError. Invariant
+        I2 (re-prepend pending batch on cancel) depends on this."""
+        # Long deadline so the test relies on the external cancel, not
+        # the timeout.
+        monkeypatch.setattr(
+            "archmentor_agent.brain.client._BRAIN_DEADLINE_S", 30.0
+        )
+
+        async def hang(_k: dict[str, Any]) -> Message:
+            await asyncio.sleep(10)
+            raise AssertionError("should not reach")
+
+        client = _client(hang)
+        task = asyncio.create_task(
+            client.decide(state=_state(), event={}, t_ms=0)
+        )
+        # Yield once so the wait_for-wrapped coroutine starts.
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

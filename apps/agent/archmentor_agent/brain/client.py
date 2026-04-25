@@ -26,6 +26,7 @@ Logging vocabulary:
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from typing import Any
 
@@ -55,6 +56,17 @@ _MAX_TOKENS = 1024
 # those phases shouldn't need more than a few seconds on any healthy
 # network.
 _BRAIN_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
+
+# Total wall-clock budget for one `decide()` call across the SDK's
+# retry chain. The httpx-level read timeout above bounds a single
+# attempt at 120 s; with `max_retries=2` the chain can stretch to ~360 s
+# of compounded backoff, which would hold the router's serialization
+# gate well past any reasonable interview cadence. 180 s gives one
+# full attempt + headroom for at most one cheap retry. On exhaustion we
+# return `BrainDecision.stay_silent("brain_timeout")` so the voice loop
+# survives — `asyncio.CancelledError` MUST still propagate (router
+# cancellation contract — see `test_cancelled_error_propagates`).
+_BRAIN_DEADLINE_S = 180.0
 
 # `Draft202012Validator(schema)` is compiled once per process; reusing
 # it avoids re-parsing the schema on every brain call. The schema is a
@@ -126,7 +138,23 @@ class BrainClient:
         )
 
         try:
-            response: Message = await self._client.messages.create(**kwargs)
+            response: Message = await asyncio.wait_for(
+                self._client.messages.create(**kwargs),
+                timeout=_BRAIN_DEADLINE_S,
+            )
+        except asyncio.TimeoutError:
+            # `wait_for` cancels the inner coroutine, which the SDK
+            # converts to a clean abort. We degrade rather than raise so
+            # the voice loop keeps running; the router's `_dispatch`
+            # surfaces `reason="brain_timeout"` to the synthetic-recovery
+            # emitter (R27).
+            log.error(
+                "brain.api_error",
+                t_ms=t_ms,
+                kind="TimeoutError",
+                deadline_s=_BRAIN_DEADLINE_S,
+            )
+            return BrainDecision.stay_silent("brain_timeout")
         except (anthropic.BadRequestError, anthropic.AuthenticationError) as exc:
             # These are bugs (bad request shape, invalid API key), not
             # runtime failures. Surface them loudly so the session
