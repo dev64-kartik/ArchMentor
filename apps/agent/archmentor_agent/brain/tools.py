@@ -66,7 +66,50 @@ INTERVIEW_DECISION_TOOL: ToolDescriptor = {
             "state_updates": {
                 "type": "object",
                 "properties": {
-                    "rubric_coverage_delta": {"type": "object"},
+                    "rubric_coverage_delta": {
+                        "type": "object",
+                        "description": (
+                            "Per-dimension coverage update. Keys are rubric "
+                            "dimension names (snake_case); values are objects "
+                            "with `covered` (bool), `depth` (one of 'none', "
+                            "'shallow', 'solid', 'thorough'), and optional "
+                            "`last_touched_t_ms`. As a shorthand you may also "
+                            "emit a bare depth string (e.g. 'shallow') and the "
+                            "agent will inflate it to the full shape."
+                        ),
+                        "additionalProperties": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "covered": {"type": "boolean"},
+                                        "depth": {
+                                            "type": "string",
+                                            "enum": [
+                                                "none",
+                                                "shallow",
+                                                "solid",
+                                                "thorough",
+                                            ],
+                                        },
+                                        "last_touched_t_ms": {
+                                            "type": ["integer", "null"]
+                                        },
+                                    },
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "string",
+                                    "enum": [
+                                        "none",
+                                        "shallow",
+                                        "solid",
+                                        "thorough",
+                                    ],
+                                },
+                            ]
+                        },
+                    },
                     "phase_advance": {"type": ["string", "null"]},
                     "new_decision": {"type": ["object", "null"]},
                     "new_active_argument": {"type": ["object", "null"]},

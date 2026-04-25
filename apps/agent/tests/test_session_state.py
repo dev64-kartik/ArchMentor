@@ -106,6 +106,50 @@ def test_with_state_updates_ignores_null_subkeys() -> None:
     assert updated.decisions == []
 
 
+def test_with_state_updates_coerces_bare_depth_strings() -> None:
+    """Opus reliably emits `rubric_coverage_delta` with bare depth strings
+    (`{"storage_design": "shallow"}`) instead of full CoverageStatus
+    objects. The M3 dogfood (2026-04-25) hit ValidationError on every
+    PG-on-canvas turn, which rolled back the entire dispatch including
+    co-located `session_summary_append`. The apply path must coerce
+    shorthand without losing siblings.
+    """
+    state = SessionState(
+        problem=_problem(),
+        system_prompt_version="v0",
+        started_at=datetime.now(UTC),
+    )
+
+    updated = state.with_state_updates(
+        {
+            "rubric_coverage_delta": {"storage_design": "shallow"},
+            "session_summary_append": "Candidate added Postgres on canvas.",
+        }
+    )
+
+    coverage = updated.rubric_coverage["storage_design"]
+    assert coverage.depth == "shallow"
+    assert coverage.covered is True
+    assert "Postgres on canvas" in updated.session_summary
+
+
+def test_with_state_updates_treats_unknown_depth_as_shallow() -> None:
+    """Off-spec depth strings shouldn't raise — coverage gets recorded as
+    `shallow` so the dispatch still lands and the brain has a chance to
+    correct itself on the next turn.
+    """
+    state = SessionState(
+        problem=_problem(),
+        system_prompt_version="v0",
+        started_at=datetime.now(UTC),
+    )
+    updated = state.with_state_updates(
+        {"rubric_coverage_delta": {"capacity": "deep"}}
+    )
+    assert updated.rubric_coverage["capacity"].depth == "shallow"
+    assert updated.rubric_coverage["capacity"].covered is True
+
+
 def test_with_state_updates_appends_to_existing_summary() -> None:
     """session_summary_append concatenates with a blank-line separator
     so repeated appends produce a readable running summary rather than

@@ -169,7 +169,8 @@ class SessionState(BaseModel):
         rubric_delta = updates.get("rubric_coverage_delta")
         if rubric_delta:
             merged = dict(data.get("rubric_coverage") or {})
-            merged.update(rubric_delta)
+            for dimension, raw in rubric_delta.items():
+                merged[dimension] = _coerce_coverage_status(raw)
             data["rubric_coverage"] = merged
 
         new_decision = updates.get("new_decision")
@@ -189,3 +190,31 @@ class SessionState(BaseModel):
             data["session_summary"] = f"{existing}{sep}{summary_append}"
 
         return SessionState.model_validate(data)
+
+
+_COVERAGE_DEPTHS = ("none", "shallow", "solid", "thorough")
+
+
+def _coerce_coverage_status(raw: Any) -> dict[str, Any]:
+    """Inflate brain shorthand into a `CoverageStatus`-shaped dict.
+
+    Opus reliably emits the bare depth string (e.g. ``"shallow"``) instead
+    of the full object even with the schema set, so accept both shapes
+    here. Anything else collapses to "covered + depth=shallow" so an
+    off-spec emission updates `session_summary_append` rather than
+    raising and rolling back the entire dispatch (the M3 dogfood hit
+    this on every PG-on-canvas turn).
+    """
+    if isinstance(raw, str):
+        depth = raw if raw in _COVERAGE_DEPTHS else "shallow"
+        return {"covered": depth != "none", "depth": depth}
+    if isinstance(raw, dict):
+        depth = raw.get("depth", "shallow")
+        if depth not in _COVERAGE_DEPTHS:
+            depth = "shallow"
+        return {
+            "covered": bool(raw.get("covered", depth != "none")),
+            "depth": depth,
+            "last_touched_t_ms": raw.get("last_touched_t_ms"),
+        }
+    return {"covered": True, "depth": "shallow"}
