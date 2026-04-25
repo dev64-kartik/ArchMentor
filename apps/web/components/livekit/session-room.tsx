@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ConnectionState,
+  type LocalTrackPublication,
   type RemoteAudioTrack,
   type RemoteTrack,
   Room,
@@ -16,11 +17,36 @@ import {
   Track,
 } from "livekit-client";
 
+import { endSessionKeepalive } from "@/lib/api/sessions";
 import { fetchLiveKitToken } from "@/lib/livekit/token";
+import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 type Props = {
   room: string;
+  /**
+   * Real session UUID for R26 keepalive. Omit on dev-test where no
+   * session row exists. When unset, the `beforeunload` handler is not
+   * registered (no API call to make).
+   */
+  sessionId?: string;
+  /**
+   * Lifts the joined Room ref to the parent so co-mounted components
+   * (e.g., ExcalidrawCanvas) can publish to the same connection. Called
+   * with `null` on disconnect/unmount.
+   */
+  onRoomChange?: (room: Room | null) => void;
 };
+
+type MicHealth = "idle" | "live" | "muted" | "ended";
+
+// R24 thresholds — shows reassuring copy after the brain has been
+// "thinking" past the average Opus latency. Anchored to observed M2
+// latency (7-15 s) plus headroom.
+const THINKING_REASSURE_MS = 6_000;
+const THINKING_STILL_MS = 20_000;
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type AiSpeakingState = "idle" | "listening" | "speaking" | "thinking";
 
@@ -66,7 +92,7 @@ function parseAiState(payload: Uint8Array): AiSpeakingState | null {
  * remote track attach, `<audio>` playback — happens inside the click
  * handler so the gesture cascade is preserved.
  */
-export function SessionRoom({ room: roomName }: Props) {
+export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) {
   const roomRef = useRef<Room | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   // Synchronous guard against double-click and StrictMode double-invoke.
@@ -90,6 +116,30 @@ export function SessionRoom({ room: roomName }: Props) {
   const [joined, setJoined] = useState(false);
   const [joining, setJoining] = useState(false);
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [micHealth, setMicHealth] = useState<MicHealth>("idle");
+
+  // R25 — derive a single mic-health dot from local audio track
+  // lifecycle. We ride RoomEvent.LocalTrackPublished/Unpublished plus
+  // the per-track Muted/Unmuted/Ended callbacks because LocalTrack does
+  // not expose a single "state" enum.
+  const bindMicTrack = useCallback((pub: LocalTrackPublication) => {
+    const track = pub.audioTrack;
+    if (!track) return;
+    const sync = () => {
+      setMicHealth(track.isMuted ? "muted" : "live");
+    };
+    sync();
+    track.on("muted", sync);
+    track.on("unmuted", sync);
+    track.on("ended", () => setMicHealth("ended"));
+  }, []);
+
+  const publishRoomToParent = useCallback(
+    (room: Room | null) => {
+      onRoomChange?.(room);
+    },
+    [onRoomChange],
+  );
 
   const attachAudioTrack = useCallback((track: RemoteAudioTrack) => {
     const el = audioElRef.current;
@@ -108,6 +158,7 @@ export function SessionRoom({ room: roomName }: Props) {
     setJoined(false);
     setAiState("idle");
     setElapsedSec(0);
+    setMicHealth("idle");
     joiningRef.current = false;
   }, []);
 
@@ -184,6 +235,14 @@ export function SessionRoom({ room: roomName }: Props) {
       });
       setNeedsAudioUnlock(!room.canPlaybackAudio);
     });
+    room.on(RoomEvent.LocalTrackPublished, (pub) => {
+      if (pub.kind !== Track.Kind.Audio) return;
+      bindMicTrack(pub);
+    });
+    room.on(RoomEvent.LocalTrackUnpublished, (pub) => {
+      if (pub.kind !== Track.Kind.Audio) return;
+      setMicHealth("ended");
+    });
     room.on(RoomEvent.Disconnected, (reason) => {
       console.log("[session] Disconnected", { reason });
       // Unexpected disconnect (network drop, token expiry, SFU kick).
@@ -192,6 +251,7 @@ export function SessionRoom({ room: roomName }: Props) {
       if (mountedRef.current && roomRef.current === room) {
         roomRef.current = null;
         pendingTrackRef.current = null;
+        publishRoomToParent(null);
         resetJoinedState();
       }
     });
@@ -214,13 +274,21 @@ export function SessionRoom({ room: roomName }: Props) {
       // budget on a slow connection.
       await room.startAudio();
       await room.localParticipant.setMicrophoneEnabled(true);
+      // The LocalTrackPublished event fires before this point on
+      // happy paths; bind defensively in case it raced ahead of our
+      // listener registration (StrictMode double-mount).
+      for (const pub of room.localParticipant.audioTrackPublications.values()) {
+        bindMicTrack(pub);
+      }
       setAiState("listening");
       setJoined(true);
+      publishRoomToParent(room);
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : String(exc));
       setAiState("idle");
       roomRef.current?.disconnect();
       roomRef.current = null;
+      publishRoomToParent(null);
       // Release the AudioContext we eagerly created — otherwise Chrome
       // accumulates contexts on repeated failed joins.
       audioContext?.close().catch(() => undefined);
@@ -233,7 +301,13 @@ export function SessionRoom({ room: roomName }: Props) {
         joiningRef.current = false;
       }
     }
-  }, [attachAudioTrack, resetJoinedState, roomName]);
+  }, [
+    attachAudioTrack,
+    bindMicTrack,
+    publishRoomToParent,
+    resetJoinedState,
+    roomName,
+  ]);
 
   useEffect(() => {
     const el = audioElRef.current;
@@ -289,8 +363,9 @@ export function SessionRoom({ room: roomName }: Props) {
       roomRef.current?.disconnect();
       roomRef.current = null;
       pendingTrackRef.current = null;
+      publishRoomToParent(null);
     };
-  }, []);
+  }, [publishRoomToParent]);
 
   useEffect(() => {
     if (!joined) {
@@ -309,8 +384,35 @@ export function SessionRoom({ room: roomName }: Props) {
     roomRef.current = null;
     pendingTrackRef.current = null;
     setConnectionState(ConnectionState.Disconnected);
+    publishRoomToParent(null);
     resetJoinedState();
-  }, [resetJoinedState]);
+  }, [publishRoomToParent, resetJoinedState]);
+
+  // R26 — keepalive Fetch on tab close. Only registers when we have a
+  // real session UUID; dev-test uses a slug that has no DB row.
+  useEffect(() => {
+    if (!sessionId || !UUID_RE.test(sessionId)) return;
+    const onBeforeUnload = () => {
+      if (!joined) return;
+      // Auth token must be read synchronously inside the handler; the
+      // browser cuts the page short after `beforeunload` returns.
+      void (async () => {
+        try {
+          const supabase = createSupabaseBrowserClient();
+          const {
+            data: { session },
+          } = await supabase.auth.getSession();
+          if (session?.access_token) {
+            endSessionKeepalive(sessionId, session.access_token);
+          }
+        } catch (err) {
+          console.warn("[session] beforeunload end-session failed", err);
+        }
+      })();
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [joined, sessionId]);
 
   const handleAudioUnlock = useCallback(async () => {
     try {
@@ -348,6 +450,7 @@ export function SessionRoom({ room: roomName }: Props) {
     <div className="flex flex-col gap-3">
       <div className="flex items-center gap-3">
         <StatusDot state={connectionState} />
+        <MicHealthDot health={micHealth} />
         <span className="text-sm text-neutral-700 dark:text-neutral-300">
           Room <code className="text-xs">{roomName}</code>
         </span>
@@ -453,6 +556,13 @@ function AiStateIndicator({ state }: { state: AiSpeakingState }) {
     },
   };
   const { label, bg, pulse, urgent } = config[state];
+
+  // R24 — once the brain has been "thinking" past the average Opus
+  // turnaround, swap in reassuring copy so the candidate doesn't think
+  // the session is wedged. Re-renders inside the same aria-live region
+  // so screen readers announce the change.
+  const reassure = useThinkingElapsed(state);
+
   return (
     <div
       role="status"
@@ -462,7 +572,56 @@ function AiStateIndicator({ state }: { state: AiSpeakingState }) {
         pulse ? "animate-pulse" : ""
       }`}
     >
-      {label}
+      <div>{label}</div>
+      {reassure ? (
+        <div className="mt-1 text-sm font-normal opacity-90">{reassure}</div>
+      ) : null}
     </div>
   );
 }
+
+function useThinkingElapsed(state: AiSpeakingState): string | null {
+  const [copy, setCopy] = useState<string | null>(null);
+  useEffect(() => {
+    if (state !== "thinking") {
+      setCopy(null);
+      return;
+    }
+    setCopy(null);
+    const t1 = setTimeout(
+      () => setCopy("Mentor is considering — keep going if you'd like."),
+      THINKING_REASSURE_MS,
+    );
+    const t2 = setTimeout(
+      () => setCopy("Still thinking — feel free to continue."),
+      THINKING_STILL_MS,
+    );
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [state]);
+  return copy;
+}
+
+function MicHealthDot({ health }: { health: MicHealth }) {
+  const { color, label } = MIC_HEALTH_DISPLAY[health];
+  return (
+    <span
+      role="status"
+      aria-label={label}
+      title={label}
+      className="inline-flex items-center gap-1.5 text-xs text-neutral-600 dark:text-neutral-400"
+    >
+      <span className={`inline-block h-2 w-2 rounded-full ${color}`} />
+      mic
+    </span>
+  );
+}
+
+const MIC_HEALTH_DISPLAY: Record<MicHealth, { color: string; label: string }> = {
+  idle: { color: "bg-neutral-300 dark:bg-neutral-600", label: "Microphone idle" },
+  live: { color: "bg-emerald-500", label: "Microphone live" },
+  muted: { color: "bg-red-500", label: "Microphone muted" },
+  ended: { color: "bg-neutral-400 opacity-60", label: "Microphone ended" },
+};
