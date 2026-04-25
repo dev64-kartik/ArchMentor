@@ -95,12 +95,14 @@ export function ExcalidrawCanvas({ room }: Props) {
 }
 
 function ImageDisclosureBanner() {
+  // Anchored to the bottom of the canvas so it can never collide with
+  // Excalidraw's top toolbar or its colour-picker popup.
   return (
     <div
       role="status"
       aria-live="polite"
       className={[
-        "pointer-events-none absolute inset-x-0 top-0 z-10 mx-auto mt-2",
+        "pointer-events-none absolute inset-x-0 bottom-2 z-10 mx-auto",
         "max-w-md rounded-md border border-amber-300 bg-amber-50/95 px-3 py-2",
         "text-xs text-amber-900 shadow-sm",
         "dark:border-amber-700 dark:bg-amber-950/90 dark:text-amber-100",
