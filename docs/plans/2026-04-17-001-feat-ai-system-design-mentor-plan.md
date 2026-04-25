@@ -691,6 +691,10 @@ See `docs/plans/2026-04-22-001-feat-m2-brain-mvp-plan.md` for the execution-leve
 
 **Verify:** 45-min session feels like a real interview; phase transitions are content-driven; barge-in works; cost stays under $5; low-confidence decisions abstained.
 
+**M3 dogfood findings (2026-04-25, carry into M4):**
+- **Per-session cost is higher than the $5 cap budgets for under active drawing.** A ~4-min M3 dogfood burned ~$1.50 because every `CANVAS_CHANGE` event drives a fresh Opus call (no agent debounce per M3 plan R8) and most decide `stay_silent`. At Opus 4.7 pricing (~$15/M input) and ~5-9s per call, an hour of active drawing-while-thinking projects to $20-30. Streaming LLM→TTS reduces *latency* but not call count — the M4/M5 cost lever is **call-count throttling**: skip the brain call when canvas changed but `parsed_text` is unchanged from the last brain input, and apply exponential backoff on consecutive `stay_silent` outcomes (e.g., min cooldown after the first `stay_silent`, doubling per consecutive abstain, reset on any `speak`). Wire this into the existing cost-circuit-breaker bullet rather than as a new subsystem.
+- **`brain.call.begin` consistently logs `transcript_turns=0`** even when STT is producing utterances. The rolling transcript window isn't being populated on the path the prompt builder reads, so the brain reasons without recent verbatim context — likely the cause of the brain repeating itself across consecutive turns observed in M3 dogfood. Diagnose during the session-summary-compressor work (the same code path owns both rolling-window upkeep and Haiku rollover); add a regression test that asserts `transcript_turns > 0` after the second utterance.
+
 ### M5 — Report generation (week 7)
 
 - Async report job (Celery or background task)
