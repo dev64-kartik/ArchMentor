@@ -8,10 +8,16 @@ export default function HomePage() {
         Practice system design interviews with an AI interviewer who listens, watches your
         whiteboard, and gives rubric-anchored feedback.
       </p>
-      <div className="flex gap-3">
+      <div className="flex flex-wrap gap-3">
+        <Link
+          href="/session/new"
+          className="rounded-md bg-emerald-600 px-4 py-2 text-white hover:bg-emerald-700"
+        >
+          Start a session
+        </Link>
         <Link
           href="/problems"
-          className="rounded-md bg-neutral-900 px-4 py-2 text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-neutral-200"
+          className="rounded-md border border-neutral-300 px-4 py-2 text-neutral-900 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-100 dark:hover:bg-neutral-800"
         >
           Browse problems
         </Link>
