@@ -27,6 +27,7 @@ Logging vocabulary:
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from typing import Any
 
@@ -208,6 +209,15 @@ class BrainClient:
             )
             return BrainDecision.schema_violation(None, usage=usage)
 
+        # Recover Opus's XML-tool-use spillover before validation. Opus
+        # 4.x intermittently emits nested-object fields as a single
+        # string of `<parameter name="...">value</parameter>` even
+        # though the schema asks for an object. Observed in M3 dogfood
+        # 2026-04-25 when state_updates arrived as one long XML blob,
+        # which previously crashed the entire dispatch and silently
+        # dropped a real session_summary update.
+        tool_input = _recover_xml_tool_input(tool_input, t_ms=t_ms)
+
         errors = sorted(_DECISION_VALIDATOR.iter_errors(tool_input), key=lambda e: e.path)
         if errors:
             first = errors[0]
@@ -263,6 +273,65 @@ def _extract_tool_block(response: Message) -> ToolUseBlock | None:
         if isinstance(block, ToolUseBlock) and block.name == INTERVIEW_DECISION_TOOL["name"]:
             return block
     return None
+
+
+# Object-typed sub-keys on `interview_decision`'s `state_updates`. If
+# Opus emits them as XML-tool-use strings, we attempt recovery in place.
+# Keys not in this set are passed through untouched (the brain doesn't
+# emit XML for them in observed traffic).
+_OBJECT_TYPED_PATHS: tuple[tuple[str, ...], ...] = (
+    ("state_updates",),
+)
+
+_XML_PARAMETER_RE = re.compile(
+    r'<parameter\s+name="(?P<name>[^"]+)">(?P<value>.*?)</parameter>',
+    re.DOTALL,
+)
+
+
+def _recover_xml_tool_input(
+    tool_input: dict[str, Any], *, t_ms: int
+) -> dict[str, Any]:
+    """Inflate Opus's XML-style tool-use spillover back into a dict.
+
+    When Opus emits a nested object as the literal string
+    ``"\\n<parameter name=\\"foo\\">bar</parameter>"`` the strict
+    JSON-schema validator below would otherwise reject the entire
+    decision and we'd silently drop a real state update. We probe a
+    fixed allowlist of paths (currently just ``state_updates``) and
+    reshape the string back into the `{name: value}` map the schema
+    expects.
+
+    Logs ``brain.tool_input_recovered`` so the operator can grep for
+    how often the model fell into this format. Recovery is best-effort:
+    if no `<parameter>` tags match, the original string is left in
+    place to fail validation as before.
+    """
+    for path in _OBJECT_TYPED_PATHS:
+        node: Any = tool_input
+        for key in path[:-1]:
+            if not isinstance(node, dict) or key not in node:
+                node = None
+                break
+            node = node[key]
+        if not isinstance(node, dict):
+            continue
+        leaf = path[-1]
+        value = node.get(leaf)
+        if not isinstance(value, str):
+            continue
+        recovered: dict[str, str] = {}
+        for match in _XML_PARAMETER_RE.finditer(value):
+            recovered[match.group("name")] = match.group("value").strip()
+        if recovered:
+            log.info(
+                "brain.tool_input_recovered",
+                t_ms=t_ms,
+                path="/".join(path),
+                recovered_keys=sorted(recovered),
+            )
+            node[leaf] = recovered
+    return tool_input
 
 
 def _usage_from_response(usage: Usage | None, *, model: str) -> BrainUsage:

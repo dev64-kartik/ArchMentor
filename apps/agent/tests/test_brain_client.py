@@ -397,6 +397,76 @@ class TestDegradedPaths:
         assert decision.reason == "utterance_has_control_chars"
 
 
+class TestXmlToolInputRecovery:
+    """Opus 4.x intermittently emits nested-object fields as the literal
+    `<parameter name="...">value</parameter>` XML string instead of a
+    JSON object. Observed in the M3 dogfood (2026-04-25): the brain had
+    a real session_summary update to land but the wrapper format failed
+    schema validation and the entire dispatch was lost. The recovery
+    path inflates the XML back into the dict shape the schema expects.
+    """
+
+    async def test_state_updates_xml_string_is_recovered(self) -> None:
+        xml_blob = (
+            '\n<parameter name="session_summary_append">Candidate asked '
+            "&quot;is it the right call?&quot; — fishing for validation."
+            "</parameter>"
+        )
+        tool_input = _valid_tool_input()
+        tool_input["state_updates"] = xml_blob
+
+        def responder(_k: dict[str, Any]) -> Message:
+            return _make_message(tool_input=tool_input)
+
+        client = _client(responder)
+        decision = await client.decide(state=_state(), event={}, t_ms=0)
+
+        # Schema validation passed because state_updates was reshaped.
+        assert decision.reason is None
+        assert decision.state_updates == {
+            "session_summary_append": (
+                "Candidate asked &quot;is it the right call?&quot; — "
+                "fishing for validation."
+            )
+        }
+
+    async def test_state_updates_xml_with_multiple_fields_is_recovered(
+        self,
+    ) -> None:
+        xml_blob = (
+            '<parameter name="session_summary_append">Pushed for QPS.</parameter>'
+            '<parameter name="phase_advance">capacity</parameter>'
+        )
+        tool_input = _valid_tool_input()
+        tool_input["state_updates"] = xml_blob
+
+        def responder(_k: dict[str, Any]) -> Message:
+            return _make_message(tool_input=tool_input)
+
+        client = _client(responder)
+        decision = await client.decide(state=_state(), event={}, t_ms=0)
+        assert decision.reason is None
+        assert decision.state_updates == {
+            "session_summary_append": "Pushed for QPS.",
+            "phase_advance": "capacity",
+        }
+
+    async def test_unrecognizable_string_still_fails_validation(self) -> None:
+        """If the offending string isn't XML-shaped we don't pretend to
+        recover — it falls through to the existing schema_violation
+        path so the operator still sees a warning."""
+        tool_input = _valid_tool_input()
+        tool_input["state_updates"] = "just a regular sentence"
+
+        def responder(_k: dict[str, Any]) -> Message:
+            return _make_message(tool_input=tool_input)
+
+        client = _client(responder)
+        decision = await client.decide(state=_state(), event={}, t_ms=0)
+        assert decision.decision == "stay_silent"
+        assert decision.reason == "schema_violation"
+
+
 # ─────────────────────── error taxonomy ───────────────────────────────
 
 
