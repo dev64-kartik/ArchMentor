@@ -1,5 +1,11 @@
 """Seed a deterministic problem + session for M1 mic smoke tests.
 
+Status (M3+): the candidate-facing entry path is now `/session/new`
+backed by `POST /sessions`. This script is retained for **replay-only
+flows** that need a fixed session UUID against the dev problem (e.g.,
+`scripts/replay.py --snapshot ...`). For end-to-end lifecycle smoke,
+prefer `scripts/replay.py --lifecycle`.
+
 Idempotent: running it multiple times updates in place.
 
     # Default — seeds a synthetic `dev@archmentor.local` owner. Useful
