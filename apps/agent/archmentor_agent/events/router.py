@@ -470,9 +470,7 @@ class EventRouter:
         """
         if self._emit_synthetic is None:
             return
-        _recovery_reasons = frozenset(
-            {"brain_timeout", "anthropic_api_connection_during_wait_for"}
-        )
+        _recovery_reasons = frozenset({"brain_timeout", "anthropic_api_connection_during_wait_for"})
         if decision.reason not in _recovery_reasons:
             return
         if self._apology_used:

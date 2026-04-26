@@ -143,9 +143,7 @@ def test_with_state_updates_treats_unknown_depth_as_shallow() -> None:
         system_prompt_version="v0",
         started_at=datetime.now(UTC),
     )
-    updated = state.with_state_updates(
-        {"rubric_coverage_delta": {"capacity": "deep"}}
-    )
+    updated = state.with_state_updates({"rubric_coverage_delta": {"capacity": "deep"}})
     assert updated.rubric_coverage["capacity"].depth == "shallow"
     assert updated.rubric_coverage["capacity"].covered is True
 

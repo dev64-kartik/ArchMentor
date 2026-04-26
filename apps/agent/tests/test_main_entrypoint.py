@@ -790,8 +790,7 @@ async def test_transcript_window_caps_at_30_turns() -> None:
     seeded = seed.model_copy(
         update={
             "transcript_window": [
-                TranscriptTurn(t_ms=i, speaker="candidate", text=f"turn-{i}")
-                for i in range(30)
+                TranscriptTurn(t_ms=i, speaker="candidate", text=f"turn-{i}") for i in range(30)
             ],
         }
     )
@@ -818,9 +817,7 @@ async def test_append_transcript_no_baseline_state_logs_and_continues() -> None:
 
     brain = FakeBrainClient()
     brain.enqueue_stay_silent("ack")
-    agent, _, ledger, _, store, _, _ = _build_agent_under_test(
-        brain_enabled=True, brain=brain
-    )
+    agent, _, ledger, _, store, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
     # Wipe the seeded state so the mutator hits the `current is None` branch.
     store._states.pop(SESSION_ID, None)
 

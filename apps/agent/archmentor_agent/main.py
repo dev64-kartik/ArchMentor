@@ -515,9 +515,7 @@ class MentorAgent(Agent):
         log.info("agent.ack.end")
         ack_t_ms = self._now_relative_ms()
         self._log("utterance_ai", {"text": TURN_ACK_UTTERANCE, "speaker": "ai"})
-        await self._append_transcript_turn(
-            speaker="ai", text=TURN_ACK_UTTERANCE, t_ms=ack_t_ms
-        )
+        await self._append_transcript_turn(speaker="ai", text=TURN_ACK_UTTERANCE, t_ms=ack_t_ms)
         await self._publish_state("listening")
 
     async def _run_brain_turn(self, *, text: str, turn_t_ms: int) -> None:
@@ -613,9 +611,7 @@ class MentorAgent(Agent):
                 return
             ai_t_ms = self._now_relative_ms()
             self._log("utterance_ai", {"text": utterance.text, "speaker": "ai"})
-            await self._append_transcript_turn(
-                speaker="ai", text=utterance.text, t_ms=ai_t_ms
-            )
+            await self._append_transcript_turn(speaker="ai", text=utterance.text, t_ms=ai_t_ms)
             await self._publish_state("listening")
 
     async def _say(self, text: str) -> None:
@@ -986,9 +982,7 @@ class MentorAgent(Agent):
                 t_ms=t_ms,
             )
 
-    async def _append_transcript_turn(
-        self, *, speaker: str, text: str, t_ms: int
-    ) -> None:
+    async def _append_transcript_turn(self, *, speaker: str, text: str, t_ms: int) -> None:
         """Append a TranscriptTurn to ``state.transcript_window`` via Redis CAS.
 
         The brain reads the full window on every call (see

@@ -92,9 +92,7 @@ INTERVIEW_DECISION_TOOL: ToolDescriptor = {
                                                 "thorough",
                                             ],
                                         },
-                                        "last_touched_t_ms": {
-                                            "type": ["integer", "null"]
-                                        },
+                                        "last_touched_t_ms": {"type": ["integer", "null"]},
                                     },
                                     "additionalProperties": False,
                                 },

@@ -389,9 +389,7 @@ async def test_synthetic_recovery_fires_once_on_brain_timeout() -> None:
     def emit(*, text: str, reason: str) -> None:
         emissions.append((text, reason))
 
-    router, _, _, _, _, _, snap_tasks = _make_router(
-        brain=brain, recovery_text=_TEST_RECOVERY_TEXT
-    )
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain, recovery_text=_TEST_RECOVERY_TEXT)
     router._emit_synthetic = emit  # inject post-construction; mirrors entrypoint wiring
 
     await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "a"}))
@@ -460,9 +458,7 @@ async def test_synthetic_recovery_fires_on_anthropic_api_connection_during_wait_
     def emit(*, text: str, reason: str) -> None:
         emissions.append((text, reason))
 
-    router, _, _, _, _, _, snap_tasks = _make_router(
-        brain=brain, recovery_text=_TEST_RECOVERY_TEXT
-    )
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain, recovery_text=_TEST_RECOVERY_TEXT)
     router._emit_synthetic = emit
 
     await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "a"}))

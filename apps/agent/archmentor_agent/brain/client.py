@@ -356,9 +356,7 @@ def _recover_xml_state_updates(value: str) -> dict[str, str] | None:
     return recovered if recovered else None
 
 
-def _recover_xml_tool_input(
-    tool_input: dict[str, Any], *, t_ms: int
-) -> dict[str, Any]:
+def _recover_xml_tool_input(tool_input: dict[str, Any], *, t_ms: int) -> dict[str, Any]:
     """Inflate Opus's XML-style tool-use spillover back into a dict.
 
     When Opus emits ``state_updates`` as the literal string

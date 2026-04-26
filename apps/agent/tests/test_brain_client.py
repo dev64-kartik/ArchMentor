@@ -425,8 +425,7 @@ class TestXmlToolInputRecovery:
         assert decision.reason is None
         assert decision.state_updates == {
             "session_summary_append": (
-                "Candidate asked &quot;is it the right call?&quot; — "
-                "fishing for validation."
+                "Candidate asked &quot;is it the right call?&quot; — fishing for validation."
             )
         }
 
