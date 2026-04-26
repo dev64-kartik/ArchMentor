@@ -62,6 +62,11 @@ dev = [
     # `FakeServer` pattern needed for concurrent CAS tests. Pinned
     # exact — see global CLAUDE.md: pin exact versions.
     "fakeredis==2.35.1",
+    # Property-based testing for the canvas parser (M3 Unit 7). The
+    # adversarial scene-input space is wide enough that hand-written
+    # cases miss the long tail; @given(excalidraw_scene()) covers
+    # invariants like "label tags balance" and "output ≤ 8 KiB UTF-8".
+    "hypothesis==6.152.2",
 ]
 
 [build-system]

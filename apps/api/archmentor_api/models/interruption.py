@@ -24,7 +24,7 @@ class Interruption(SQLModel, table=True):
     __tablename__ = "interruptions"
 
     id: UUID = Field(default_factory=pk_uuid, primary_key=True)
-    session_id: UUID = Field(foreign_key="sessions.id", index=True)
+    session_id: UUID = Field(foreign_key="sessions.id", index=True, ondelete="CASCADE")
     t_ms: int = Field(nullable=False, index=True)
 
     trigger: str = Field(max_length=50, nullable=False)

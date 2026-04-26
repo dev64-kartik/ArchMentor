@@ -21,7 +21,7 @@ class Report(SQLModel, table=True):
     __tablename__ = "reports"
 
     id: UUID = Field(default_factory=pk_uuid, primary_key=True)
-    session_id: UUID = Field(foreign_key="sessions.id", unique=True, index=True)
+    session_id: UUID = Field(foreign_key="sessions.id", unique=True, index=True, ondelete="CASCADE")
     status: ReportStatus = Field(
         default=ReportStatus.PENDING,
         sa_column=str_enum_column(ReportStatus, default=ReportStatus.PENDING),

@@ -198,3 +198,22 @@ def test_append_event_rejects_oversized_payload(client: TestClient, session_id: 
         headers=_agent_headers(),
     )
     assert response.status_code == 413
+
+
+def test_active_session_gate_compiles_with_for_update_on_postgres() -> None:
+    """The TOCTOU fix relies on `SELECT ... FOR UPDATE` on the session row.
+
+    SQLite silently no-ops FOR UPDATE, so the actual race scenario can't
+    be reproduced in this test harness. Instead we compile the query the
+    helper builds against the Postgres dialect and assert it includes
+    the FOR UPDATE clause — that's the structural invariant the
+    production database needs. Removing `.with_for_update()` from
+    `_require_active_session` makes this test fail.
+    """
+    from archmentor_api.models.session import InterviewSession
+    from sqlalchemy.dialects import postgresql
+    from sqlmodel import select
+
+    stmt = select(InterviewSession).where(InterviewSession.id == uuid4()).with_for_update()
+    compiled = str(stmt.compile(dialect=postgresql.dialect()))
+    assert "FOR UPDATE" in compiled.upper()

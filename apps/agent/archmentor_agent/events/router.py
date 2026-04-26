@@ -48,8 +48,8 @@ import structlog
 from archmentor_agent.brain.client import BrainClient
 from archmentor_agent.brain.decision import BrainDecision
 from archmentor_agent.events.coalescer import coalesce
-from archmentor_agent.events.types import EventType, RouterEvent
-from archmentor_agent.queue import SpeechCheckGate, UtteranceQueue
+from archmentor_agent.events.types import RouterEvent
+from archmentor_agent.queue import UtteranceQueue
 from archmentor_agent.snapshots.client import SnapshotClient
 from archmentor_agent.snapshots.serializer import build_snapshot
 from archmentor_agent.state.redis_store import (
@@ -89,6 +89,23 @@ shutdown drain catches it. See `MentorAgent` Unit 7 wiring.
 """
 
 
+class SyntheticUtteranceEmitter(Protocol):
+    """Subset of `MentorAgent._emit_synthetic` the router needs.
+
+    Decoupled via Protocol so the router can fire R27's recovery
+    utterance through the speech-check gate without importing the agent
+    module. The router observes `BrainDecision.reason="brain_timeout"`
+    first; the agent owns the gate + TTS hand-off.
+
+    `reason` is a discriminator written to the `ai_utterance` ledger row
+    (`synthetic: true`, `reason: "brain_timeout"`) so M5 reports + the
+    M6 eval harness can filter synthetic speech out of candidate-speech
+    metrics. Fire-and-forget; never awaited from the router.
+    """
+
+    def __call__(self, *, text: str, reason: str) -> None: ...
+
+
 class EventRouter:
     """Serialized brain dispatcher with coalescing + cost guard."""
 
@@ -101,9 +118,10 @@ class EventRouter:
         snapshot_client: SnapshotClient,
         snapshot_scheduler: SnapshotScheduler,
         utterance_queue: UtteranceQueue,
-        gate: SpeechCheckGate,
         log_event: LedgerLogger,
         now_ms: Callable[[], int],
+        synthetic_emitter: SyntheticUtteranceEmitter | None = None,
+        recovery_text: str = "",
     ) -> None:
         self._session_id = session_id
         self._brain = brain
@@ -111,9 +129,10 @@ class EventRouter:
         self._snapshot_client = snapshot_client
         self._schedule_snapshot = snapshot_scheduler
         self._queue = utterance_queue
-        self._gate = gate  # held for future canvas wiring; gate is read by MentorAgent today
         self._log = log_event
         self._now_ms = now_ms
+        self._emit_synthetic = synthetic_emitter
+        self._recovery_text = recovery_text
 
         self._lock = asyncio.Lock()
         self._pending: list[RouterEvent] = []
@@ -124,19 +143,20 @@ class EventRouter:
         self._consecutive_schema_violations = 0
         self._cost_capped = False
         self._escalation_emitted = False
+        # R27: synthetic recovery utterance fires at most once per session.
+        # Flips True on attempt regardless of whether the speech-check
+        # gate let it through — repeated brain timeouts must not spam
+        # the candidate with the same line.
+        self._apology_used = False
 
     async def handle(self, event: RouterEvent) -> None:
         """Enqueue an event; spawn `_dispatch` if not already running.
 
         Returns immediately. The actual brain call runs in
-        `_dispatch_loop`. Raises `NotImplementedError` for
-        `CANVAS_CHANGE` (M3 path) before touching `pending` or
-        `_dispatching`.
+        `_dispatch_loop`. M3 lands `canvas_change`: it flows through the
+        same path as `turn_end`, with the coalescer's priority logic
+        deciding which event wins when a batch mixes types.
         """
-        if event.type is EventType.CANVAS_CHANGE:
-            log.info("router.canvas_change.deferred_to_m3", t_ms=event.t_ms)
-            raise NotImplementedError("canvas_change wires in M3")
-
         spawn = False
         async with self._lock:
             self._pending.append(event)
@@ -301,6 +321,7 @@ class EventRouter:
         self._emit_brain_decision_event(snapshot_t_ms, decision)
         self._update_violation_counter(decision)
         self._maybe_push_utterance(decision, snapshot_t_ms)
+        self._maybe_emit_recovery_utterance(decision)
 
     async def _load_state(self) -> SessionState | None:
         return await self._store.load(self._session_id)
@@ -424,6 +445,39 @@ class EventRouter:
         self._consecutive_schema_violations = 0
         self._escalation_emitted = False
 
+    def _maybe_emit_recovery_utterance(self, decision: BrainDecision) -> None:
+        """Fire R27's synthetic recovery utterance on brain timeout.
+
+        Routes through `MentorAgent._emit_synthetic` (the speech-check
+        gate is the agent's responsibility — the router doesn't import
+        it). The `_apology_used` flag flips on attempt regardless of
+        whether the gate let the line through, so repeated brain
+        timeouts don't spam the candidate. R24's elapsed-time copy
+        carries the visible signal when the gate blocks.
+
+        Two reasons trigger R27 (see `brain/client.py` comment for the
+        SDK behaviour that causes the second one):
+        - `"brain_timeout"`: `asyncio.wait_for` fired and the SDK
+          converted it cleanly to a TimeoutError.
+        - `"anthropic_api_connection_during_wait_for"`: the SDK converted
+          a wait_for-triggered CancelledError into `APIConnectionError`
+          mid-backoff, which the client catches after the wall-clock
+          deadline has elapsed. Functionally identical to a timeout from
+          the candidate's perspective.
+
+        No-op when no `synthetic_emitter` was wired (tests / kill-
+        switch paths) — the router stays callable without one.
+        """
+        if self._emit_synthetic is None:
+            return
+        _recovery_reasons = frozenset({"brain_timeout", "anthropic_api_connection_during_wait_for"})
+        if decision.reason not in _recovery_reasons:
+            return
+        if self._apology_used:
+            return
+        self._apology_used = True
+        self._emit_synthetic(text=self._recovery_text, reason=decision.reason or "brain_timeout")
+
     def _maybe_push_utterance(self, decision: BrainDecision, t_ms: int) -> None:
         if decision.decision != "speak":
             return
@@ -478,4 +532,9 @@ def _decision_payload(decision: BrainDecision) -> dict[str, Any]:
     }
 
 
-__all__ = ["EventRouter", "LedgerLogger", "SnapshotScheduler"]
+__all__ = [
+    "EventRouter",
+    "LedgerLogger",
+    "SnapshotScheduler",
+    "SyntheticUtteranceEmitter",
+]

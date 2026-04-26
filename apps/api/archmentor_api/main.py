@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from archmentor_api import __version__
 from archmentor_api.config import get_settings
+from archmentor_api.middleware import BodySizeLimitMiddleware
 from archmentor_api.routes import health, livekit_tokens, me, problems, reports, sessions
 
 
@@ -20,6 +21,9 @@ def create_app() -> FastAPI:
         redoc_url=None,
     )
 
+    # Body-size gate runs before CORS so an oversized payload is rejected
+    # without burning a CORS preflight round-trip on the response.
+    app.add_middleware(BodySizeLimitMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,

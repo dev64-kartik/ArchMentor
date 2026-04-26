@@ -4,23 +4,28 @@ Merges a list of `RouterEvent` (everything that piled up while a brain
 call was in flight) into a single `RouterEvent` so the next brain call
 only fires once per coalesced batch.
 
-M2 rule — `turn_end` always wins:
+M3 priority semantics:
 
-- Any batch containing at least one `TURN_END` collapses to a single
-  `TURN_END`. The merged payload exposes `transcripts` as the ordered
-  list of every `TURN_END` payload's `text` (or the full payload if
-  `text` is absent), so the brain sees every utterance in order.
-- A batch of only `LONG_SILENCE` returns the most recent one (latest
-  `t_ms`); same for `PHASE_TIMER`. If both `LONG_SILENCE` and
-  `PHASE_TIMER` are present without any `TURN_END`, the latest event
-  by `t_ms` wins (priority is undefined for a no-speech batch in M2).
-- `t_ms` on the merged event is the latest `t_ms` across the batch —
-  monotonic-by-construction with the next dispatch's pre-await stamp.
+- Any HIGH (e.g. canvas_change): latest HIGH event's type; payload is
+  the HIGH event's source payload + `concurrent_transcripts` (any
+  TURN_END text in the batch) + `merged_from`.
+- MEDIUM only, with TURN_END: collapses to a single TURN_END whose
+  payload carries `transcripts` (every TURN_END's text in order) +
+  `merged_from`. M2 rule preserved.
+- MEDIUM only, no TURN_END: latest by `t_ms`; source payload pass-through
+  + `merged_from`. M2 rule preserved.
+- LOW only: latest by `t_ms`; source payload pass-through + `merged_from`.
 
-Assumption flagged for M3: `canvas_change` introduces a priority field
-because a factual error drawn mid-speech is more urgent than the
-current `turn_end`. The router rejects `canvas_change` at `handle()`
-entry today, so this function never sees one.
+`t_ms` on the merged event is the latest `t_ms` across the batch —
+monotonic-by-construction with the next dispatch's pre-await stamp.
+This carries the M2 invariant forward so the router's I3 invariant
+(snapshot t_ms is the moment the batch closed) still holds.
+
+`concurrent_transcripts` is empty when no TURN_END is in the batch,
+*including* a batch of one CANVAS_CHANGE. The brain prompt's
+`[Event payload shapes]` section (Unit 9 lands the bootstrap.py
+clause) documents this contract; the offline contract test in
+`test_event_coalescer.py` verifies the coalescer output matches.
 
 Pure function. No I/O, no logging — the router logs the merge result
 once per dispatch.
@@ -30,7 +35,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from archmentor_agent.events.types import EventType, RouterEvent
+from archmentor_agent.events.types import (
+    PRIORITY_RANK,
+    EventType,
+    Priority,
+    RouterEvent,
+)
 
 
 def coalesce(events: list[RouterEvent]) -> RouterEvent:
@@ -38,47 +48,60 @@ def coalesce(events: list[RouterEvent]) -> RouterEvent:
 
     Raises `ValueError` if the batch is empty — callers must guard
     upstream (the router only invokes us when `pending` had items).
-    Raises `ValueError` if the batch contains a `CANVAS_CHANGE`
-    (the router rejects it at `handle()` entry; defense in depth).
     """
     if not events:
         raise ValueError("coalesce requires a non-empty batch")
-    for ev in events:
-        if ev.type is EventType.CANVAS_CHANGE:
-            raise ValueError(
-                "canvas_change must be rejected at router.handle() entry; "
-                "the coalescer must never see one in M2."
-            )
 
-    turn_ends = [e for e in events if e.type is EventType.TURN_END]
-    if turn_ends:
+    max_rank = max(PRIORITY_RANK[e.priority] for e in events)
+    latest_t_ms = max(e.t_ms for e in events)
+    merged_from = [e.type.value for e in events]
+
+    if max_rank == PRIORITY_RANK[Priority.HIGH]:
+        # Highest tier: a HIGH event always wins. If multiple HIGH
+        # events landed in the same batch, the latest by `t_ms` carries
+        # the merged payload. Any TURN_END text in the batch folds in
+        # via `concurrent_transcripts` so speech-while-drawing stays
+        # visible to the brain.
+        high_events = [e for e in events if e.priority is Priority.HIGH]
+        latest_high = max(high_events, key=lambda e: e.t_ms)
+        concurrent_transcripts = [
+            _extract_transcript(e.payload) for e in events if e.type is EventType.TURN_END
+        ]
         merged_payload: dict[str, Any] = {
-            "transcripts": [_extract_transcript(e.payload) for e in turn_ends],
-            # Surface the merged-from list so the brain prompt and snapshots
-            # can show what got coalesced; M3 will replace this with a
-            # priority-aware merge log.
-            "merged_from": [e.type.value for e in events],
+            **latest_high.payload,
+            "concurrent_transcripts": concurrent_transcripts,
+            "merged_from": merged_from,
         }
-        latest = max(events, key=lambda e: e.t_ms)
         return RouterEvent(
-            type=EventType.TURN_END,
-            t_ms=latest.t_ms,
+            type=latest_high.type,
+            t_ms=latest_t_ms,
             payload=merged_payload,
+            priority=latest_high.priority,
         )
 
-    # No turn_end → the latest event wins (priority is undefined for a
-    # no-speech batch in M2; see the module docstring "priority is
-    # undefined" note). M2 has only LONG_SILENCE and PHASE_TIMER
-    # landing here; payload comes through verbatim. M3 introduces a
-    # priority field on RouterEvent so `canvas_change` can preempt —
-    # that change will replace this latest-wins branch with a
-    # priority-aware merge, so a future reader tracing a weird merge
-    # outcome should start here.
+    # M2 turn_end-wins rule: any batch containing at least one TURN_END
+    # collapses to a single TURN_END with all transcripts in order.
+    turn_ends = [e for e in events if e.type is EventType.TURN_END]
+    if turn_ends:
+        merged_payload = {
+            "transcripts": [_extract_transcript(e.payload) for e in turn_ends],
+            "merged_from": merged_from,
+        }
+        return RouterEvent(
+            type=EventType.TURN_END,
+            t_ms=latest_t_ms,
+            payload=merged_payload,
+            priority=Priority.MEDIUM,
+        )
+
+    # No HIGH, no TURN_END — latest by `t_ms` wins. M2 LONG_SILENCE +
+    # PHASE_TIMER batches still resolve here.
     latest = max(events, key=lambda e: e.t_ms)
     return RouterEvent(
         type=latest.type,
         t_ms=latest.t_ms,
-        payload={**latest.payload, "merged_from": [e.type.value for e in events]},
+        payload={**latest.payload, "merged_from": merged_from},
+        priority=latest.priority,
     )
 
 

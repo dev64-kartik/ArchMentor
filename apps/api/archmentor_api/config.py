@@ -73,6 +73,13 @@ class Settings(BaseSettings):
         min_length=32,
     )
 
+    @field_validator("livekit_url")
+    @classmethod
+    def _validate_livekit_url_scheme(cls, v: str) -> str:
+        if not (v.startswith("ws://") or v.startswith("wss://")):
+            raise ValueError("livekit_url must use ws:// or wss:// scheme")
+        return v
+
     @field_validator(
         "jwt_secret",
         "livekit_api_key",

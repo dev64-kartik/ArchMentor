@@ -7,10 +7,17 @@ Usage:
     # Actually invoke the current brain client and diff the result:
     uv run python scripts/replay.py --snapshot <uuid> --run
 
+    # Drive the M3 lifecycle end-to-end against a running stack:
+    uv run python scripts/replay.py --lifecycle \\
+        --email you@example.com --password ...
+
 Exit codes:
     0 — stored and fresh decisions agree on decision + priority + confidence
+        (or — for --lifecycle — every step passed)
     1 — the three match-keys disagree (a prompt / schema drift signal)
+        or any --lifecycle step failed
     2 — snapshot not found (or other operator error)
+    3 — usage error (bad CLI args, missing env, etc.)
 
 `--dry-run` is the default so a misclick in `watch uv run …` doesn't
 burn Anthropic tokens. Pass `--run` to actually invoke the brain.
@@ -122,6 +129,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="Required on multi-snapshot replays (`--session`) to confirm the token spend.",
+    )
+    parser.add_argument(
+        "--lifecycle",
+        action="store_true",
+        help="Drive the full M3 lifecycle (POST /sessions → /events → "
+        "/canvas-snapshots → /end → DELETE) and assert cascade. Requires "
+        "--email + --password and a running stack.",
+    )
+    parser.add_argument(
+        "--email",
+        help="GoTrue email for --lifecycle sign-in.",
+    )
+    parser.add_argument(
+        "--password",
+        help="GoTrue password for --lifecycle sign-in.",
     )
     return parser
 
@@ -336,16 +358,243 @@ def run_replay(
     return EXIT_MATCH if diff.match_keys_agree else EXIT_DIVERGED
 
 
+# ──────────────── --lifecycle: M3 full-stack smoke ────────────────────
+
+
+_LIFECYCLE_CASCADE_TABLES = (
+    "session_events",
+    "brain_snapshots",
+    "canvas_snapshots",
+    "interruptions",
+    "reports",
+)
+
+
+def _gotrue_url() -> str:
+    """Resolve the GoTrue base URL from the same env var the web uses."""
+    url = os.environ.get("NEXT_PUBLIC_GOTRUE_URL") or os.environ.get("GOTRUE_API_EXTERNAL_URL")
+    if not url:
+        raise SystemExit(
+            "NEXT_PUBLIC_GOTRUE_URL (or GOTRUE_API_EXTERNAL_URL) is not set; "
+            "cannot sign in for --lifecycle."
+        )
+    return url.rstrip("/")
+
+
+def _api_url() -> str:
+    """Reuse the agent's api_url field so dev + CI agree on one knob."""
+    from archmentor_agent.config import get_settings as _agent_settings
+
+    return _agent_settings().api_url.rstrip("/")
+
+
+def _agent_token() -> str:
+    """Shared-secret for X-Agent-Token. Same source as the live agent."""
+    from archmentor_agent.config import get_settings as _agent_settings
+
+    return _agent_settings().agent_ingest_token.get_secret_value()
+
+
+def _print_step(name: str, ok: bool, detail: str = "") -> None:
+    marker = "PASS" if ok else "FAIL"
+    suffix = f" — {detail}" if detail else ""
+    print(f"  [{marker}] {name}{suffix}")
+
+
+async def _run_lifecycle(email: str, password: str) -> int:
+    """End-to-end smoke: sign-in → /sessions → /events → /canvas-snapshots
+    → /end → DELETE → cascade audit. Prints per-step pass/fail and
+    returns EXIT_MATCH on full success, EXIT_DIVERGED on any failure.
+
+    Built directly on httpx + sqlmodel rather than spinning up FastAPI's
+    test client because the goal is to exercise the *running* stack
+    (uvicorn, GoTrue, Postgres) the way a candidate-driven session does.
+    """
+    import httpx
+    from sqlalchemy import text
+
+    api_url = _api_url()
+    gotrue_url = _gotrue_url()
+    agent_token = _agent_token()
+
+    print("=== replay: --lifecycle smoke ===")
+    print(f"  api: {api_url}")
+    print(f"  gotrue: {gotrue_url}")
+
+    failures: list[str] = []
+
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        # Step 1: sign in via GoTrue's password grant.
+        token_resp = await http.post(
+            f"{gotrue_url}/token?grant_type=password",
+            json={"email": email, "password": password},
+        )
+        if token_resp.status_code != 200:
+            detail = f"HTTP {token_resp.status_code}: {token_resp.text}"
+            _print_step("gotrue sign-in", False, detail)
+            return EXIT_DIVERGED
+        access_token = token_resp.json().get("access_token")
+        if not access_token:
+            _print_step("gotrue sign-in", False, "no access_token in response")
+            return EXIT_DIVERGED
+        _print_step("gotrue sign-in", True)
+        user_headers = {"Authorization": f"Bearer {access_token}"}
+        agent_headers = {"X-Agent-Token": agent_token}
+
+        # Step 2: pick a problem.
+        problems_resp = await http.get(f"{api_url}/problems", headers=user_headers)
+        if problems_resp.status_code != 200 or not problems_resp.json():
+            _print_step(
+                "GET /problems",
+                False,
+                f"HTTP {problems_resp.status_code}: {problems_resp.text}",
+            )
+            return EXIT_DIVERGED
+        problem_slug = problems_resp.json()[0]["slug"]
+        _print_step("GET /problems", True, f"using slug={problem_slug!r}")
+
+        # Step 3: create the session.
+        create_resp = await http.post(
+            f"{api_url}/sessions",
+            headers=user_headers,
+            json={"problem_slug": problem_slug},
+        )
+        if create_resp.status_code != 201:
+            _print_step(
+                "POST /sessions",
+                False,
+                f"HTTP {create_resp.status_code}: {create_resp.text}",
+            )
+            return EXIT_DIVERGED
+        session_id = create_resp.json()["session_id"]
+        _print_step("POST /sessions", True, f"id={session_id}")
+
+        # Step 4: agent appends a candidate-utterance event. We pick
+        # `utterance_candidate` because it's the highest-volume row in a
+        # real session — exercising it here catches schema drift the
+        # agent would hit on the very first transcript.
+        event_resp = await http.post(
+            f"{api_url}/sessions/{session_id}/events",
+            headers=agent_headers,
+            json={
+                "t_ms": 1_000,
+                "type": "utterance_candidate",
+                "payload_json": {"text": "hello mentor"},
+            },
+        )
+        if event_resp.status_code != 201:
+            failures.append("POST /events")
+            detail = f"HTTP {event_resp.status_code}: {event_resp.text}"
+            _print_step("POST /events (agent)", False, detail)
+        else:
+            _print_step("POST /events (agent)", True)
+
+        # Step 5: agent appends a canvas snapshot.
+        canvas_resp = await http.post(
+            f"{api_url}/sessions/{session_id}/canvas-snapshots",
+            headers=agent_headers,
+            json={
+                "t_ms": 2_000,
+                "scene_json": {
+                    "elements": [
+                        {"id": "a", "type": "rectangle", "x": 0, "y": 0},
+                    ],
+                    "appState": {},
+                },
+            },
+        )
+        if canvas_resp.status_code != 201:
+            failures.append("POST /canvas-snapshots")
+            _print_step(
+                "POST /canvas-snapshots",
+                False,
+                f"HTTP {canvas_resp.status_code}: {canvas_resp.text}",
+            )
+        else:
+            _print_step("POST /canvas-snapshots", True)
+
+        # Step 6: end the session.
+        end_resp = await http.post(
+            f"{api_url}/sessions/{session_id}/end",
+            headers=user_headers,
+        )
+        if end_resp.status_code != 200 or end_resp.json().get("status") != "ended":
+            failures.append("POST /end")
+            _print_step(
+                "POST /end",
+                False,
+                f"HTTP {end_resp.status_code}: {end_resp.text}",
+            )
+        else:
+            _print_step("POST /end", True)
+
+        # Step 7: delete and assert cascade.
+        delete_resp = await http.delete(
+            f"{api_url}/sessions/{session_id}",
+            headers=user_headers,
+        )
+        if delete_resp.status_code != 204:
+            failures.append("DELETE /sessions/{id}")
+            _print_step(
+                "DELETE /sessions/{id}",
+                False,
+                f"HTTP {delete_resp.status_code}: {delete_resp.text}",
+            )
+        else:
+            _print_step("DELETE /sessions/{id}", True)
+
+    # Cascade audit — any orphan child rows mean a missing ON DELETE
+    # CASCADE. We talk straight to Postgres because the API has no
+    # endpoint that exposes raw row counts for a deleted session.
+    with engine.connect() as conn:
+        for table in _LIFECYCLE_CASCADE_TABLES:
+            # Table name is interpolated from the static
+            # `_LIFECYCLE_CASCADE_TABLES` allowlist above; not user
+            # input. The bound `:sid` is parametrized.
+            query = text(
+                f"SELECT COUNT(*) FROM {table} WHERE session_id = :sid"  # noqa: S608
+            )
+            try:
+                row_count = int(conn.execute(query, {"sid": session_id}).scalar_one())
+            except Exception as exc:
+                _print_step(f"cascade {table}", False, f"query failed: {exc}")
+                failures.append(f"cascade {table}")
+                continue
+            if row_count == 0:
+                _print_step(f"cascade {table}", True, "0 rows")
+            else:
+                _print_step(f"cascade {table}", False, f"{row_count} orphan rows")
+                failures.append(f"cascade {table}")
+
+    if failures:
+        print(f"\n{len(failures)} failure(s): {', '.join(failures)}")
+        return EXIT_DIVERGED
+    print("\nlifecycle smoke: all steps passed.")
+    return EXIT_MATCH
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.lifecycle:
+        if not args.email or not args.password:
+            print(
+                "--lifecycle requires --email and --password.",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        import asyncio
+
+        return asyncio.run(_run_lifecycle(args.email, args.password))
+
     _reject_session_mode(args)
     if args.snapshot is None:
         # Distinct from EXIT_NOT_FOUND: an automated caller that sees
         # exit 3 knows it invoked the script wrong, not that the UUID
         # resolved but is absent from Postgres.
         print(
-            "--snapshot <uuid> is required (--session is reserved).",
+            "--snapshot <uuid> is required (--session is reserved, "
+            "--lifecycle takes --email/--password).",
             file=sys.stderr,
         )
         return EXIT_USAGE
