@@ -53,6 +53,7 @@ from livekit.agents import (
     WorkerOptions,
     cli,
 )
+from livekit.rtc.participant import PublishDataError
 
 from archmentor_agent.api_client.bootstrap import BootstrapFetchError, fetch_session_bootstrap
 from archmentor_agent.audio.stt import _WHISPER_PROMPT_ECHO_STEMS
@@ -74,6 +75,7 @@ from archmentor_agent.state.session_state import (
     PendingUtterance,
     ProblemCard,
     SessionState,
+    TranscriptTurn,
 )
 
 AiState = Literal["speaking", "listening", "thinking"]
@@ -91,6 +93,24 @@ class CanvasNoBaselineStateError(Exception):
 
 # Default 45-minute session budget, mirrors `InterviewSession.duration_s_planned`.
 _DEFAULT_SESSION_SECONDS = 2700
+
+# Rolling-transcript window cap (turns). The brain reads the full
+# `transcript_window` on every call, so an unbounded list would inflate
+# every prompt's token count linearly with session length. 30 turns =
+# roughly 2-3 minutes of conversation, matching the M2 plan's "verbatim,
+# last 2-3 min" intent. M4's Haiku session-summary compression replaces
+# this hard cap with summarise-and-trim semantics; until then this is
+# the single back-pressure on prompt size.
+_TRANSCRIPT_WINDOW_CAP = 30
+
+
+class TranscriptNoBaselineStateError(Exception):
+    """Raised when no SessionState baseline exists in Redis for a transcript CAS apply.
+
+    Mirrors `CanvasNoBaselineStateError` so eviction / pre-init paths
+    log under their own key (`agent.transcript.no_baseline_state`)
+    rather than blurring with CAS contention exhaustion.
+    """
 
 
 class _UserInputEvent(Protocol):
@@ -391,7 +411,11 @@ class MentorAgent(Agent):
             handle = self.session.say(OPENING_UTTERANCE, allow_interruptions=False)
             await handle.wait_for_playout()
             log.info("agent.opening.say.end")
+            opening_t_ms = self._now_relative_ms()
             self._log("utterance_ai", {"text": OPENING_UTTERANCE, "speaker": "ai"})
+            await self._append_transcript_turn(
+                speaker="ai", text=OPENING_UTTERANCE, t_ms=opening_t_ms
+            )
             await self._publish_state("listening")
         except Exception:
             log.exception("agent.on_enter.failed")
@@ -459,6 +483,11 @@ class MentorAgent(Agent):
 
         turn_t_ms = self._now_relative_ms()
         self._log("utterance_candidate", {"text": text, "speaker": "candidate"})
+        # Append BEFORE the brain dispatch so the brain reads a state
+        # that includes the just-spoken turn (read-after-CAS contract,
+        # mirrors R23 for canvas_state). On the static-ack path this is
+        # a no-op because there's no brain wiring.
+        await self._append_transcript_turn(speaker="candidate", text=text, t_ms=turn_t_ms)
 
         if not self._brain_enabled or self._brain is None:
             await self._run_static_ack_turn()
@@ -484,7 +513,11 @@ class MentorAgent(Agent):
             await self._publish_state("listening")
             return
         log.info("agent.ack.end")
+        ack_t_ms = self._now_relative_ms()
         self._log("utterance_ai", {"text": TURN_ACK_UTTERANCE, "speaker": "ai"})
+        await self._append_transcript_turn(
+            speaker="ai", text=TURN_ACK_UTTERANCE, t_ms=ack_t_ms
+        )
         await self._publish_state("listening")
 
     async def _run_brain_turn(self, *, text: str, turn_t_ms: int) -> None:
@@ -578,7 +611,11 @@ class MentorAgent(Agent):
                 log.warning("agent.say_skipped", reason=str(exc))
                 await self._publish_state("listening")
                 return
+            ai_t_ms = self._now_relative_ms()
             self._log("utterance_ai", {"text": utterance.text, "speaker": "ai"})
+            await self._append_transcript_turn(
+                speaker="ai", text=utterance.text, t_ms=ai_t_ms
+            )
             await self._publish_state("listening")
 
     async def _say(self, text: str) -> None:
@@ -670,9 +707,14 @@ class MentorAgent(Agent):
                 payload,
                 topic=AI_STATE_TOPIC,
             )
-        except (ConnectionError, OSError, RuntimeError) as exc:
+        except (ConnectionError, OSError, RuntimeError, PublishDataError) as exc:
             # Data publish must never break the voice loop — room is
-            # mid-teardown or the participant isn't connected yet.
+            # mid-teardown (LiveKit FFI raises PublishDataError when the
+            # engine is closed during disconnect) or the participant
+            # isn't connected yet. The on_enter() catch path retries
+            # this call as a "best effort" recovery; without swallowing
+            # PublishDataError here, the disconnect-mid-TTS path emits
+            # two stack traces per session for what is benign teardown.
             log.warning("agent.publish_state_failed", state=state, reason=str(exc))
 
     def _log(self, event_type: str, payload: dict[str, object]) -> None:
@@ -942,6 +984,71 @@ class MentorAgent(Agent):
                 "agent.canvas.cas_exhausted",
                 session_id=str(self._session_id),
                 t_ms=t_ms,
+            )
+
+    async def _append_transcript_turn(
+        self, *, speaker: str, text: str, t_ms: int
+    ) -> None:
+        """Append a TranscriptTurn to ``state.transcript_window`` via Redis CAS.
+
+        The brain reads the full window on every call (see
+        ``brain/prompt_builder.py::build_user_message`` — ``transcript_window``
+        ships in the dynamic ``state_json`` blob). Without this hook the
+        window stays empty for the life of the session, leaving the brain
+        to reason on per-turn payloads only with no cross-turn continuity.
+
+        Mirrors ``_apply_canvas_state`` (R23-style read-after-CAS): the
+        caller awaits this before triggering the next brain dispatch so
+        the next ``decide(...)`` reads a state that already includes the
+        just-emitted turn.
+
+        Capped at ``_TRANSCRIPT_WINDOW_CAP`` turns. Older entries are
+        dropped from the head. M4 replaces the hard cap with a Haiku
+        session-summary compression cycle (``session_summary`` field
+        accumulates compressed history; transcript_window holds the
+        recent uncompressed tail).
+        """
+        if self._brain is None:
+            # Static-ack path or brain disabled — no Redis state to update.
+            # The transcript_window only matters when the brain reads it.
+            return
+        store = self._brain.store
+
+        new_turn = TranscriptTurn(t_ms=t_ms, speaker=speaker, text=text)
+
+        def _mutator(current: SessionState | None) -> SessionState:
+            if current is None:
+                # No baseline state — likely between session-end and
+                # session-start, or Redis eviction. The ledger row for
+                # this utterance still lands; the next brain call will
+                # rebuild state if needed.
+                raise TranscriptNoBaselineStateError(
+                    "no baseline state for transcript_window apply"
+                )
+            updated_window = [*current.transcript_window, new_turn]
+            if len(updated_window) > _TRANSCRIPT_WINDOW_CAP:
+                # Drop oldest. M4 will replace this with summarise-into
+                # `session_summary` before discarding.
+                updated_window = updated_window[-_TRANSCRIPT_WINDOW_CAP:]
+            return current.model_copy(update={"transcript_window": updated_window})
+
+        try:
+            await store.apply(self._session_id, _mutator)
+        except TranscriptNoBaselineStateError:
+            log.warning(
+                "agent.transcript.no_baseline_state",
+                session_id=str(self._session_id),
+                t_ms=t_ms,
+                speaker=speaker,
+            )
+        except RedisCasExhaustedError:
+            # Brain may see a one-cycle-stale transcript on the next
+            # dispatch; subsequent turns still append cleanly.
+            log.warning(
+                "agent.transcript.cas_exhausted",
+                session_id=str(self._session_id),
+                t_ms=t_ms,
+                speaker=speaker,
             )
 
     def log_event(self, event_type: str, payload: dict[str, Any]) -> None:
