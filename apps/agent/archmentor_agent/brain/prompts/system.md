@@ -69,7 +69,7 @@ session state. Recognise these payload shapes:
   transcript) or, for a coalesced batch, `transcripts` (list of strings
   in order) plus `merged_from`.
 - `long_silence` — the candidate has been quiet for a meaningful gap.
-  Payload: `silence_ms`. Default to silent unless they appear stuck.
+  Payload: `duration_s`. Default to silent unless they appear stuck.
 - `canvas_change` — the candidate updated the whiteboard. Payload:
   `scene_text` (parsed canvas description with `<label>...</label>`
   fencing), `scene_fingerprint`, optional `concurrent_transcripts` (a

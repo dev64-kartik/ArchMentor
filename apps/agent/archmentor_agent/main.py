@@ -54,6 +54,7 @@ from livekit.agents import (
     cli,
 )
 
+from archmentor_agent.api_client.bootstrap import BootstrapFetchError, fetch_session_bootstrap
 from archmentor_agent.audio.stt import _WHISPER_PROMPT_ECHO_STEMS
 from archmentor_agent.brain.bootstrap import (
     DEV_PROMPT_VERSION,
@@ -71,11 +72,22 @@ from archmentor_agent.state.redis_store import RedisCasExhaustedError, RedisSess
 from archmentor_agent.state.session_state import (
     CanvasState,
     PendingUtterance,
+    ProblemCard,
     SessionState,
 )
 
 AiState = Literal["speaking", "listening", "thinking"]
 AI_STATE_TOPIC = "ai_state"
+
+
+class CanvasNoBaselineStateError(Exception):
+    """Raised when no SessionState baseline exists in Redis for a canvas CAS apply.
+
+    Distinct from `RedisCasExhaustedError` (retry budget exhausted) so log
+    lines carry `canvas.no_baseline_state` vs `canvas.cas_exhausted` and
+    operators can distinguish eviction/pre-init from contention.
+    """
+
 
 # Default 45-minute session budget, mirrors `InterviewSession.duration_s_planned`.
 _DEFAULT_SESSION_SECONDS = 2700
@@ -241,15 +253,21 @@ def build_initial_session_state(
     cost_cap_usd: float,
     prompt_version: str = DEV_PROMPT_VERSION,
     now: datetime | None = None,
+    problem: ProblemCard | None = None,
 ) -> SessionState:
     """Assemble the `SessionState` the brain starts from on `on_enter`.
 
     Split out so Unit 7's integration tests can build a seed state
-    without invoking the full entrypoint. The ProblemCard comes from
-    `brain.bootstrap` until M3 lands a bootstrap API route.
+    without invoking the full entrypoint.
+
+    The `problem` parameter accepts a `ProblemCard` built by the caller
+    (production: fetched from the bootstrap API; replay/dev: built from
+    `build_dev_problem_card()`). When omitted, falls back to
+    `build_dev_problem_card()` so existing tests and seed-dev flows keep
+    working without changes.
     """
     return SessionState(
-        problem=build_dev_problem_card(),
+        problem=problem if problem is not None else build_dev_problem_card(),
         system_prompt_version=prompt_version,
         started_at=now or datetime.now(UTC),
         elapsed_s=0,
@@ -274,6 +292,7 @@ class MentorAgent(Agent):
         room: rtc.Room,
         brain_enabled: bool,
         brain: _BrainWiring | None,
+        bootstrap_problem: ProblemCard | None = None,
     ) -> None:
         super().__init__(
             instructions=(
@@ -286,6 +305,9 @@ class MentorAgent(Agent):
         self._room = room
         self._brain_enabled = brain_enabled
         self._brain = brain
+        # ProblemCard fetched from the bootstrap API in the production
+        # path; None on replay/dev paths (falls back to build_dev_problem_card).
+        self._bootstrap_problem = bootstrap_problem
         self._t0_ms: int | None = None
         # Set once the opening utterance has finished playing. The
         # framework refuses follow-up `session.say()` while the agent
@@ -356,7 +378,7 @@ class MentorAgent(Agent):
         # the session is alive and connected but effectively deaf.
         # Surface the error, then unblock STT in `finally`.
         try:
-            await self._initialize_brain_state()
+            await self._initialize_brain_state(problem=self._bootstrap_problem)
             await self._publish_state("speaking")
             log.info("agent.opening.say.begin", text=OPENING_UTTERANCE)
             # `allow_interruptions=False` keeps the intro playing through
@@ -389,13 +411,21 @@ class MentorAgent(Agent):
             self.opening_complete.set()
             log.info("agent.on_enter.end")
 
-    async def _initialize_brain_state(self) -> None:
+    async def _initialize_brain_state(
+        self,
+        *,
+        problem: ProblemCard | None = None,
+    ) -> None:
         """Seed Redis with a fresh SessionState for this session.
 
         Skipped when the brain is disabled — the M1 fallback path has
         no session-state consumer so a Redis round-trip would be wasted
         (and fail if Redis isn't running, which is a valid M1-only
         dev configuration).
+
+        The `problem` kwarg carries the ProblemCard fetched from the
+        bootstrap API in the production path (see `entrypoint`). When
+        None (replay / seed-dev paths), falls back to `build_dev_problem_card`.
         """
         if not self._brain_enabled or self._brain is None:
             return
@@ -405,6 +435,7 @@ class MentorAgent(Agent):
             # intended ceiling — matches the API's
             # `InterviewSession.cost_cap_usd` column default.
             cost_cap_usd=5.0,
+            problem=problem,
         )
         await self._brain.store.put(self._session_id, state)
         log.info(
@@ -823,7 +854,6 @@ class MentorAgent(Agent):
             payload={
                 "scene_text": parsed_text,
                 "scene_fingerprint": scene_fingerprint,
-                "t_ms": t_ms,
             },
             priority=default_priority(EventType.CANVAS_CHANGE),
         )
@@ -886,7 +916,7 @@ class MentorAgent(Agent):
                 # intentionally don't synthesize a fresh SessionState
                 # here because the canvas description alone isn't enough
                 # to seed problem + prompt_version + cost cap.
-                raise RedisCasExhaustedError("no baseline state for canvas_state apply")
+                raise CanvasNoBaselineStateError("no baseline state for canvas_state apply")
             return current.model_copy(
                 update={
                     "canvas_state": CanvasState(
@@ -897,10 +927,17 @@ class MentorAgent(Agent):
 
         try:
             await store.apply(self._session_id, _mutator)
+        except CanvasNoBaselineStateError:
+            # Redis key absent (eviction or pre-init) — non-fatal; the
+            # canvas_change ledger row + snapshot still land.
+            log.warning(
+                "agent.canvas.no_baseline_state",
+                session_id=str(self._session_id),
+                t_ms=t_ms,
+            )
         except RedisCasExhaustedError:
-            # Non-fatal: the canvas_change ledger row + snapshot still
-            # land, so replay reconstructs the timeline. The brain may
-            # see one-cycle-stale canvas_state for this single dispatch.
+            # CAS retry budget exhausted under write contention — non-fatal;
+            # the brain may see one-cycle-stale canvas_state for this dispatch.
             log.warning(
                 "agent.canvas.cas_exhausted",
                 session_id=str(self._session_id),
@@ -967,10 +1004,10 @@ def build_brain_wiring(
         snapshot_client=snapshot_client,
         snapshot_scheduler=agent.schedule_snapshot,
         utterance_queue=queue,
-        gate=gate,
         log_event=agent.log_event,
         now_ms=agent.now_relative_ms,
         synthetic_emitter=agent.emit_synthetic,
+        recovery_text=SYNTHETIC_RECOVERY_UTTERANCE,
     )
     return _BrainWiring(
         brain=brain,
@@ -1031,17 +1068,22 @@ async def entrypoint(ctx: JobContext) -> None:
     """Per-room entrypoint — one instance per session dispatch."""
     session_id = _session_id_from_ctx(ctx)
     settings = get_settings()
-    ledger = LedgerClient(_ledger_config(settings))
+    api_url, agent_token = _agent_http_config(settings)
+    ledger = LedgerClient(LedgerConfig(base_url=api_url, agent_token=agent_token))
 
     # Snapshot client lives for the duration of the session; shared
     # pool covers the fire-and-forget POST traffic from the router.
-    snapshot_client = SnapshotClient(_snapshot_client_config(settings))
+    snapshot_client = SnapshotClient(
+        SnapshotClientConfig(base_url=api_url, agent_token=agent_token)
+    )
     # Canvas-snapshot client is structurally parallel to `snapshot_client`
     # (same auth, same retry policy, same drop-on-4xx semantics). Two
     # clients rather than one shared client because the per-session HTTP
     # connection pool sizing differs by route — canvas events fire
     # ~0-60/min during a session, brain snapshots fire 1 per dispatch.
-    canvas_snapshot_client = CanvasSnapshotClient(_canvas_snapshot_client_config(settings))
+    canvas_snapshot_client = CanvasSnapshotClient(
+        CanvasSnapshotClientConfig(base_url=api_url, agent_token=agent_token)
+    )
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -1057,12 +1099,22 @@ async def entrypoint(ctx: JobContext) -> None:
         brain_enabled=settings.brain_enabled,
     )
 
+    # Fetch the problem card from the API bootstrap route for production
+    # sessions. For dev/replay sessions (room name doesn't parse as a
+    # `session-<uuid>` room) fall through to `build_dev_problem_card()`.
+    bootstrap_problem = await _fetch_bootstrap_problem(
+        session_id=session_id,
+        room_name=ctx.room.name or "",
+        settings=settings,
+    )
+
     mentor = MentorAgent(
         session_id=session_id,
         ledger=ledger,
         room=ctx.room,
         brain_enabled=settings.brain_enabled,
         brain=None,
+        bootstrap_problem=bootstrap_problem,
     )
     if settings.brain_enabled:
         from archmentor_agent.brain.client import get_brain_client
@@ -1182,6 +1234,15 @@ async def entrypoint(ctx: JobContext) -> None:
         if interim_tasks:
             log.info("agent.shutdown.drain_interim_tasks", count=len(interim_tasks))
             await asyncio.gather(*interim_tasks, return_exceptions=True)
+        # Drain text-stream read tasks BEFORE mentor.shutdown() so any
+        # in-flight reader.read_all() + on_canvas_scene_payload body
+        # finishes before the router and ledger close. These are the
+        # Task[None] tasks spawned by _on_canvas_scene_sync; they are
+        # distinct from mentor._canvas_tasks (Task[bool] snapshot POSTs)
+        # which shutdown() drains internally.
+        if canvas_tasks:
+            log.info("agent.shutdown.drain_canvas_tasks", count=len(canvas_tasks))
+            await asyncio.gather(*canvas_tasks, return_exceptions=True)
         # MentorAgent.shutdown() drains the router, snapshot tasks, and
         # ledger tasks in the correct order, then deletes the Redis
         # session key. Keep this call idempotent — `_brain is None` on
@@ -1190,6 +1251,74 @@ async def entrypoint(ctx: JobContext) -> None:
         await snapshot_client.aclose()
         await canvas_snapshot_client.aclose()
         await ledger.aclose()
+
+
+async def _fetch_bootstrap_problem(
+    *,
+    session_id: UUID,
+    room_name: str,
+    settings: Settings,
+) -> ProblemCard | None:
+    """Fetch the ProblemCard from the control-plane bootstrap API.
+
+    Returns None (triggering `build_dev_problem_card()` fallback) when:
+    - The room name doesn't match the `session-<uuid>` production format
+      (e.g. the dev-test or replay session), OR
+    - The brain is disabled (no API call needed — state is never seeded).
+
+    Logs a structured `agent.bootstrap.dev_fallback` event so the operator
+    can distinguish production bootstraps from dev-path fallbacks.
+    """
+    if not settings.brain_enabled:
+        return None
+
+    # Dev/replay sessions use raw UUIDs or non-session-prefixed room names.
+    if not room_name.startswith("session-"):
+        log.info(
+            "agent.bootstrap.dev_fallback",
+            reason="non_session_room",
+            room_name=room_name,
+        )
+        return None
+
+    try:
+        bootstrap = await fetch_session_bootstrap(
+            api_url=settings.api_url,
+            agent_token=settings.agent_ingest_token.get_secret_value(),
+            session_id=session_id,
+        )
+    except BootstrapFetchError as exc:
+        # Log loudly but don't crash the session — fall back to dev card
+        # so the voice loop can still run (the brain will use the dev
+        # problem, which is wrong but recoverable for a dev session).
+        # In production this should page the operator.
+        log.error(
+            "agent.bootstrap.fetch_failed",
+            session_id=str(session_id),
+            error=str(exc),
+        )
+        log.info(
+            "agent.bootstrap.dev_fallback",
+            reason="fetch_error",
+            session_id=str(session_id),
+        )
+        return None
+
+    log.info(
+        "agent.bootstrap.fetched",
+        session_id=str(session_id),
+        problem_slug=bootstrap.problem_slug,
+    )
+    return ProblemCard(
+        slug=bootstrap.problem_slug,
+        # API doesn't expose version or title via the bootstrap route yet;
+        # use defaults that won't affect the brain prompt (the brain reads
+        # statement_md and rubric_yaml, not slug/version/title).
+        version=1,
+        title=bootstrap.problem_slug,
+        statement_md=bootstrap.statement_md,
+        rubric_yaml=bootstrap.rubric_yaml,
+    )
 
 
 def _session_id_from_ctx(ctx: JobContext) -> UUID:
@@ -1210,52 +1339,20 @@ def _session_id_from_ctx(ctx: JobContext) -> UUID:
         ) from exc
 
 
-def _ledger_config(settings: Settings | None = None) -> LedgerConfig:
-    """Build the ledger client config from `Settings`.
+def _agent_http_config(settings: Settings | None = None) -> tuple[str, str]:
+    """Return ``(api_url, agent_ingest_token)`` from ``Settings``.
 
-    Settings construction itself enforces presence + non-placeholder on
-    `agent_ingest_token`, so this function no longer raises directly —
-    `get_settings()` raises `pydantic.ValidationError` at import time
-    when the env var is missing. Tests that exercise the missing-token
-    failure mode now assert against `ValidationError`, not `RuntimeError`.
+    All three ingest clients (ledger, snapshot, canvas-snapshot) share the
+    same trust boundary and the same token, so a single helper avoids
+    three near-identical builders. Each construction site builds its own
+    typed config dataclass from the returned tuple.
 
-    Passing ``settings`` explicitly lets the entrypoint reuse the
-    object it already resolved; the default path falls back to the
-    cached singleton so existing callers (tests, legacy call sites)
-    don't have to thread it through.
+    Passing ``settings`` explicitly lets the entrypoint reuse the object
+    it already resolved; the default path falls back to the cached singleton
+    so tests that call this function directly still work.
     """
     cfg = settings or get_settings()
-    return LedgerConfig(
-        base_url=cfg.api_url,
-        agent_token=cfg.agent_ingest_token.get_secret_value(),
-    )
-
-
-def _snapshot_client_config(settings: Settings | None = None) -> SnapshotClientConfig:
-    """Build the snapshot client config from `Settings`.
-
-    Shares the `agent_ingest_token` with the ledger — the events and
-    snapshots ingest routes live on the same trust boundary and M2
-    intentionally does not split them (see plan "Deferred Production
-    Concerns"). When M3 splits the tokens this function and
-    ``_ledger_config`` become the single place to diverge them.
-    """
-    cfg = settings or get_settings()
-    return SnapshotClientConfig(
-        base_url=cfg.api_url,
-        agent_token=cfg.agent_ingest_token.get_secret_value(),
-    )
-
-
-def _canvas_snapshot_client_config(
-    settings: Settings | None = None,
-) -> CanvasSnapshotClientConfig:
-    """Build the canvas-snapshot client config — same trust boundary."""
-    cfg = settings or get_settings()
-    return CanvasSnapshotClientConfig(
-        base_url=cfg.api_url,
-        agent_token=cfg.agent_ingest_token.get_secret_value(),
-    )
+    return cfg.api_url, cfg.agent_ingest_token.get_secret_value()
 
 
 # Re-exposed for tests that only need a fresh `PendingUtterance`.
@@ -1265,6 +1362,7 @@ __all__ = [
     "TURN_ACK_UTTERANCE",
     "MentorAgent",
     "PendingUtterance",
+    "_agent_http_config",
     "build_initial_session_state",
     "entrypoint",
     "main",

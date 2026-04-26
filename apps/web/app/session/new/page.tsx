@@ -1,28 +1,8 @@
 import { redirect } from "next/navigation";
 
 import { StartSessionForm } from "@/components/session/start-session-form";
+import { isProblemSummaryList, type ProblemSummary } from "@/lib/api/sessions";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-
-type ProblemSummary = {
-  slug: string;
-  version: number;
-  title: string;
-  difficulty: string;
-};
-
-function isProblemSummaryList(value: unknown): value is ProblemSummary[] {
-  if (!Array.isArray(value)) return false;
-  return value.every((entry) => {
-    if (typeof entry !== "object" || entry === null) return false;
-    const v = entry as Record<string, unknown>;
-    return (
-      typeof v["slug"] === "string" &&
-      typeof v["version"] === "number" &&
-      typeof v["title"] === "string" &&
-      typeof v["difficulty"] === "string"
-    );
-  });
-}
 
 /**
  * Server-rendered problem catalog + start-session form.

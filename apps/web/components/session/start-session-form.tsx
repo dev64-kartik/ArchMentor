@@ -35,6 +35,7 @@ export function StartSessionForm({ problems }: Props) {
       router.push(`/session/${session.session_id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
       setSubmitting(false);
     }
   };

@@ -20,7 +20,7 @@ from archmentor_api.models.session import InterviewSession, SessionStatus
 # Bump in lock-step with `apps/agent/archmentor_agent/brain/bootstrap.py`'s
 # `DEV_PROMPT_VERSION`; the API is the source of truth at session creation
 # because the agent reads it from the DB row.
-DEFAULT_PROMPT_VERSION = "m2-initial"
+DEFAULT_PROMPT_VERSION = "m3-canvas"
 
 DEFAULT_COST_CAP_USD = 5.0
 DEFAULT_DURATION_S_PLANNED = 2700  # 45 minutes
@@ -81,6 +81,14 @@ def get_owned_session(
     """Fetch a session by id, enforcing ownership.
 
     404 if missing, 403 if not owned by the caller.
+
+    # Intentional 403/404 split (see ce:review 2026-04-26 finding #8):
+    # 404 for missing rows, 403 for cross-user. Allows operators to
+    # distinguish a typo from a wrong-tenant URL. Session UUIDs are 122-bit
+    # random so the enumeration oracle is not practically exploitable.
+    # Project precedent: /livekit/token uses the same split.
+    # Revisit if session_ids ever appear in user-shareable URLs that could
+    # leak across tenants.
     """
     row = db.get(InterviewSession, session_id)
     if row is None:

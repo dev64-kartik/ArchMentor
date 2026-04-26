@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Room } from "livekit-client";
 
 import { CanvasScenePublisher } from "./canvas-scene-publisher";
@@ -65,26 +65,23 @@ export function ExcalidrawCanvas({ room }: Props) {
     return () => document.removeEventListener("visibilitychange", onVisibility);
   }, []);
 
-  const onChange = useMemo(
-    () => (elements: readonly unknown[]) => {
-      // Track image-element presence for the R19 banner. Cheap pass —
-      // the throttled publish is downstream.
-      let sawImage = false;
-      for (const element of elements) {
-        if (
-          typeof element === "object" &&
-          element !== null &&
-          (element as { type?: unknown }).type === "image"
-        ) {
-          sawImage = true;
-          break;
-        }
+  const onChange = useCallback((elements: readonly unknown[]) => {
+    // Track image-element presence for the R19 banner. Cheap pass —
+    // the throttled publish is downstream.
+    let sawImage = false;
+    for (const element of elements) {
+      if (
+        typeof element === "object" &&
+        element !== null &&
+        (element as { type?: unknown }).type === "image"
+      ) {
+        sawImage = true;
+        break;
       }
-      setHasImageElement((prev) => (prev === sawImage ? prev : sawImage));
-      void publisherRef.current?.onSceneChange(elements);
-    },
-    [],
-  );
+    }
+    setHasImageElement((prev) => (prev === sawImage ? prev : sawImage));
+    publisherRef.current?.onSceneChange(elements);
+  }, []);
 
   return (
     <div className="relative h-full w-full">

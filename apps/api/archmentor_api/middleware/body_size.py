@@ -14,11 +14,13 @@ caps in `routes/sessions.py` stay as defense-in-depth: middleware is the
 primary gate, the handler check is the secondary backstop in case the
 middleware is misconfigured or bypassed by a future router refactor.
 
-For requests with a `Content-Length` header the rejection is immediate
-(no body read). For chunked requests without `Content-Length` the
-middleware buffers the body in chunks, counts UTF-8 bytes, and aborts
-with 413 the moment the cap is exceeded — so the worst-case memory
-footprint for a malicious chunked stream is `cap + 1 chunk`.
+For ALL capped requests, the middleware streams and counts actual body
+bytes regardless of whether a `Content-Length` header is present. The
+only fast-path is: if `Content-Length` is declared and *exceeds* the cap,
+reject immediately without reading the body. In all other cases (no C-L,
+or C-L within cap), the middleware reads and counts bytes so a client
+that declares `Content-Length: 100` but sends 10 MB cannot bypass the
+gate (the "Content-Length lie" attack).
 """
 
 from __future__ import annotations
@@ -60,13 +62,22 @@ def _cap_for_path(path: str) -> int | None:
 
 
 def _content_length(scope: Scope) -> int | None:
-    """Return the Content-Length header as an int, or None if missing/invalid."""
+    """Return the Content-Length header as an int, or None if missing/invalid/negative.
+
+    `name.lower()` is applied for safety — uvicorn normalizes header names to
+    lowercase, but other ASGI servers (e.g. Hypercorn) may not. A negative
+    Content-Length is invalid per RFC 9110 and treated as missing so the
+    streaming-cap path runs instead.
+    """
     for name, value in scope.get("headers", []):
-        if name == b"content-length":
+        if name.lower() == b"content-length":
             try:
-                return int(value)
+                parsed = int(value)
             except ValueError:
                 return None
+            if parsed < 0:
+                return None
+            return parsed
     return None
 
 
@@ -114,17 +125,18 @@ class BodySizeLimitMiddleware:
             return
 
         declared = _content_length(scope)
-        if declared is not None:
-            if declared > cap:
-                await _send_413(send, cap=cap, observed=declared)
-                return
-            await self._app(scope, receive, send)
+        if declared is not None and declared > cap:
+            # Fast-path: Content-Length already proves the body is too large.
+            # No need to read a single byte.
+            await _send_413(send, cap=cap, observed=declared)
             return
 
-        # No Content-Length: chunked encoding (or a client that omitted
-        # the header). Buffer the body while counting bytes, abort if it
-        # exceeds the cap, replay the buffered chunks otherwise.
-        await self._gate_streamed_body(scope, receive, send, cap=cap)
+        # Always stream-and-count the body. When Content-Length is declared
+        # and within cap, we still read bytes to catch the "Content-Length lie"
+        # — a client claiming C-L: 100 but sending 10 MB would otherwise bypass
+        # the gate entirely. The effective per-chunk cap is `min(cap, declared)`
+        # so we abort the moment observed bytes exceed either bound.
+        await self._gate_streamed_body(scope, receive, send, cap=cap, declared=declared)
 
     async def _gate_streamed_body(
         self,
@@ -133,7 +145,12 @@ class BodySizeLimitMiddleware:
         send: Send,
         *,
         cap: int,
+        declared: int | None = None,
     ) -> None:
+        # If C-L was declared and within cap, cap the running counter at
+        # `min(cap, declared)` as defense-in-depth: any byte beyond the
+        # declared length is evidence of a lie, and we abort with 413.
+        effective_cap = min(cap, declared) if declared is not None else cap
         chunks: list[Message] = []
         total = 0
         more = True
@@ -153,7 +170,7 @@ class BodySizeLimitMiddleware:
             body = message.get("body", b"")
             total += len(body)
             chunks.append(message)
-            if total > cap:
+            if total > effective_cap:
                 await _send_413(send, cap=cap, observed=total)
                 return
             more = bool(message.get("more_body", False))

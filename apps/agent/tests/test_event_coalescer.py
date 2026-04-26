@@ -272,9 +272,16 @@ def test_coalesced_canvas_change_payload_matches_documented_keys() -> None:
         ),
     ]
     merged = coalesce(batch)
-    assert expected_keys.issubset(merged.payload.keys()), (
-        f"coalescer output is missing brain-contract keys: {expected_keys - merged.payload.keys()}"
+    assert set(merged.payload.keys()) == expected_keys, (
+        f"coalescer payload key drift: "
+        f"missing={expected_keys - merged.payload.keys()}, "
+        f"extra={set(merged.payload.keys()) - expected_keys}"
     )
+    assert isinstance(merged.payload["concurrent_transcripts"], list)
+    assert isinstance(merged.payload["scene_text"], str)
+    assert isinstance(merged.payload["scene_fingerprint"], str)
+    assert isinstance(merged.payload["merged_from"], list)
+    assert all(isinstance(t, str) for t in merged.payload["concurrent_transcripts"])
 
 
 def test_coalesced_turn_end_payload_matches_documented_keys() -> None:

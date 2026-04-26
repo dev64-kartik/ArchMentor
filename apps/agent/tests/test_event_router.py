@@ -21,7 +21,7 @@ from _helpers import FakeBrainClient, FakeSessionStore, FakeSnapshotClient
 from archmentor_agent.brain.client import BrainClient
 from archmentor_agent.brain.decision import BrainDecision, BrainUsage
 from archmentor_agent.events import EventRouter, EventType, RouterEvent
-from archmentor_agent.queue import SpeechCheckGate, UtteranceQueue
+from archmentor_agent.queue import UtteranceQueue
 from archmentor_agent.snapshots.client import SnapshotClient
 from archmentor_agent.state.redis_store import (
     RedisCasExhaustedError,
@@ -73,9 +73,9 @@ def _make_router(
     snapshots: FakeSnapshotClient | None = None,
     clock: _FakeClock | None = None,
     queue: UtteranceQueue | None = None,
-    gate: SpeechCheckGate | None = None,
     log_events: list[tuple[str, dict[str, Any]]] | None = None,
     seed_state: SessionState | None = None,
+    recovery_text: str = "",
 ) -> tuple[
     EventRouter,
     FakeBrainClient,
@@ -90,7 +90,6 @@ def _make_router(
     snapshots = snapshots or FakeSnapshotClient()
     clock = clock or _FakeClock()
     queue = queue or UtteranceQueue(clock.now)
-    gate = gate or SpeechCheckGate(clock.now)
     log_events = log_events if log_events is not None else []
 
     state = seed_state if seed_state is not None else _make_state()
@@ -114,9 +113,9 @@ def _make_router(
         snapshot_client=cast(SnapshotClient, snapshots),
         snapshot_scheduler=schedule,
         utterance_queue=queue,
-        gate=gate,
         log_event=log,
         now_ms=clock.now,
+        recovery_text=recovery_text,
     )
     return router, brain, store, snapshots, queue, log_events, snapshot_tasks
 
@@ -372,6 +371,9 @@ async def test_canvas_change_dispatches_through_router() -> None:
     assert len(decisions) == 1
 
 
+_TEST_RECOVERY_TEXT = "Let me come back to that — please continue."
+
+
 @pytest.mark.asyncio
 async def test_synthetic_recovery_fires_once_on_brain_timeout() -> None:
     """R27: brain_timeout decision fires the synthetic recovery utterance
@@ -387,7 +389,9 @@ async def test_synthetic_recovery_fires_once_on_brain_timeout() -> None:
     def emit(*, text: str, reason: str) -> None:
         emissions.append((text, reason))
 
-    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain)
+    router, _, _, _, _, _, snap_tasks = _make_router(
+        brain=brain, recovery_text=_TEST_RECOVERY_TEXT
+    )
     router._emit_synthetic = emit  # inject post-construction; mirrors entrypoint wiring
 
     await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "a"}))
@@ -399,7 +403,7 @@ async def test_synthetic_recovery_fires_once_on_brain_timeout() -> None:
     assert len(emissions) == 1
     text, reason = emissions[0]
     assert reason == "brain_timeout"
-    assert text == "Let me come back to that — please continue."
+    assert text == _TEST_RECOVERY_TEXT
     assert router._apology_used is True
 
 
@@ -421,8 +425,9 @@ async def test_synthetic_recovery_skipped_when_no_emitter_wired() -> None:
 
 @pytest.mark.asyncio
 async def test_synthetic_recovery_not_fired_for_other_reasons() -> None:
-    """Only `brain_timeout` triggers R27 — other stay_silent reasons
-    (api_error, schema_violation, cost_capped) do not."""
+    """Only `brain_timeout` and `anthropic_api_connection_during_wait_for`
+    trigger R27 — other stay_silent reasons (api_error, schema_violation,
+    cost_capped) do not."""
     brain = FakeBrainClient()
     brain.enqueue_stay_silent("api_error")
     brain.enqueue_stay_silent("low_confidence")
@@ -441,6 +446,34 @@ async def test_synthetic_recovery_not_fired_for_other_reasons() -> None:
     await _await_snapshots(snap_tasks)
 
     assert emissions == []
+
+
+@pytest.mark.asyncio
+async def test_synthetic_recovery_fires_on_anthropic_api_connection_during_wait_for() -> None:
+    """R27 must also fire when the brain client returns
+    `reason="anthropic_api_connection_during_wait_for"` (Fix 5 — SDK converts
+    wait_for CancelledError → APIConnectionError mid-backoff after deadline)."""
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("anthropic_api_connection_during_wait_for")
+    emissions: list[tuple[str, str]] = []
+
+    def emit(*, text: str, reason: str) -> None:
+        emissions.append((text, reason))
+
+    router, _, _, _, _, _, snap_tasks = _make_router(
+        brain=brain, recovery_text=_TEST_RECOVERY_TEXT
+    )
+    router._emit_synthetic = emit
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "a"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(emissions) == 1
+    text, reason = emissions[0]
+    assert text == _TEST_RECOVERY_TEXT
+    assert reason == "anthropic_api_connection_during_wait_for"
+    assert router._apology_used is True
 
 
 @pytest.mark.asyncio

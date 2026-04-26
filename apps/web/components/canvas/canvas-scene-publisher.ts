@@ -30,13 +30,15 @@ export class CanvasScenePublisher {
 
   /**
    * Called from Excalidraw's `onChange`. Strips images, computes a
-   * fingerprint over a stable serialization of `elements`, and
-   * dispatches the throttled publish.
+   * synchronous FNV-1a fingerprint over a stable serialization of
+   * `elements`, and dispatches the throttled publish.
+   *
+   * All work is synchronous so there are no async-overlap races.
    */
-  async onSceneChange(elements: readonly unknown[]): Promise<void> {
+  onSceneChange(elements: readonly unknown[]): void {
     const sanitizedElements = stripFiles(elements);
     const elementsKey = stableStringify(sanitizedElements);
-    const fingerprint = await sha256Hex(elementsKey);
+    const fingerprint = fnv1aHex(elementsKey);
     if (fingerprint === this.lastFingerprint) {
       return;
     }
@@ -66,6 +68,7 @@ export class CanvasScenePublisher {
       clearTimeout(this.throttleTimer);
       this.throttleTimer = null;
     }
+    this.flushNow(); // best-effort flush of any pending scene
     this.pendingScene = null;
   }
 
@@ -92,7 +95,6 @@ export class CanvasScenePublisher {
     const scene = this.pendingScene;
     if (scene === null) return;
     this.pendingScene = null;
-    this.lastFingerprint = scene.scene_fingerprint;
     try {
       const text = JSON.stringify(scene);
       // livekit-client@2.x: `sendText(text, options)` returns a stream
@@ -101,11 +103,16 @@ export class CanvasScenePublisher {
       await this.room.localParticipant.sendText(text, {
         topic: CANVAS_SCENE_TOPIC,
       });
+      // Commit the dedup cursor only after a successful send. If sendText
+      // throws (room disconnected), lastFingerprint remains at its prior
+      // value so the next onChange (or a flush retry) will re-attempt
+      // this scene rather than silently suppressing it.
+      this.lastFingerprint = scene.scene_fingerprint;
     } catch (err) {
-      // Room may be disconnected (tab close, network drop). Drop
-      // silently — the next scene change will re-attempt, and the
-      // server-side replay path reads from `canvas_snapshots` not from
-      // text-stream history.
+      // Room may be disconnected (tab close, network drop). Leave
+      // lastFingerprint unchanged so the scene is retried on the next
+      // onChange. The server-side replay path also reads from
+      // `canvas_snapshots`, not from text-stream history.
       // oxlint-disable-next-line no-console -- single diagnostic surface for canvas drops
       console.warn("[canvas] publish failed", err);
     }
@@ -163,12 +170,18 @@ function stableStringify(value: unknown): string {
   });
 }
 
-async function sha256Hex(input: string): Promise<string> {
-  const data = new TextEncoder().encode(input);
-  const buf = await crypto.subtle.digest("SHA-256", data);
-  return Array.from(new Uint8Array(buf))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+/**
+ * FNV-1a 32-bit hash over a string. Returns a lowercase hex string.
+ * Cryptographic strength isn't needed for dedup fingerprinting — this
+ * runs in microseconds with no async overhead.
+ */
+function fnv1aHex(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = (hash * 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
-export const _testing = { stripFiles, stableStringify };
+export const _testing = { stripFiles, stableStringify, fnv1aHex };

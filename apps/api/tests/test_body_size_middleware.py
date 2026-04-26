@@ -19,6 +19,7 @@ from archmentor_api.middleware.body_size import (
     EVENT_BODY_CAP_BYTES,
     SNAPSHOT_BODY_CAP_BYTES,
     BodySizeLimitMiddleware,
+    _content_length,
 )
 from archmentor_api.models.problem import Problem
 from archmentor_api.models.session import InterviewSession, SessionStatus
@@ -180,6 +181,141 @@ class TestUngatedRoutes:
         assert response.status_code == 200
 
 
+class TestContentLengthLie:
+    """Direct-ASGI tests for the Content-Length lie attack.
+
+    A client declaring a small C-L but sending a large actual body must
+    still be rejected. `TestClient` always sets an accurate C-L, so these
+    tests drive the middleware via a fake ASGI transport.
+    """
+
+    @pytest.mark.asyncio
+    async def test_content_length_lie_oversized_body_rejected(self) -> None:
+        """POST with Content-Length: 100 but 10 KiB body must 413."""
+
+        async def inner_app(scope: dict, receive, send) -> None:  # type: ignore[no-untyped-def]
+            raise AssertionError("inner app must not be invoked when middleware aborts")
+
+        middleware = BodySizeLimitMiddleware(inner_app)
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": f"/sessions/{uuid4()}/events",
+            # Declare a small body that's within the 16 KiB cap.
+            "headers": [(b"content-length", b"100")],
+        }
+        # But actually send 10 KiB — a C-L lie.
+        chunks = [
+            {"type": "http.request", "body": b"x" * (10 * 1024), "more_body": False},
+        ]
+        chunk_iter = iter(chunks)
+
+        async def receive() -> dict:
+            return next(chunk_iter)
+
+        sent: list[dict] = []
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        await middleware(scope, receive, send)
+        statuses = [m.get("status") for m in sent if m["type"] == "http.response.start"]
+        assert statuses == [413]
+
+    @pytest.mark.asyncio
+    async def test_content_length_within_cap_streamed_count_matches_declared(self) -> None:
+        """C-L: 50 with exactly 50 bytes body passes through to the inner app."""
+        received_chunks: list[bytes] = []
+
+        async def inner_app(scope: dict, receive, send) -> None:  # type: ignore[no-untyped-def]
+            while True:
+                msg = await receive()
+                if msg["type"] == "http.request":
+                    received_chunks.append(msg.get("body", b""))
+                    if not msg.get("more_body", False):
+                        break
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 201,
+                    "headers": [(b"content-type", b"application/json")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b'{"ok":true}'})
+
+        middleware = BodySizeLimitMiddleware(inner_app)
+        body_bytes = b"x" * 50
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": f"/sessions/{uuid4()}/events",
+            "headers": [(b"content-length", str(len(body_bytes)).encode("ascii"))],
+        }
+        chunks = [
+            {"type": "http.request", "body": body_bytes, "more_body": False},
+        ]
+        chunk_iter = iter(chunks)
+
+        async def receive() -> dict:
+            return next(chunk_iter)
+
+        sent: list[dict] = []
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        await middleware(scope, receive, send)
+        statuses = [m.get("status") for m in sent if m["type"] == "http.response.start"]
+        assert statuses == [201]
+        assert b"".join(received_chunks) == body_bytes
+
+    @pytest.mark.asyncio
+    async def test_content_length_within_cap_actual_smaller_passes(self) -> None:
+        """C-L: 100 but only 50 bytes sent — under-counting is fine; only over-counting is a lie."""
+        received_chunks: list[bytes] = []
+
+        async def inner_app(scope: dict, receive, send) -> None:  # type: ignore[no-untyped-def]
+            while True:
+                msg = await receive()
+                if msg["type"] == "http.request":
+                    received_chunks.append(msg.get("body", b""))
+                    if not msg.get("more_body", False):
+                        break
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 201,
+                    "headers": [(b"content-type", b"application/json")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b'{"ok":true}'})
+
+        middleware = BodySizeLimitMiddleware(inner_app)
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": f"/sessions/{uuid4()}/events",
+            # Declare 100 bytes but only send 50.
+            "headers": [(b"content-length", b"100")],
+        }
+        chunks = [
+            {"type": "http.request", "body": b"x" * 50, "more_body": False},
+        ]
+        chunk_iter = iter(chunks)
+
+        async def receive() -> dict:
+            return next(chunk_iter)
+
+        sent: list[dict] = []
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        await middleware(scope, receive, send)
+        statuses = [m.get("status") for m in sent if m["type"] == "http.response.start"]
+        assert statuses == [201]
+
+
 class TestStreamedBodyFallback:
     """Direct-ASGI tests for chunked / Content-Length-less requests.
 
@@ -279,3 +415,31 @@ def test_cap_constants_are_consistent() -> None:
     """Document the cap values so a reviewer notices a silent change."""
     assert EVENT_BODY_CAP_BYTES == 16 * 1024
     assert SNAPSHOT_BODY_CAP_BYTES == 256 * 1024
+
+
+class TestContentLengthParsing:
+    """Unit tests for `_content_length` — header normalisation and negative values."""
+
+    def test_negative_content_length_treated_as_missing(self) -> None:
+        """Content-Length: -1 is invalid per RFC 9110; treat as absent so the
+        streaming-cap path runs instead of the fast-reject path."""
+        scope = {"headers": [(b"content-length", b"-1")]}
+        assert _content_length(scope) is None
+
+    def test_mixed_case_content_length_header_parsed(self) -> None:
+        """ASGI servers other than uvicorn may not lowercase header names.
+        `Content-LENGTH: 100` must still be recognised."""
+        scope = {"headers": [(b"Content-LENGTH", b"100")]}
+        assert _content_length(scope) == 100
+
+    def test_normal_content_length_parsed(self) -> None:
+        scope = {"headers": [(b"content-length", b"512")]}
+        assert _content_length(scope) == 512
+
+    def test_missing_content_length_returns_none(self) -> None:
+        scope = {"headers": [(b"accept", b"application/json")]}
+        assert _content_length(scope) is None
+
+    def test_non_integer_content_length_returns_none(self) -> None:
+        scope = {"headers": [(b"content-length", b"abc")]}
+        assert _content_length(scope) is None

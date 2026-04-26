@@ -13,7 +13,9 @@ from archmentor_api.db import get_db_session
 from archmentor_api.main import app
 from archmentor_api.models.brain_snapshot import BrainSnapshot
 from archmentor_api.models.canvas_snapshot import CanvasSnapshot
+from archmentor_api.models.interruption import Interruption, InterruptionPriority
 from archmentor_api.models.problem import Problem
+from archmentor_api.models.report import Report
 from archmentor_api.models.session import InterviewSession, SessionStatus
 from archmentor_api.models.session_event import SessionEvent, SessionEventType
 from archmentor_api.models.user import User
@@ -186,6 +188,28 @@ def test_list_sessions_returns_caller_sessions(
     _ = user_id
 
 
+def test_list_sessions_n_plus_1_regression(client: TestClient, seed: dict[str, object]) -> None:
+    """Regression: list_sessions must not issue N extra queries for N sessions.
+
+    The fix (selectinload on InterviewSession.problem) collapses the per-row
+    db.get(Problem) calls into a single IN-clause batch query so the total
+    query count stays constant regardless of result set size.
+
+    # TODO(#19): Replace this placeholder with a structured query-count assertion
+    # using a SQLAlchemy `before_cursor_execute` event listener once the test
+    # harness supports it. For now this exercises the endpoint with 3 rows to
+    # verify it returns correctly after the selectinload change.
+    """
+    for _ in range(3):
+        r = client.post(
+            "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
+        )
+        assert r.status_code == 201
+    response = client.get("/sessions", headers=seed["headers"])
+    assert response.status_code == 200
+    assert len(response.json()) == 3
+
+
 def test_list_sessions_empty(client: TestClient, seed: dict[str, object]) -> None:
     response = client.get("/sessions", headers=seed["headers"])
     assert response.status_code == 200
@@ -249,7 +273,14 @@ def test_end_session_happy_path(client: TestClient, seed: dict[str, object]) -> 
     assert body["ended_at"] is not None
 
 
-def test_end_session_already_ended_returns_409(client: TestClient, seed: dict[str, object]) -> None:
+def test_end_session_already_ended_returns_200_idempotent(
+    client: TestClient, seed: dict[str, object]
+) -> None:
+    """Calling /end on an already-ENDED session must return 200, not 409.
+
+    Network retries and browser unload races both call /end twice;
+    the second call should be a no-op returning the same SessionView.
+    """
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -257,8 +288,13 @@ def test_end_session_already_ended_returns_409(client: TestClient, seed: dict[st
 
     first = client.post(f"/sessions/{session_id}/end", headers=seed["headers"])
     assert first.status_code == 200
+    assert first.json()["status"] == "ended"
+
     second = client.post(f"/sessions/{session_id}/end", headers=seed["headers"])
-    assert second.status_code == 409
+    assert second.status_code == 200
+    assert second.json()["status"] == "ended"
+    # ended_at must be the same (no re-write on second call).
+    assert second.json()["ended_at"] == first.json()["ended_at"]
 
 
 def test_end_session_requires_auth(client: TestClient) -> None:
@@ -309,11 +345,27 @@ def test_after_end_event_ingest_returns_409(client: TestClient, seed: dict[str, 
 # ---------- DELETE /sessions/{id} ----------
 
 
-def test_delete_session_happy_path(client: TestClient, seed: dict[str, object]) -> None:
+def test_delete_active_session_returns_409(client: TestClient, seed: dict[str, object]) -> None:
+    """DELETE on an ACTIVE session must 409; call /end first."""
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
     session_id = create.json()["session_id"]
+
+    response = client.delete(f"/sessions/{session_id}", headers=seed["headers"])
+    assert response.status_code == 409
+    assert "/end" in response.json()["detail"]
+
+
+def test_delete_session_happy_path(client: TestClient, seed: dict[str, object]) -> None:
+    """DELETE after /end must succeed (204)."""
+    create = client.post(
+        "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
+    )
+    session_id = create.json()["session_id"]
+
+    end = client.post(f"/sessions/{session_id}/end", headers=seed["headers"])
+    assert end.status_code == 200
 
     response = client.delete(f"/sessions/{session_id}", headers=seed["headers"])
     assert response.status_code == 204
@@ -327,6 +379,9 @@ def test_delete_session_idempotent(client: TestClient, seed: dict[str, object]) 
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
     session_id = create.json()["session_id"]
+
+    end = client.post(f"/sessions/{session_id}/end", headers=seed["headers"])
+    assert end.status_code == 200
 
     first = client.delete(f"/sessions/{session_id}", headers=seed["headers"])
     assert first.status_code == 204
@@ -390,6 +445,22 @@ def test_canvas_snapshot_no_longer_has_diff_column() -> None:
     assert "diff_from_prev_json" not in CanvasSnapshot.model_fields
 
 
+def test_prompt_version_parity() -> None:
+    """API DEFAULT_PROMPT_VERSION and agent DEV_PROMPT_VERSION must stay in sync.
+
+    Both constants stamp new sessions so prompt-version replay queries align
+    across the M2/M3 boundary. A drift here causes silent mismatches in
+    `scripts/replay.py` — catch it at commit time instead.
+    """
+    from archmentor_agent.brain.bootstrap import DEV_PROMPT_VERSION
+    from archmentor_api.services.sessions import DEFAULT_PROMPT_VERSION
+
+    assert DEFAULT_PROMPT_VERSION == DEV_PROMPT_VERSION, (
+        f"Prompt version mismatch: API={DEFAULT_PROMPT_VERSION!r}, "
+        f"agent={DEV_PROMPT_VERSION!r}. Bump both constants together."
+    )
+
+
 def test_delete_session_cascades_to_children(
     client: TestClient, engine: Engine, seed: dict[str, object]
 ) -> None:
@@ -432,7 +503,25 @@ def test_delete_session_cascades_to_children(
                 scene_json={},
             )
         )
+        db.add(
+            Interruption(
+                session_id=session_id,
+                t_ms=0,
+                trigger="turn_end",
+                priority=InterruptionPriority.MEDIUM,
+                confidence=0.8,
+                text="Can you walk me through the data model?",
+            )
+        )
+        db.add(
+            Report(
+                session_id=session_id,
+            )
+        )
         db.commit()
+
+    end = client.post(f"/sessions/{session_id}/end", headers=seed["headers"])
+    assert end.status_code == 200
 
     response = client.delete(f"/sessions/{session_id}", headers=seed["headers"])
     assert response.status_code == 204
@@ -443,6 +532,113 @@ def test_delete_session_cascades_to_children(
         canvas = db.exec(
             select(CanvasSnapshot).where(CanvasSnapshot.session_id == session_id)
         ).all()
+        interruptions = db.exec(
+            select(Interruption).where(Interruption.session_id == session_id)
+        ).all()
+        reports = db.exec(select(Report).where(Report.session_id == session_id)).all()
     assert events == []
     assert brain == []
     assert canvas == []
+    assert interruptions == []
+    assert reports == []
+
+
+# ---------- GET /sessions/{id}/bootstrap ----------
+
+
+def _agent_headers() -> dict[str, str]:
+    return {"X-Agent-Token": os.environ["API_AGENT_INGEST_TOKEN"]}
+
+
+def test_bootstrap_happy_path_returns_problem_payload(
+    client: TestClient, seed: dict[str, object]
+) -> None:
+    create = client.post(
+        "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
+    )
+    assert create.status_code == 201
+    session_id = create.json()["session_id"]
+
+    response = client.get(f"/sessions/{session_id}/bootstrap", headers=_agent_headers())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_id"] == session_id
+    assert body["problem_slug"] == "url-shortener"
+    assert body["statement_md"] == "# URL shortener"
+    assert body["rubric_yaml"] == "dimensions: []"
+
+
+def test_bootstrap_missing_agent_token_returns_401(
+    client: TestClient, seed: dict[str, object]
+) -> None:
+    create = client.post(
+        "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
+    )
+    session_id = create.json()["session_id"]
+
+    response = client.get(f"/sessions/{session_id}/bootstrap")
+    assert response.status_code == 401
+
+
+def test_bootstrap_wrong_agent_token_returns_403(
+    client: TestClient, seed: dict[str, object]
+) -> None:
+    create = client.post(
+        "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
+    )
+    session_id = create.json()["session_id"]
+
+    response = client.get(
+        f"/sessions/{session_id}/bootstrap",
+        headers={"X-Agent-Token": "wrong-token"},
+    )
+    assert response.status_code == 403
+
+
+def test_bootstrap_user_jwt_returns_401(client: TestClient, seed: dict[str, object]) -> None:
+    """Bootstrap is NOT user-JWT authenticated; a Bearer token is rejected."""
+    create = client.post(
+        "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
+    )
+    session_id = create.json()["session_id"]
+
+    # Sends a valid user JWT but no X-Agent-Token — should be 401
+    # (missing agent credentials, not 403).
+    response = client.get(f"/sessions/{session_id}/bootstrap", headers=seed["headers"])
+    assert response.status_code == 401
+
+
+def test_bootstrap_unknown_session_returns_404(client: TestClient, seed: dict[str, object]) -> None:
+    response = client.get(f"/sessions/{uuid4()}/bootstrap", headers=_agent_headers())
+    assert response.status_code == 404
+
+
+def test_bootstrap_ended_session_returns_409(client: TestClient, seed: dict[str, object]) -> None:
+    create = client.post(
+        "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
+    )
+    session_id = create.json()["session_id"]
+
+    end = client.post(f"/sessions/{session_id}/end", headers=seed["headers"])
+    assert end.status_code == 200
+
+    response = client.get(f"/sessions/{session_id}/bootstrap", headers=_agent_headers())
+    assert response.status_code == 409
+
+
+# ---------- Settings validators ----------
+
+
+def test_settings_rejects_http_livekit_url() -> None:
+    """livekit_url must use ws:// or wss://; http:// must raise ValidationError."""
+    import pydantic
+    from archmentor_api.config import Settings
+
+    with pytest.raises(pydantic.ValidationError, match="livekit_url"):
+        Settings(
+            jwt_secret="a" * 32,
+            livekit_api_key="key",
+            livekit_api_secret="s" * 32,
+            agent_ingest_token="t" * 32,
+            livekit_url="http://internal/path",
+        )

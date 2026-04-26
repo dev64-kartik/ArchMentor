@@ -466,6 +466,19 @@ class TestXmlToolInputRecovery:
         assert decision.decision == "stay_silent"
         assert decision.reason == "schema_violation"
 
+    def test_oversized_input_returns_none_without_scanning(self) -> None:
+        """#38: inputs larger than 32 KiB must return None immediately,
+        guarding against ReDoS on adversarially-crafted API responses."""
+        from archmentor_agent.brain.client import _recover_xml_state_updates
+
+        # 100 KiB of valid-looking XML that would take a long time to
+        # scan if the regex ran. We only need to assert it returns None
+        # (the cap fires) — not that it's fast (that's hard to unit-test
+        # reliably in CI). Correctness is sufficient here.
+        big_blob = '<parameter name="k">' + ("x" * (100 * 1024)) + "</parameter>"
+        result = _recover_xml_state_updates(big_blob)
+        assert result is None, "expected None for oversized input"
+
 
 # ─────────────────────── error taxonomy ───────────────────────────────
 
@@ -512,16 +525,26 @@ class TestErrorTaxonomy:
         assert decision.decision == "stay_silent"
         assert decision.reason == "api_error"
 
-    async def test_api_connection_error_degrades_to_stay_silent(self) -> None:
+    async def test_api_connection_error_before_deadline_propagates(self) -> None:
+        """APIConnectionError arriving before the deadline is a genuine network
+        failure and must propagate (not silently coerced to stay_silent).
+
+        Note: Fix 5 changed the behavior of this scenario from `api_error`
+        (silent degrade) to `propagate` because the router's generic exception
+        handler (`except Exception`) will catch it and log `router.brain.unexpected`.
+        This is the correct signal for an unexpected connection error that
+        isn't deadline-triggered.
+        """
+
         def responder(_k: dict[str, Any]) -> Message:
             raise anthropic.APIConnectionError(
-                message="boom",
+                message="genuine connection error before deadline",
                 request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
             )
 
         client = _client(responder)
-        decision = await client.decide(state=_state(), event={}, t_ms=0)
-        assert decision.reason == "api_error"
+        with pytest.raises(anthropic.APIConnectionError):
+            await client.decide(state=_state(), event={}, t_ms=0)
 
     async def test_cancelled_error_propagates(self) -> None:
         """Router relies on CancelledError propagating to abort in-flight
@@ -572,6 +595,81 @@ class TestErrorTaxonomy:
         client = _client(hang)
         task = asyncio.create_task(client.decide(state=_state(), event={}, t_ms=0))
         # Yield once so the wait_for-wrapped coroutine starts.
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_api_connection_error_after_deadline_returns_discriminated_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SDK converts wait_for's CancelledError → APIConnectionError mid-backoff.
+
+        When the wall-clock has elapsed past _BRAIN_DEADLINE_S at the time the
+        APIConnectionError arrives, we treat it as a deadline-triggered abort
+        and return stay_silent("anthropic_api_connection_during_wait_for") so
+        R27's synthetic recovery utterance fires.
+
+        Test strategy: patch `asyncio.get_event_loop().time` so that when the
+        elapsed-time check runs inside `decide`, it sees a value >= deadline,
+        even though no real time has passed. This simulates the production
+        scenario where the SDK blocks past the deadline without yielding back
+        through asyncio (e.g. inside its own blocking retry logic).
+        """
+        import archmentor_agent.brain.client as _brain_client_module
+
+        deadline = 180.0
+        monkeypatch.setattr(_brain_client_module, "_BRAIN_DEADLINE_S", deadline)
+
+        # We can't use asyncio.sleep inside the fake (wait_for would intercept
+        # it). Instead we raise APIConnectionError immediately but monkeypatch
+        # asyncio.get_event_loop().time so the elapsed check reads >= deadline.
+        # Using patched event-loop time simulates "SDK raised after the deadline
+        # elapsed" without any real wall-clock wait.
+        call_count = 0
+
+        def patched_time() -> float:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call is `call_start_s = event_loop.time()`.
+                return 0.0
+            # Second call is the elapsed check after the exception —
+            # return a value past the deadline.
+            return deadline + 1.0
+
+        monkeypatch.setattr(asyncio.get_event_loop(), "time", patched_time)
+
+        def raise_connection_error(_k: dict[str, Any]) -> Message:
+            raise anthropic.APIConnectionError(
+                message="connection aborted mid-backoff",
+                request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+            )
+
+        client = _client(raise_connection_error)
+        decision = await client.decide(state=_state(), event={}, t_ms=0)
+        assert decision.decision == "stay_silent"
+        assert decision.reason == "anthropic_api_connection_during_wait_for"
+
+    async def test_external_cancel_not_swallowed_by_api_connection_branch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """CancelledError must not be accidentally caught by the APIConnectionError branch.
+
+        This verifies the Fix 5 discriminated branch still lets external
+        cancellation propagate correctly (invariant I2 — router cancellation
+        contract must not be broken).
+        """
+        monkeypatch.setattr("archmentor_agent.brain.client._BRAIN_DEADLINE_S", 30.0)
+
+        async def hang(_k: dict[str, Any]) -> Message:
+            await asyncio.sleep(10)
+            raise AssertionError("should not reach")
+
+        client = _client(hang)
+        task = asyncio.create_task(client.decide(state=_state(), event={}, t_ms=0))
         await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

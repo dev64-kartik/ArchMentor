@@ -23,13 +23,15 @@ from _helpers import (
     FakeSessionStore,
     FakeSnapshotClient,
 )
+from archmentor_agent.api_client.bootstrap import SessionBootstrap
 from archmentor_agent.brain.client import BrainClient
 from archmentor_agent.brain.decision import BrainDecision, BrainUsage
 from archmentor_agent.canvas.client import CanvasSnapshotClient
 from archmentor_agent.config import reset_settings_cache
 from archmentor_agent.main import (
     MentorAgent,
-    _ledger_config,
+    _agent_http_config,
+    _fetch_bootstrap_problem,
     _session_id_from_ctx,
     build_brain_wiring,
     build_initial_session_state,
@@ -82,10 +84,11 @@ def test_session_id_raises_on_garbage_room() -> None:
 def _disable_env_file(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stop `Settings` from reading the developer's `.env` file.
 
-    `_ledger_config` constructs `Settings()` internally, so monkeypatching
-    `os.environ` alone isn't enough — pydantic-settings reads `.env` too.
-    Replace `model_config` with a copy that has `env_file=None` for the
-    duration of the test; `monkeypatch.setattr` restores the original.
+    `_agent_http_config` constructs `Settings()` internally, so
+    monkeypatching `os.environ` alone isn't enough — pydantic-settings
+    reads `.env` too. Replace `model_config` with a copy that has
+    `env_file=None` for the duration of the test; `monkeypatch.setattr`
+    restores the original.
     """
     from archmentor_agent.config import Settings
     from pydantic_settings import SettingsConfigDict
@@ -94,23 +97,23 @@ def _disable_env_file(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Settings, "model_config", config_no_env_file)
 
 
-def test_ledger_config_requires_agent_token(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_agent_http_config_requires_agent_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """Settings construction raises ValidationError when the token is
     absent. The raw RuntimeError from M1's `_ledger_config` was replaced
     by pydantic-settings' own validation."""
     _disable_env_file(monkeypatch)
     monkeypatch.delenv("ARCHMENTOR_AGENT_INGEST_TOKEN", raising=False)
     with pytest.raises(ValidationError, match="agent_ingest_token"):
-        _ledger_config()
+        _agent_http_config()
 
 
-def test_ledger_config_uses_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_agent_http_config_returns_url_and_token(monkeypatch: pytest.MonkeyPatch) -> None:
     _disable_env_file(monkeypatch)
     monkeypatch.setenv("ARCHMENTOR_API_URL", "http://api.test:9999")
     monkeypatch.setenv("ARCHMENTOR_AGENT_INGEST_TOKEN", "tok_test_tok_test_tok_test_tok")
-    cfg = _ledger_config()
-    assert cfg.base_url == "http://api.test:9999"
-    assert cfg.agent_token == "tok_test_tok_test_tok_test_tok"  # noqa: S105 — fixture value
+    api_url, agent_token = _agent_http_config()
+    assert api_url == "http://api.test:9999"
+    assert agent_token == "tok_test_tok_test_tok_test_tok"  # noqa: S105 — fixture value
 
 
 def test_build_initial_session_state_populates_problem_and_cost() -> None:
@@ -129,6 +132,142 @@ def test_build_initial_session_state_populates_problem_and_cost() -> None:
     assert state.phase is InterviewPhase.INTRO
     assert state.decisions == []
     assert state.transcript_window == []
+
+
+def test_build_initial_session_state_with_injected_problem() -> None:
+    """When a ProblemCard is injected, it replaces the dev-test fallback."""
+    injected = ProblemCard(
+        slug="injected-slug",
+        version=3,
+        title="Injected Problem",
+        statement_md="# Injected",
+        rubric_yaml="dimensions: []\n",
+    )
+    state = build_initial_session_state(cost_cap_usd=3.0, problem=injected)
+    assert state.problem.slug == "injected-slug"
+    assert state.problem.title == "Injected Problem"
+    assert state.cost_cap_usd == 3.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_bootstrap_problem_dev_fallback_non_session_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non `session-<uuid>` room name → dev fallback (None returned)."""
+    from archmentor_agent.config import Settings
+
+    _disable_env_file(monkeypatch)
+    monkeypatch.setenv("ARCHMENTOR_API_URL", "http://api.test:9999")
+    monkeypatch.setenv("ARCHMENTOR_AGENT_INGEST_TOKEN", "tok_test_tok_test_tok_test_tok")
+    monkeypatch.setenv("ARCHMENTOR_ANTHROPIC_API_KEY", "key_test")
+    monkeypatch.setenv("ARCHMENTOR_BRAIN_ENABLED", "true")
+    settings = Settings()  # ty: ignore[missing-argument]
+
+    result = await _fetch_bootstrap_problem(
+        session_id=UUID("11111111-2222-3333-4444-555555555555"),
+        room_name="dev-test",
+        settings=settings,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_bootstrap_problem_brain_disabled_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Brain disabled → no API call, None returned immediately."""
+    from archmentor_agent.config import Settings
+
+    _disable_env_file(monkeypatch)
+    monkeypatch.setenv("ARCHMENTOR_API_URL", "http://api.test:9999")
+    monkeypatch.setenv("ARCHMENTOR_AGENT_INGEST_TOKEN", "tok_test_tok_test_tok_test_tok")
+    monkeypatch.setenv("ARCHMENTOR_ANTHROPIC_API_KEY", "key_test")
+    monkeypatch.setenv("ARCHMENTOR_BRAIN_ENABLED", "false")
+    settings = Settings()  # ty: ignore[missing-argument]
+
+    result = await _fetch_bootstrap_problem(
+        session_id=UUID("11111111-2222-3333-4444-555555555555"),
+        room_name="session-11111111-2222-3333-4444-555555555555",
+        settings=settings,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_bootstrap_problem_success_builds_problem_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When fetch succeeds, a ProblemCard is built from the bootstrap payload."""
+    from archmentor_agent.config import Settings
+
+    _disable_env_file(monkeypatch)
+    monkeypatch.setenv("ARCHMENTOR_API_URL", "http://api.test:9999")
+    monkeypatch.setenv("ARCHMENTOR_AGENT_INGEST_TOKEN", "tok_test_tok_test_tok_test_tok")
+    monkeypatch.setenv("ARCHMENTOR_ANTHROPIC_API_KEY", "key_test")
+    monkeypatch.setenv("ARCHMENTOR_BRAIN_ENABLED", "true")
+    settings = Settings()  # ty: ignore[missing-argument]
+
+    session_id = UUID("11111111-2222-3333-4444-555555555555")
+
+    async def _mock_fetch(
+        *,
+        api_url: str,
+        agent_token: str,
+        session_id: UUID,
+        timeout_s: float = 5.0,
+        max_retries: int = 1,
+    ) -> SessionBootstrap:
+        return SessionBootstrap(
+            problem_slug="url-shortener",
+            statement_md="# URL Shortener statement",
+            rubric_yaml="dimensions: [functional]",
+        )
+
+    import archmentor_agent.main as _main_module
+
+    monkeypatch.setattr(_main_module, "fetch_session_bootstrap", _mock_fetch)
+
+    result = await _fetch_bootstrap_problem(
+        session_id=session_id,
+        room_name=f"session-{session_id}",
+        settings=settings,
+    )
+    assert result is not None
+    assert result.slug == "url-shortener"
+    assert result.statement_md == "# URL Shortener statement"
+    assert result.rubric_yaml == "dimensions: [functional]"
+
+
+@pytest.mark.asyncio
+async def test_fetch_bootstrap_problem_fetch_error_falls_back_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BootstrapFetchError during production fetch → dev fallback (None), no crash."""
+    from archmentor_agent.api_client.bootstrap import BootstrapFetchError
+    from archmentor_agent.config import Settings
+
+    _disable_env_file(monkeypatch)
+    monkeypatch.setenv("ARCHMENTOR_API_URL", "http://api.test:9999")
+    monkeypatch.setenv("ARCHMENTOR_AGENT_INGEST_TOKEN", "tok_test_tok_test_tok_test_tok")
+    monkeypatch.setenv("ARCHMENTOR_ANTHROPIC_API_KEY", "key_test")
+    monkeypatch.setenv("ARCHMENTOR_BRAIN_ENABLED", "true")
+    settings = Settings()  # ty: ignore[missing-argument]
+
+    session_id = UUID("11111111-2222-3333-4444-555555555555")
+
+    async def _mock_fetch(**_: object) -> SessionBootstrap:
+        raise BootstrapFetchError("connection refused", status_code=None)
+
+    import archmentor_agent.main as _main_module
+
+    monkeypatch.setattr(_main_module, "fetch_session_bootstrap", _mock_fetch)
+
+    result = await _fetch_bootstrap_problem(
+        session_id=session_id,
+        room_name=f"session-{session_id}",
+        settings=settings,
+    )
+    assert result is None
 
 
 # ──────────────────────────────────────────────────────────────────────

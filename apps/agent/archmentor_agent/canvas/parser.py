@@ -44,13 +44,16 @@ _TEXT_TYPE = "text"
 _ARROW_LIKE_TYPES = frozenset({"arrow", "line"})
 _IMAGE_TYPE = "image"
 
-# Sentinel labels for arrows whose binding doesn't resolve. `(unbound)`
-# means the arrow has no `startBinding` / `endBinding` at all (the
-# candidate dragged it but didn't attach an endpoint). `(unresolved)`
-# means the binding points at an element id that doesn't exist in the
-# current scene — usually a stale reference after deletion.
-_UNBOUND = "(unbound)"
-_UNRESOLVED = "(unresolved)"
+# Sentinel labels for arrows whose binding doesn't resolve. Both are
+# wrapped in `<label>...</label>` so the brain prompt's trust contract
+# is uniform: every parenthesised value inside a connection line is
+# fenced, regardless of whether it came from the candidate or the
+# server. `(unbound)` means the arrow has no `startBinding` /
+# `endBinding` at all. `(unresolved)` means the binding points at an
+# element id that doesn't exist in the current scene — usually a stale
+# reference after deletion.
+_UNBOUND = "<label>(unbound)</label>"
+_UNRESOLVED = "<label>(unresolved)</label>"
 
 _IMAGE_PLACEHOLDER = "[embedded image]"
 
@@ -74,7 +77,7 @@ def parse_scene(scene: dict[str, Any]) -> str:
     annotations: list[str] = []
     unnamed: list[str] = []
 
-    seen_text_ids: set[str] = {eid for eid in label_index.values_to_text_ids() if eid is not None}
+    seen_text_ids: set[str] = set(label_index.values_to_text_ids())
 
     for element in elements:
         if not isinstance(element, dict):
@@ -170,17 +173,26 @@ def _build_label_index(elements: list[Any]) -> _LabelIndex:
 
 
 def _format_arrow(element: dict[str, Any], label_index: _LabelIndex) -> str:
-    start_label = _resolve_endpoint(element.get("startBinding"), label_index)
-    end_label = _resolve_endpoint(element.get("endBinding"), label_index)
+    # _resolve_endpoint returns a fully-fenced string in all cases —
+    # either a sentinel (`<label>(unbound)</label>` / `<label>(unresolved)</label>`)
+    # or a candidate label wrapped in `<label>...</label>`.
+    start = _resolve_endpoint(element.get("startBinding"), label_index)
+    end = _resolve_endpoint(element.get("endBinding"), label_index)
 
     arrow_label = _arrow_label(element, label_index)
-    base = f"<label>{start_label}</label> -> <label>{end_label}</label>"
+    base = f"{start} -> {end}"
     if arrow_label is not None:
         return f"{base} (labeled: <label>{arrow_label}</label>)"
     return base
 
 
 def _resolve_endpoint(binding: Any, label_index: _LabelIndex) -> str:
+    """Return a fully-fenced endpoint string.
+
+    Sentinels are already full `<label>...</label>` strings. Resolved
+    labels are escaped and wrapped here so the caller always gets a
+    uniformly fenced value and no double-wrapping occurs.
+    """
     if not isinstance(binding, dict):
         return _UNBOUND
     target_id = binding.get("elementId")
@@ -189,7 +201,7 @@ def _resolve_endpoint(binding: Any, label_index: _LabelIndex) -> str:
     label = label_index.label_for(target_id)
     if label is None:
         return _UNRESOLVED
-    return _escape(label)
+    return f"<label>{_escape(label)}</label>"
 
 
 def _arrow_label(element: dict[str, Any], label_index: _LabelIndex) -> str | None:

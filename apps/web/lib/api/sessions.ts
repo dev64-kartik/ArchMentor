@@ -49,7 +49,7 @@ async function authHeader(): Promise<string> {
 
 async function fetchJson<T>(
   path: string,
-  init: RequestInit & { parseAs?: (v: unknown) => v is T },
+  init: RequestInit & { parseAs: (v: unknown) => v is T },
 ): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -76,7 +76,7 @@ async function fetchJson<T>(
     throw new Error(`${path} failed (${response.status}): ${detail}`);
   }
   const body: unknown = await response.json();
-  if (init.parseAs && !init.parseAs(body)) {
+  if (!init.parseAs(body)) {
     throw new Error(`${path} response is malformed`);
   }
   return body as T;
@@ -93,7 +93,7 @@ function isProblemSummary(value: unknown): value is ProblemSummary {
   );
 }
 
-function isProblemSummaryList(value: unknown): value is ProblemSummary[] {
+export function isProblemSummaryList(value: unknown): value is ProblemSummary[] {
   return Array.isArray(value) && value.every(isProblemSummary);
 }
 
@@ -105,6 +105,8 @@ function isSessionView(value: unknown): value is SessionView {
     typeof v["livekit_room"] === "string" &&
     typeof v["livekit_url"] === "string" &&
     typeof v["status"] === "string" &&
+    (typeof v["started_at"] === "string" || v["started_at"] === null) &&
+    (typeof v["ended_at"] === "string" || v["ended_at"] === null) &&
     typeof v["problem"] === "object" &&
     isProblemSummary(v["problem"])
   );
@@ -155,4 +157,68 @@ export async function endSession(sessionId: string): Promise<SessionView> {
     headers: { Authorization: auth },
     parseAs: isSessionView,
   });
+}
+
+export type DeleteSessionError =
+  | "session_active"
+  | "not_found"
+  | "forbidden"
+  | "unknown";
+
+export type DeleteSessionResult =
+  | { ok: true }
+  | { ok: false; error: DeleteSessionError };
+
+/**
+ * Delete a session and cascade all related rows.
+ *
+ * Returns a typed result rather than throwing so callers can branch on
+ * specific error cases:
+ * - `session_active` — session is still ACTIVE; call `/end` first (409).
+ * - `not_found`      — no session with this id (404).
+ * - `forbidden`      — caller does not own this session (403).
+ * - `unknown`        — any other non-2xx status.
+ *
+ * TODO: surface `session_active` in the UI (Delete button disabled while
+ * session is not yet ended, or prompt user to end first).
+ */
+export async function deleteSession(
+  sessionId: string,
+): Promise<DeleteSessionResult> {
+  const auth = await authHeader();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(`${apiUrl()}/sessions/${sessionId}`, {
+      method: "DELETE",
+      headers: { Authorization: auth },
+      credentials: "omit",
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(
+        `/sessions/${sessionId} DELETE timed out after ${TIMEOUT_MS}ms`,
+        { cause: err },
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (response.status === 204 || response.ok) {
+    return { ok: true };
+  }
+  if (response.status === 409) {
+    return { ok: false, error: "session_active" };
+  }
+  if (response.status === 404) {
+    return { ok: false, error: "not_found" };
+  }
+  if (response.status === 403) {
+    return { ok: false, error: "forbidden" };
+  }
+  return { ok: false, error: "unknown" };
 }

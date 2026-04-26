@@ -17,9 +17,9 @@ import {
   Track,
 } from "livekit-client";
 
+import { useAccessTokenRef } from "@/components/auth/auth-provider";
 import { endSessionKeepalive } from "@/lib/api/sessions";
 import { fetchLiveKitToken } from "@/lib/livekit/token";
-import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 type Props = {
   room: string;
@@ -93,6 +93,7 @@ function parseAiState(payload: Uint8Array): AiSpeakingState | null {
  * handler so the gesture cascade is preserved.
  */
 export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) {
+  const tokenRef = useAccessTokenRef();
   const roomRef = useRef<Room | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   // Synchronous guard against double-click and StrictMode double-invoke.
@@ -100,6 +101,11 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
   // `joined` in the click handler can miss an in-flight connect. A ref
   // is written synchronously so the second click returns immediately.
   const joiningRef = useRef(false);
+  // Cleanup thunk returned by the last bindMicTrack call. Called before
+  // re-binding (reconnect, StrictMode second mount) and in the unmount
+  // effect to prevent orphaned track listeners from firing with stale
+  // closures after the component is gone.
+  const micTrackCleanupRef = useRef<(() => void) | null>(null);
   // Track the audio track that arrived before the <audio> element
   // mounted. The RoomEvent.TrackSubscribed handler stashes it here;
   // the audio-element mount effect picks it up and calls attach().
@@ -122,16 +128,29 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
   // lifecycle. We ride RoomEvent.LocalTrackPublished/Unpublished plus
   // the per-track Muted/Unmuted/Ended callbacks because LocalTrack does
   // not expose a single "state" enum.
+  //
+  // Returns a cleanup thunk that removes the registered listeners.
+  // Callers MUST invoke the previous cleanup before binding a new track
+  // (reconnect, StrictMode double-mount) and in the unmount path to
+  // prevent orphaned handlers from firing with stale closures.
   const bindMicTrack = useCallback((pub: LocalTrackPublication) => {
     const track = pub.audioTrack;
     if (!track) return;
     const sync = () => {
       setMicHealth(track.isMuted ? "muted" : "live");
     };
+    const onEnded = () => setMicHealth("ended");
     sync();
     track.on("muted", sync);
     track.on("unmuted", sync);
-    track.on("ended", () => setMicHealth("ended"));
+    track.on("ended", onEnded);
+    // Run any previously registered cleanup before storing the new one.
+    micTrackCleanupRef.current?.();
+    micTrackCleanupRef.current = () => {
+      track.off("muted", sync);
+      track.off("unmuted", sync);
+      track.off("ended", onEnded);
+    };
   }, []);
 
   const publishRoomToParent = useCallback(
@@ -197,7 +216,10 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
         });
         if (track.kind !== Track.Kind.Audio) return;
         attachAudioTrack(track as RemoteAudioTrack);
-        setAiState("speaking");
+        // Do NOT set ai_state here. DataReceived is the authoritative
+        // state owner. TrackSubscribed fires on reconnect cycles too,
+        // which would incorrectly override a "thinking" or "listening"
+        // state the agent already published.
       },
     );
     room.on(RoomEvent.TrackUnsubscribed, (track) => {
@@ -241,6 +263,8 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
     });
     room.on(RoomEvent.LocalTrackUnpublished, (pub) => {
       if (pub.kind !== Track.Kind.Audio) return;
+      micTrackCleanupRef.current?.();
+      micTrackCleanupRef.current = null;
       setMicHealth("ended");
     });
     room.on(RoomEvent.Disconnected, (reason) => {
@@ -360,6 +384,9 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
       const hasRoom = !!roomRef.current;
       console.log("[session] SessionRoom unmount", { aliveMs, hasRoom });
       mountedRef.current = false;
+      micTrackCleanupRef.current?.();
+      micTrackCleanupRef.current = null;
+      roomRef.current?.removeAllListeners();
       roomRef.current?.disconnect();
       roomRef.current = null;
       pendingTrackRef.current = null;
@@ -390,29 +417,20 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
 
   // R26 — keepalive Fetch on tab close. Only registers when we have a
   // real session UUID; dev-test uses a slug that has no DB row.
+  // Token is read synchronously from `tokenRef` (kept fresh by
+  // AuthProvider); awaiting `getSession()` inside `beforeunload` does
+  // not complete before the browser tears down the page.
   useEffect(() => {
     if (!sessionId || !UUID_RE.test(sessionId)) return;
     const onBeforeUnload = () => {
       if (!joined) return;
-      // Auth token must be read synchronously inside the handler; the
-      // browser cuts the page short after `beforeunload` returns.
-      void (async () => {
-        try {
-          const supabase = createSupabaseBrowserClient();
-          const {
-            data: { session },
-          } = await supabase.auth.getSession();
-          if (session?.access_token) {
-            endSessionKeepalive(sessionId, session.access_token);
-          }
-        } catch (err) {
-          console.warn("[session] beforeunload end-session failed", err);
-        }
-      })();
+      const token = tokenRef.current;
+      if (!token) return;
+      endSessionKeepalive(sessionId, token);
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [joined, sessionId]);
+  }, [joined, sessionId, tokenRef]);
 
   const handleAudioUnlock = useCallback(async () => {
     try {

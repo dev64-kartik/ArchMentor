@@ -23,7 +23,7 @@ from archmentor_agent.state.session_state import ProblemCard
 
 DEV_PROBLEM_SLUG = "dev-test"
 DEV_PROBLEM_VERSION = 2
-DEV_PROMPT_VERSION = "m2-initial"
+DEV_PROMPT_VERSION = "m3-canvas"
 
 DEV_PROBLEM_TITLE = "Design URL Shortener"
 

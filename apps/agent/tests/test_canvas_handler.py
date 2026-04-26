@@ -325,3 +325,38 @@ async def test_canvas_change_priority_is_high() -> None:
 
     assert len(captured) == 1
     assert captured[0].priority is Priority.HIGH
+
+
+@pytest.mark.asyncio
+async def test_no_baseline_state_logs_distinct_key_and_still_dispatches() -> None:
+    """#26: CanvasNoBaselineStateError (current is None) must log
+    `agent.canvas.no_baseline_state`, not `agent.canvas.cas_exhausted`,
+    and must NOT block the canvas_change ledger row.
+    """
+    import structlog.testing
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ok")
+    store = FakeSessionStore()
+    # Intentionally DO NOT seed any state — store._states is empty, so
+    # the mutator receives current=None and raises CanvasNoBaselineStateError.
+    agent, ledger, _, _, _, _ = _make_agent(brain=brain, store=store)
+    # Remove the state that _make_agent seeded so the mutator sees None.
+    store._states.clear()
+
+    rect, label = _labeled_rect("a", "A")
+    with structlog.testing.capture_logs() as captured:
+        await agent.on_canvas_scene_payload(_scene_payload(rect, label))
+        await _drain_tasks(agent)
+
+    events = [e.get("event", "") for e in captured]
+    # Distinct no-baseline log key must appear; CAS-exhausted key must NOT.
+    assert any("no_baseline_state" in e for e in events), (
+        f"expected 'no_baseline_state' in log events; got: {events}"
+    )
+    assert not any("cas_exhausted" in e for e in events), (
+        f"unexpected 'cas_exhausted' in log for no-baseline path: {events}"
+    )
+    # Canvas change ledger row still written despite the CAS failure.
+    canvas_events = [p for et, p in ledger.appends if et == "canvas_change"]
+    assert len(canvas_events) == 1

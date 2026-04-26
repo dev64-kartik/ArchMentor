@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlmodel import Session, select
 
 from archmentor_api.config import Settings, get_settings
@@ -101,15 +101,8 @@ class SessionView(BaseModel):
     problem: ProblemRef
 
 
-def _build_view(db: Session, row: InterviewSession, livekit_url: str) -> SessionView:
-    problem = db.get(Problem, row.problem_id)
-    if problem is None:
-        # Defensive: a session row exists with an FK to a problem that's
-        # been deleted. Surface as 500 — manual intervention needed.
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Session references a missing problem",
-        )
+def _session_to_view(row: InterviewSession, problem: Problem, livekit_url: str) -> SessionView:
+    """Build a `SessionView` from a pre-fetched session row + problem."""
     return SessionView(
         session_id=row.id,
         livekit_room=row.livekit_room,
@@ -124,6 +117,18 @@ def _build_view(db: Session, row: InterviewSession, livekit_url: str) -> Session
             difficulty=problem.difficulty,
         ),
     )
+
+
+def _build_view(db: Session, row: InterviewSession, livekit_url: str) -> SessionView:
+    problem = db.get(Problem, row.problem_id)
+    if problem is None:
+        # Defensive: a session row exists with an FK to a problem that's
+        # been deleted. Surface as 500 — manual intervention needed.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Session references a missing problem",
+        )
+    return _session_to_view(row, problem, livekit_url)
 
 
 def _user_uuid(user: CurrentUser) -> UUID:
@@ -166,6 +171,9 @@ def list_sessions(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> list[SessionView]:
     user_id = _user_uuid(user)
+    # Fetch all sessions in one query, then batch-fetch their Problems in a
+    # single IN-clause query — 2 total queries regardless of session count,
+    # avoiding the N+1 that results from calling db.get(Problem, ...) per row.
     rows = db.exec(
         select(InterviewSession)
         .where(InterviewSession.user_id == user_id)
@@ -174,7 +182,21 @@ def list_sessions(
         # is what `sa.desc` actually receives.
         .order_by(sa.desc(InterviewSession.started_at))  # ty: ignore[invalid-argument-type]
     ).all()
-    return [_build_view(db, row, settings.livekit_url) for row in rows]
+    if not rows:
+        return []
+    problem_ids = list({row.problem_id for row in rows})
+    problems = db.exec(select(Problem).where(Problem.id.in_(problem_ids))).all()  # ty: ignore[unresolved-attribute]
+    problem_index = {p.id: p for p in problems}
+    views: list[SessionView] = []
+    for row in rows:
+        problem = problem_index.get(row.problem_id)
+        if problem is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Session references a missing problem",
+            )
+        views.append(_session_to_view(row, problem, settings.livekit_url))
+    return views
 
 
 @router.get("/{session_id}", response_model=SessionView)
@@ -212,6 +234,11 @@ def end_session(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     if locked.user_id != user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your session")
+    if locked.status is SessionStatus.ENDED:
+        # Idempotent: already ended — return the current row without re-writing.
+        # Callers that call /end twice (network retry, browser unload race) should
+        # not get a 409; the session is in the desired terminal state.
+        return _build_view(db, locked, settings.livekit_url)
     if locked.status is not SessionStatus.ACTIVE:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -232,11 +259,70 @@ def delete_session(
     user: CurrentUser,
     db: Annotated[Session, Depends(get_db_session)],
 ) -> None:
-    """Hard-delete the session; child rows cascade via Postgres ON DELETE CASCADE."""
+    """Hard-delete the session; child rows cascade via Postgres ON DELETE CASCADE.
+
+    Requires the session to be in a non-ACTIVE state. Call POST /end first.
+    """
     user_id = _user_uuid(user)
     row = get_owned_session(db, session_id=session_id, user_id=user_id)
+    if row.status is SessionStatus.ACTIVE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Session is active; call /end before deleting",
+        )
     db.delete(row)
     db.commit()
+
+
+class SessionBootstrap(BaseModel):
+    """Bootstrap payload for the agent worker on session connect.
+
+    Carries everything the agent needs to seed the brain's ProblemCard
+    without a separate DB query — problem content is stable for the
+    session lifetime, so fetching it once at startup is the right contract.
+    """
+
+    session_id: UUID
+    problem_slug: str
+    statement_md: str
+    rubric_yaml: str
+
+
+@router.get(
+    "/{session_id}/bootstrap",
+    response_model=SessionBootstrap,
+    dependencies=[Depends(require_agent)],
+)
+def get_session_bootstrap(
+    session_id: UUID,
+    db: Annotated[Session, Depends(get_db_session)],
+) -> SessionBootstrap:
+    """Return the problem content the agent worker needs at session start.
+
+    Authenticated via X-Agent-Token (agent-only). Only ACTIVE sessions can
+    be bootstrapped — a stale agent reconnecting to an ended session should
+    fail fast rather than re-seeding its brain with stale state.
+    """
+    session_row = db.get(InterviewSession, session_id)
+    if session_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    if session_row.status is not SessionStatus.ACTIVE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Session is not active (status={session_row.status.value})",
+        )
+    problem = db.get(Problem, session_row.problem_id)
+    if problem is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session references a missing problem",
+        )
+    return SessionBootstrap(
+        session_id=session_id,
+        problem_slug=problem.slug,
+        statement_md=problem.statement_md,
+        rubric_yaml=problem.rubric_yaml,
+    )
 
 
 class AppendEventBody(BaseModel):
@@ -333,19 +419,13 @@ def append_brain_snapshot(
     snapshots are write-only from the agent; replay reads them
     directly from Postgres via `scripts/replay.py` with DB creds.
     """
-    # Aggregate byte check across all four JSON blobs + reasoning text.
-    # A session_state_json that's narrowly under cap but combined with
-    # a reasoning_text blob pushes total storage over — checking the
-    # sum is what actually bounds the row size at rest. All four
-    # measurements use UTF-8 byte length so multi-byte Unicode (e.g.
-    # the Hinglish transcript path) is counted accurately instead of
-    # being undercounted by `len(str)`.
-    total_bytes = (
-        len(json.dumps(body.session_state_json).encode("utf-8"))
-        + len(json.dumps(body.event_payload_json).encode("utf-8"))
-        + len(json.dumps(body.brain_output_json).encode("utf-8"))
-        + len(body.reasoning_text.encode("utf-8"))
-    )
+    # Aggregate byte check across the full snapshot body. Computing this
+    # once via model_dump_json() avoids four separate encode calls and
+    # accurately reflects the total payload size including multi-byte
+    # Unicode (e.g. Hinglish transcript paths). The body-size middleware
+    # is the primary gate; this check is defense-in-depth in case a
+    # future router refactor bypasses the middleware.
+    total_bytes = len(body.model_dump_json().encode("utf-8"))
     if total_bytes > _MAX_SNAPSHOT_PAYLOAD_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
@@ -388,6 +468,19 @@ class AppendCanvasSnapshotBody(BaseModel):
     t_ms: int = Field(ge=0, description="Milliseconds since session start")
     scene_json: dict[str, object] = Field(default_factory=dict)
 
+    @field_validator("scene_json", mode="before")
+    @classmethod
+    def _reject_nested_files(cls, v: Any) -> Any:
+        """R17: scene_json must not carry a 'files' key.
+
+        Excalidraw embeds image data under `files`; the agent strips it before
+        publishing, but a future client that forgets to do so must be caught
+        structurally rather than silently persisting binary data.
+        """
+        if isinstance(v, dict) and "files" in v:
+            raise ValueError("scene_json must not contain a 'files' key (R17)")
+        return v
+
 
 @router.post(
     "/{session_id}/canvas-snapshots",
@@ -410,6 +503,12 @@ def append_canvas_snapshot_endpoint(
     Schema explicitly forbids `files` per R17 — image data must not
     cross the API boundary.
     """
+    # Acquire the FOR UPDATE row lock first (same order as brain-snapshot
+    # route) so the size check runs inside the same transaction that will
+    # INSERT, preventing a TOCTOU window between the active-session gate
+    # and the INSERT.
+    _require_active_session(db, session_id)
+
     scene_bytes = len(json.dumps(body.scene_json).encode("utf-8"))
     if scene_bytes > _MAX_SNAPSHOT_PAYLOAD_BYTES:
         raise HTTPException(
@@ -418,8 +517,6 @@ def append_canvas_snapshot_endpoint(
                 f"scene_json too large: {scene_bytes} bytes (max {_MAX_SNAPSHOT_PAYLOAD_BYTES})"
             ),
         )
-
-    _require_active_session(db, session_id)
 
     snapshot = append_canvas_snapshot(
         db,

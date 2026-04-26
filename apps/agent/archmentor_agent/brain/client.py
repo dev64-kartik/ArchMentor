@@ -138,6 +138,8 @@ class BrainClient:
             phase=state.phase.value,
         )
 
+        call_start_s = asyncio.get_event_loop().time()
+
         try:
             response: Message = await asyncio.wait_for(
                 self._client.messages.create(**kwargs),
@@ -167,10 +169,59 @@ class BrainClient:
                 status=getattr(exc, "status_code", None),
             )
             raise
+        except anthropic.APIConnectionError as exc:
+            # SDK behaviour assumption (verified against anthropic-sdk-python
+            # ≥0.28 with httpx transport, 2026-04):
+            #
+            # When `asyncio.wait_for` fires while the SDK is mid-backoff
+            # between retries, the underlying `asyncio.sleep` in the SDK's
+            # retry loop is cancelled by wait_for's internal cancel. The SDK
+            # intercepts the CancelledError as part of its network-error
+            # handling and converts it to `APIConnectionError` before
+            # re-raising, so wait_for never sees its own TimeoutError.
+            # The observable effect: R27's "brain_timeout" synthetic recovery
+            # utterance would never fire because the router's
+            # `_maybe_emit_recovery_utterance` checks for `reason == "brain_timeout"`.
+            #
+            # Fix: when an APIConnectionError arrives and the wall-clock has
+            # elapsed past `_BRAIN_DEADLINE_S`, treat it as a deadline-
+            # triggered abort and return a discriminated `stay_silent` reason.
+            # When the error arrives WITHIN the deadline (a genuine mid-session
+            # connection drop before the SDK exhausted its retries), propagate
+            # so the router's generic `except Exception` path logs and degrades.
+            #
+            # Verification note: if R27 fails to fire on production timeouts,
+            # check the SDK version's retry logic in
+            # `anthropic/_base_client.py::BaseClient._should_retry` and
+            # `anthropic/_utils/retry.py`. The conversion of CancelledError →
+            # APIConnectionError must still be happening in the newer SDK for
+            # this branch to matter; if the SDK lets CancelledError propagate
+            # transparently the `except TimeoutError` branch above already
+            # handles it correctly.
+            elapsed_s = asyncio.get_event_loop().time() - call_start_s
+            if elapsed_s >= _BRAIN_DEADLINE_S:
+                log.error(
+                    "brain.api_error",
+                    t_ms=t_ms,
+                    kind="APIConnectionError_after_deadline",
+                    elapsed_s=elapsed_s,
+                    deadline_s=_BRAIN_DEADLINE_S,
+                )
+                return BrainDecision.stay_silent("anthropic_api_connection_during_wait_for")
+            # Connection error BEFORE the deadline — a genuine mid-call
+            # network failure, not a deadline-triggered cancel. Let it
+            # propagate; the router's generic handler will degrade to
+            # stay_silent("brain_unexpected") and log the exception.
+            log.error(
+                "brain.api_error",
+                t_ms=t_ms,
+                kind=type(exc).__name__,
+                elapsed_s=elapsed_s,
+            )
+            raise
         except (
             anthropic.RateLimitError,
             anthropic.APIStatusError,
-            anthropic.APIConnectionError,
         ) as exc:
             # SDK already retried (max_retries=2). Treat final failure
             # as "voice loop survives, mentor stays quiet."
@@ -275,18 +326,34 @@ def _extract_tool_block(response: Message) -> ToolUseBlock | None:
     return None
 
 
-# Object-typed sub-keys on `interview_decision`'s `state_updates`. If
-# Opus emits them as XML-tool-use strings, we attempt recovery in place.
-# Keys not in this set are passed through untouched (the brain doesn't
-# emit XML for them in observed traffic).
-_OBJECT_TYPED_PATHS: tuple[tuple[str, ...], ...] = (
-    ("state_updates",),
-)
+# The only object-typed key on `interview_decision` that Opus intermittently
+# emits as XML-tool-use spillover. Recovery is applied only to this key;
+# all others pass through untouched.
+_OBJECT_TYPED_KEY = "state_updates"
 
 _XML_PARAMETER_RE = re.compile(
     r'<parameter\s+name="(?P<name>[^"]+)">(?P<value>.*?)</parameter>',
     re.DOTALL,
 )
+
+# Safety cap: refuse to run the regex on inputs larger than this. Far above
+# any realistic state_updates payload (~100-500 bytes in observed traffic).
+_MAX_RECOVERY_INPUT_BYTES = 32 * 1024  # 32 KiB
+
+
+def _recover_xml_state_updates(value: str) -> dict[str, str] | None:
+    """Parse Opus's XML-parameter blob back into a ``{name: value}`` dict.
+
+    Returns ``None`` when no ``<parameter>`` tags match (caller leaves the
+    original value in place) or when the input exceeds the byte cap (DoS
+    resistance).
+    """
+    if len(value.encode("utf-8")) > _MAX_RECOVERY_INPUT_BYTES:
+        return None  # Refuse to scan very large inputs (DoS resistance)
+    recovered: dict[str, str] = {}
+    for match in _XML_PARAMETER_RE.finditer(value):
+        recovered[match.group("name")] = match.group("value").strip()
+    return recovered if recovered else None
 
 
 def _recover_xml_tool_input(
@@ -294,44 +361,30 @@ def _recover_xml_tool_input(
 ) -> dict[str, Any]:
     """Inflate Opus's XML-style tool-use spillover back into a dict.
 
-    When Opus emits a nested object as the literal string
+    When Opus emits ``state_updates`` as the literal string
     ``"\\n<parameter name=\\"foo\\">bar</parameter>"`` the strict
     JSON-schema validator below would otherwise reject the entire
-    decision and we'd silently drop a real state update. We probe a
-    fixed allowlist of paths (currently just ``state_updates``) and
-    reshape the string back into the `{name: value}` map the schema
-    expects.
+    decision and we'd silently drop a real state update. We attempt
+    recovery on that single key and return a new dict so the original
+    is never mutated.
 
     Logs ``brain.tool_input_recovered`` so the operator can grep for
     how often the model fell into this format. Recovery is best-effort:
-    if no `<parameter>` tags match, the original string is left in
-    place to fail validation as before.
+    if no ``<parameter>`` tags match, the original dict is returned
+    unchanged to fail validation as before.
     """
-    for path in _OBJECT_TYPED_PATHS:
-        node: Any = tool_input
-        for key in path[:-1]:
-            if not isinstance(node, dict) or key not in node:
-                node = None
-                break
-            node = node[key]
-        if not isinstance(node, dict):
-            continue
-        leaf = path[-1]
-        value = node.get(leaf)
-        if not isinstance(value, str):
-            continue
-        recovered: dict[str, str] = {}
-        for match in _XML_PARAMETER_RE.finditer(value):
-            recovered[match.group("name")] = match.group("value").strip()
-        if recovered:
-            log.info(
-                "brain.tool_input_recovered",
-                t_ms=t_ms,
-                path="/".join(path),
-                recovered_keys=sorted(recovered),
-            )
-            node[leaf] = recovered
-    return tool_input
+    if not isinstance(tool_input.get(_OBJECT_TYPED_KEY), str):
+        return tool_input
+    recovered = _recover_xml_state_updates(tool_input[_OBJECT_TYPED_KEY])
+    if recovered is None:
+        return tool_input
+    log.info(
+        "brain.tool_input_recovered",
+        t_ms=t_ms,
+        path=_OBJECT_TYPED_KEY,
+        recovered_keys=sorted(recovered),
+    )
+    return {**tool_input, _OBJECT_TYPED_KEY: recovered}
 
 
 def _usage_from_response(usage: Usage | None, *, model: str) -> BrainUsage:

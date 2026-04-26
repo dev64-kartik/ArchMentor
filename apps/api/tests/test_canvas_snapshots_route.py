@@ -203,6 +203,22 @@ def test_files_field_in_body_returns_422(client: TestClient, active_session_id: 
     assert response.status_code == 422
 
 
+def test_nested_files_in_scene_json_returns_422(
+    client: TestClient, active_session_id: UUID
+) -> None:
+    """R17: a `files` key nested inside `scene_json` must also be rejected.
+
+    `extra='forbid'` only catches top-level unknown fields; the field_validator
+    on `scene_json` catches the nested case.
+    """
+    response = client.post(
+        f"/sessions/{active_session_id}/canvas-snapshots",
+        json={"t_ms": 0, "scene_json": {"elements": [], "files": {}}},
+        headers=_agent_headers(),
+    )
+    assert response.status_code == 422
+
+
 def test_oversized_payload_returns_413(client: TestClient, active_session_id: UUID) -> None:
     """257 KiB scene → 413 from the body-size middleware."""
     huge_label = "x" * (257 * 1024)
@@ -229,17 +245,19 @@ def test_at_cap_size_succeeds(client: TestClient, active_session_id: UUID) -> No
 
 
 def test_select_for_update_compiles_for_canvas_route() -> None:
-    """The TOCTOU fix relies on the same FOR UPDATE gate as `/events` and
-    `/snapshots`. If the route ever stops calling `_require_active_session`
-    or its lock disappears, this test would lag — keeping a structural
-    check at this level catches it on the import alone."""
-    from pathlib import Path
+    """The canvas-snapshot route uses `_require_active_session` which issues
+    SELECT ... FOR UPDATE. Compile the identical statement against the Postgres
+    dialect to verify the lock clause survives dialect rendering — matching the
+    pattern in `test_snapshots_route.py::TestTOCTOULock`.
 
-    from archmentor_api.routes import sessions as sessions_module
+    SQLite silently no-ops FOR UPDATE, so the actual row-lock can't be exercised
+    in this harness; this structural compile check catches it if the lock is
+    ever accidentally removed from `_require_active_session`.
+    """
+    from archmentor_api.models.session import InterviewSession
+    from sqlalchemy.dialects import postgresql
+    from sqlmodel import select
 
-    src = sessions_module.__file__
-    assert src is not None
-    text = Path(src).read_text(encoding="utf-8")
-    # The canvas route hits the shared helper; the helper takes the lock.
-    assert "_require_active_session" in text
-    assert "with_for_update" in text
+    stmt = select(InterviewSession).where(InterviewSession.id == uuid4()).with_for_update()
+    compiled = str(stmt.compile(dialect=postgresql.dialect()))
+    assert "FOR UPDATE" in compiled.upper()

@@ -48,7 +48,7 @@ From the origin plan's M3 scope (lines 671–679) plus M2 deferred items, ce-rev
 
 - **R1.** `POST /sessions` creates a session row (status=`ACTIVE`), mints a unique `livekit_room`, returns `{ session_id, livekit_room, livekit_url }`. Agent worker is dispatched via LiveKit's room-on-creation behaviour (already wired in M1) — no explicit dispatch RPC needed.
 - **R2.** `POST /sessions/{id}/end` transitions `ACTIVE → ENDED`, sets `ended_at`, signals the agent worker to drain (via room close OR a side channel — see Open Questions). 409 if session is not `ACTIVE`. 403 if not the caller's session.
-- **R3.** `DELETE /sessions/{id}` cascades to `session_events`, `brain_snapshots`, `canvas_snapshots`. Returns 204. 403 if not the caller's session. 404 if the session was already deleted (idempotency).
+- **R3.** `DELETE /sessions/{id}` cascades to `session_events`, `brain_snapshots`, `canvas_snapshots`, `interruptions`, `reports` (all five FK-bearing children — see migration `a1b2c3d4e5f6`). Returns 204. 403 if not the caller's session. 404 if the session was already deleted (idempotency). 409 if the session is still `ACTIVE` (caller must POST `/end` first; landed post-review 2026-04-26).
 - **R4.** `GET /sessions` returns the caller's sessions ordered by `started_at desc`. `GET /sessions/{id}` returns one session. Both 403 on cross-user reads.
 - **R5.** `GET /problems` lists active problems; `GET /problems/{slug}` returns a single problem with full statement + rubric YAML.
 - **R6.** Browser embeds `@excalidraw/excalidraw` via `dynamic(..., { ssr: false })` + `"use client"` wrapper inside `apps/web/app/session/[id]/page.tsx`. The component throttles `onChange` to 1 second.
