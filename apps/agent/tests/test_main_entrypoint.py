@@ -163,12 +163,13 @@ async def test_fetch_bootstrap_problem_dev_fallback_non_session_room(
     monkeypatch.setenv("ARCHMENTOR_BRAIN_ENABLED", "true")
     settings = Settings()  # ty: ignore[missing-argument]
 
-    result = await _fetch_bootstrap_problem(
+    problem, abort_reason = await _fetch_bootstrap_problem(
         session_id=UUID("11111111-2222-3333-4444-555555555555"),
         room_name="dev-test",
         settings=settings,
     )
-    assert result is None
+    assert problem is None
+    assert abort_reason is None
 
 
 @pytest.mark.asyncio
@@ -185,12 +186,13 @@ async def test_fetch_bootstrap_problem_brain_disabled_returns_none(
     monkeypatch.setenv("ARCHMENTOR_BRAIN_ENABLED", "false")
     settings = Settings()  # ty: ignore[missing-argument]
 
-    result = await _fetch_bootstrap_problem(
+    problem, abort_reason = await _fetch_bootstrap_problem(
         session_id=UUID("11111111-2222-3333-4444-555555555555"),
         room_name="session-11111111-2222-3333-4444-555555555555",
         settings=settings,
     )
-    assert result is None
+    assert problem is None
+    assert abort_reason is None
 
 
 @pytest.mark.asyncio
@@ -218,6 +220,7 @@ async def test_fetch_bootstrap_problem_success_builds_problem_card(
         max_retries: int = 1,
     ) -> SessionBootstrap:
         return SessionBootstrap(
+            status="active",
             problem_slug="url-shortener",
             statement_md="# URL Shortener statement",
             rubric_yaml="dimensions: [functional]",
@@ -227,15 +230,53 @@ async def test_fetch_bootstrap_problem_success_builds_problem_card(
 
     monkeypatch.setattr(_main_module, "fetch_session_bootstrap", _mock_fetch)
 
-    result = await _fetch_bootstrap_problem(
+    problem, abort_reason = await _fetch_bootstrap_problem(
         session_id=session_id,
         room_name=f"session-{session_id}",
         settings=settings,
     )
-    assert result is not None
-    assert result.slug == "url-shortener"
-    assert result.statement_md == "# URL Shortener statement"
-    assert result.rubric_yaml == "dimensions: [functional]"
+    assert problem is not None
+    assert problem.slug == "url-shortener"
+    assert problem.statement_md == "# URL Shortener statement"
+    assert problem.rubric_yaml == "dimensions: [functional]"
+    assert abort_reason is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_bootstrap_problem_aborts_when_session_not_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bootstrap arrives after R26 keepalive ended the session → abort, no TTS."""
+    from archmentor_agent.config import Settings
+
+    _disable_env_file(monkeypatch)
+    monkeypatch.setenv("ARCHMENTOR_API_URL", "http://api.test:9999")
+    monkeypatch.setenv("ARCHMENTOR_AGENT_INGEST_TOKEN", "tok_test_tok_test_tok_test_tok")
+    monkeypatch.setenv("ARCHMENTOR_ANTHROPIC_API_KEY", "key_test")
+    monkeypatch.setenv("ARCHMENTOR_BRAIN_ENABLED", "true")
+    settings = Settings()  # ty: ignore[missing-argument]
+
+    session_id = UUID("11111111-2222-3333-4444-555555555555")
+
+    async def _mock_fetch(**_: object) -> SessionBootstrap:
+        return SessionBootstrap(
+            status="ended",
+            problem_slug="url-shortener",
+            statement_md="# whatever",
+            rubric_yaml="dimensions: [functional]",
+        )
+
+    import archmentor_agent.main as _main_module
+
+    monkeypatch.setattr(_main_module, "fetch_session_bootstrap", _mock_fetch)
+
+    problem, abort_reason = await _fetch_bootstrap_problem(
+        session_id=session_id,
+        room_name=f"session-{session_id}",
+        settings=settings,
+    )
+    assert problem is None
+    assert abort_reason == "session_not_active_at_bootstrap"
 
 
 @pytest.mark.asyncio
@@ -262,12 +303,13 @@ async def test_fetch_bootstrap_problem_fetch_error_falls_back_to_none(
 
     monkeypatch.setattr(_main_module, "fetch_session_bootstrap", _mock_fetch)
 
-    result = await _fetch_bootstrap_problem(
+    problem, abort_reason = await _fetch_bootstrap_problem(
         session_id=session_id,
         room_name=f"session-{session_id}",
         settings=settings,
     )
-    assert result is None
+    assert problem is None
+    assert abort_reason is None
 
 
 # ──────────────────────────────────────────────────────────────────────

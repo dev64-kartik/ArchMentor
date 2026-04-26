@@ -563,6 +563,7 @@ def test_bootstrap_happy_path_returns_problem_payload(
     assert response.status_code == 200
     body = response.json()
     assert body["session_id"] == session_id
+    assert body["status"] == "active"
     assert body["problem_slug"] == "url-shortener"
     assert body["statement_md"] == "# URL shortener"
     assert body["rubric_yaml"] == "dimensions: []"
@@ -613,7 +614,18 @@ def test_bootstrap_unknown_session_returns_404(client: TestClient, seed: dict[st
     assert response.status_code == 404
 
 
-def test_bootstrap_ended_session_returns_409(client: TestClient, seed: dict[str, object]) -> None:
+def test_bootstrap_ended_session_returns_payload_with_ended_status(
+    client: TestClient, seed: dict[str, object]
+) -> None:
+    """Bootstrap is status-agnostic by design.
+
+    The agent worker is dispatched on LiveKit room creation and races the
+    candidate's R26 keepalive Fetch. When the keepalive wins the race, the
+    session is already ENDED by the time the worker's bootstrap fetch
+    arrives — but the problem content is read-only and stable, so returning
+    it is harmless. The agent inspects `status` and aborts cleanly without
+    speaking to an empty room.
+    """
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -623,7 +635,10 @@ def test_bootstrap_ended_session_returns_409(client: TestClient, seed: dict[str,
     assert end.status_code == 200
 
     response = client.get(f"/sessions/{session_id}/bootstrap", headers=_agent_headers())
-    assert response.status_code == 409
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ended"
+    assert body["problem_slug"] == "url-shortener"
 
 
 # ---------- Settings validators ----------

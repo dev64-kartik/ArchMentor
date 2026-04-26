@@ -1102,11 +1102,22 @@ async def entrypoint(ctx: JobContext) -> None:
     # Fetch the problem card from the API bootstrap route for production
     # sessions. For dev/replay sessions (room name doesn't parse as a
     # `session-<uuid>` room) fall through to `build_dev_problem_card()`.
-    bootstrap_problem = await _fetch_bootstrap_problem(
+    # `_fetch_bootstrap_problem` returns None and logs `agent.bootstrap.aborted`
+    # when the candidate's R26 keepalive raced ahead of us and the session
+    # is already ENDED — in that case we shut down without speaking to an
+    # empty room.
+    bootstrap_problem, abort_reason = await _fetch_bootstrap_problem(
         session_id=session_id,
         room_name=ctx.room.name or "",
         settings=settings,
     )
+    if abort_reason is not None:
+        log.info(
+            "agent.entrypoint.aborted",
+            session_id=str(session_id),
+            reason=abort_reason,
+        )
+        return
 
     mentor = MentorAgent(
         session_id=session_id,
@@ -1258,19 +1269,24 @@ async def _fetch_bootstrap_problem(
     session_id: UUID,
     room_name: str,
     settings: Settings,
-) -> ProblemCard | None:
+) -> tuple[ProblemCard | None, str | None]:
     """Fetch the ProblemCard from the control-plane bootstrap API.
 
-    Returns None (triggering `build_dev_problem_card()` fallback) when:
-    - The room name doesn't match the `session-<uuid>` production format
-      (e.g. the dev-test or replay session), OR
-    - The brain is disabled (no API call needed — state is never seeded).
+    Returns `(problem, abort_reason)`:
+    - `(problem, None)` — bootstrap succeeded; agent should proceed.
+    - `(None, None)` — falling back to `build_dev_problem_card()` (dev/replay
+      room name, brain disabled, or transient fetch error).
+    - `(None, abort_reason)` — agent should shut down without speaking. This
+      fires when the candidate's R26 keepalive Fetch raced ahead of the
+      worker's bootstrap and the session is already ENDED — speaking the
+      opening utterance would TTS into an empty room and burn Anthropic
+      budget on a dead session.
 
-    Logs a structured `agent.bootstrap.dev_fallback` event so the operator
-    can distinguish production bootstraps from dev-path fallbacks.
+    Logs structured events so operators can distinguish production
+    bootstraps, dev-path fallbacks, and tab-close-aborts.
     """
     if not settings.brain_enabled:
-        return None
+        return None, None
 
     # Dev/replay sessions use raw UUIDs or non-session-prefixed room names.
     if not room_name.startswith("session-"):
@@ -1279,7 +1295,7 @@ async def _fetch_bootstrap_problem(
             reason="non_session_room",
             room_name=room_name,
         )
-        return None
+        return None, None
 
     try:
         bootstrap = await fetch_session_bootstrap(
@@ -1302,22 +1318,37 @@ async def _fetch_bootstrap_problem(
             reason="fetch_error",
             session_id=str(session_id),
         )
-        return None
+        return None, None
+
+    if bootstrap.status != "active":
+        # Candidate's R26 keepalive Fetch (POST /sessions/{id}/end on
+        # `beforeunload`) won the race against our boot. Don't speak —
+        # there's nobody to hear it, and /events would 409 anyway.
+        log.warning(
+            "agent.bootstrap.aborted",
+            session_id=str(session_id),
+            session_status=bootstrap.status,
+            reason="session_not_active_at_bootstrap",
+        )
+        return None, "session_not_active_at_bootstrap"
 
     log.info(
         "agent.bootstrap.fetched",
         session_id=str(session_id),
         problem_slug=bootstrap.problem_slug,
     )
-    return ProblemCard(
-        slug=bootstrap.problem_slug,
-        # API doesn't expose version or title via the bootstrap route yet;
-        # use defaults that won't affect the brain prompt (the brain reads
-        # statement_md and rubric_yaml, not slug/version/title).
-        version=1,
-        title=bootstrap.problem_slug,
-        statement_md=bootstrap.statement_md,
-        rubric_yaml=bootstrap.rubric_yaml,
+    return (
+        ProblemCard(
+            slug=bootstrap.problem_slug,
+            # API doesn't expose version or title via the bootstrap route yet;
+            # use defaults that won't affect the brain prompt (the brain reads
+            # statement_md and rubric_yaml, not slug/version/title).
+            version=1,
+            title=bootstrap.problem_slug,
+            statement_md=bootstrap.statement_md,
+            rubric_yaml=bootstrap.rubric_yaml,
+        ),
+        None,
     )
 
 

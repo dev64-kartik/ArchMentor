@@ -283,6 +283,7 @@ class SessionBootstrap(BaseModel):
     """
 
     session_id: UUID
+    status: SessionStatus
     problem_slug: str
     statement_md: str
     rubric_yaml: str
@@ -299,18 +300,18 @@ def get_session_bootstrap(
 ) -> SessionBootstrap:
     """Return the problem content the agent worker needs at session start.
 
-    Authenticated via X-Agent-Token (agent-only). Only ACTIVE sessions can
-    be bootstrapped — a stale agent reconnecting to an ended session should
-    fail fast rather than re-seeding its brain with stale state.
+    Authenticated via X-Agent-Token (agent-only). Status-agnostic by design:
+    the agent worker is dispatched on LiveKit room creation and races the
+    candidate's tab-close keepalive Fetch (R26). If the candidate closes
+    the tab before the worker finishes booting, the session is already
+    ENDED when the bootstrap fetch arrives — but the problem content is
+    read-only and stable, so returning it is harmless. The `status` field
+    lets the agent decide whether to proceed with TTS/brain init or shut
+    down cleanly without speaking to an empty room.
     """
     session_row = db.get(InterviewSession, session_id)
     if session_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-    if session_row.status is not SessionStatus.ACTIVE:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Session is not active (status={session_row.status.value})",
-        )
     problem = db.get(Problem, session_row.problem_id)
     if problem is None:
         raise HTTPException(
@@ -319,6 +320,7 @@ def get_session_bootstrap(
         )
     return SessionBootstrap(
         session_id=session_id,
+        status=session_row.status,
         problem_slug=problem.slug,
         statement_md=problem.statement_md,
         rubric_yaml=problem.rubric_yaml,

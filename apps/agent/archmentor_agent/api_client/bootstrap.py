@@ -55,8 +55,16 @@ class BootstrapFetchError(Exception):
 
 @dataclass(frozen=True)
 class SessionBootstrap:
-    """Problem content returned by the control-plane bootstrap route."""
+    """Problem content returned by the control-plane bootstrap route.
 
+    `status` carries the session's lifecycle state at the moment the
+    bootstrap was fetched. The agent should refuse to proceed with TTS /
+    brain init when the session is non-ACTIVE — typically the candidate
+    closed the tab before the worker finished booting (R26 keepalive
+    raced ahead of the worker's first fetch).
+    """
+
+    status: str
     problem_slug: str
     statement_md: str
     rubric_yaml: str
@@ -108,6 +116,7 @@ async def fetch_session_bootstrap(
             if response.status_code == 200:
                 data = response.json()
                 return SessionBootstrap(
+                    status=data["status"],
                     problem_slug=data["problem_slug"],
                     statement_md=data["statement_md"],
                     rubric_yaml=data["rubric_yaml"],
