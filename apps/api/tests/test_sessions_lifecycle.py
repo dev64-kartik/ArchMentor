@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from typing import TypedDict
 from uuid import UUID, uuid4
 
 import archmentor_api.models  # noqa: F401  — registers tables
@@ -23,6 +24,18 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
+
+
+class _Seed(TypedDict):
+    """Narrow seed-fixture shape so `seed["headers"]` is `dict[str, str]`.
+
+    `dict[str, object]` would force every TestClient call to ignore ty's
+    arg-type narrowing on the `headers` kwarg. The TypedDict makes the
+    fixture's contract explicit and matches starlette's `HeaderTypes`.
+    """
+
+    user_id: UUID
+    headers: dict[str, str]
 
 
 @pytest.fixture
@@ -69,7 +82,7 @@ def _bearer(user_id: UUID, email: str = "candidate@example.com") -> dict[str, st
 
 
 @pytest.fixture
-def seed(engine: Engine) -> dict[str, object]:
+def seed(engine: Engine) -> _Seed:
     """Seed one user + one problem; return their ids and headers."""
     user_id = uuid4()
     with Session(engine) as db:
@@ -92,7 +105,7 @@ def seed(engine: Engine) -> dict[str, object]:
 # ---------- POST /sessions ----------
 
 
-def test_create_session_happy_path(client: TestClient, seed: dict[str, object]) -> None:
+def test_create_session_happy_path(client: TestClient, seed: _Seed) -> None:
     response = client.post(
         "/sessions",
         json={"problem_slug": "url-shortener"},
@@ -109,9 +122,7 @@ def test_create_session_happy_path(client: TestClient, seed: dict[str, object]) 
     assert body["problem"]["title"] == "Design a URL shortener"
 
 
-def test_create_session_unknown_problem_slug_returns_422(
-    client: TestClient, seed: dict[str, object]
-) -> None:
+def test_create_session_unknown_problem_slug_returns_422(client: TestClient, seed: _Seed) -> None:
     response = client.post(
         "/sessions",
         json={"problem_slug": "ghost-problem"},
@@ -125,9 +136,7 @@ def test_create_session_requires_auth(client: TestClient) -> None:
     assert response.status_code == 401
 
 
-def test_create_session_then_mint_livekit_token_works(
-    client: TestClient, seed: dict[str, object]
-) -> None:
+def test_create_session_then_mint_livekit_token_works(client: TestClient, seed: _Seed) -> None:
     create = client.post(
         "/sessions",
         json={"problem_slug": "url-shortener"},
@@ -148,7 +157,7 @@ def test_create_session_then_mint_livekit_token_works(
 
 
 def test_list_sessions_returns_caller_sessions(
-    client: TestClient, engine: Engine, seed: dict[str, object]
+    client: TestClient, engine: Engine, seed: _Seed
 ) -> None:
     user_id = seed["user_id"]
     headers = seed["headers"]
@@ -188,7 +197,7 @@ def test_list_sessions_returns_caller_sessions(
     _ = user_id
 
 
-def test_list_sessions_n_plus_1_regression(client: TestClient, seed: dict[str, object]) -> None:
+def test_list_sessions_n_plus_1_regression(client: TestClient, seed: _Seed) -> None:
     """Regression: list_sessions must not issue N extra queries for N sessions.
 
     The fix (selectinload on InterviewSession.problem) collapses the per-row
@@ -210,7 +219,7 @@ def test_list_sessions_n_plus_1_regression(client: TestClient, seed: dict[str, o
     assert len(response.json()) == 3
 
 
-def test_list_sessions_empty(client: TestClient, seed: dict[str, object]) -> None:
+def test_list_sessions_empty(client: TestClient, seed: _Seed) -> None:
     response = client.get("/sessions", headers=seed["headers"])
     assert response.status_code == 200
     assert response.json() == []
@@ -224,7 +233,7 @@ def test_list_sessions_requires_auth(client: TestClient) -> None:
 # ---------- GET /sessions/{id} ----------
 
 
-def test_get_session_as_owner(client: TestClient, seed: dict[str, object]) -> None:
+def test_get_session_as_owner(client: TestClient, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -234,9 +243,7 @@ def test_get_session_as_owner(client: TestClient, seed: dict[str, object]) -> No
     assert response.json()["session_id"] == session_id
 
 
-def test_get_session_403_for_other_user(
-    client: TestClient, engine: Engine, seed: dict[str, object]
-) -> None:
+def test_get_session_403_for_other_user(client: TestClient, engine: Engine, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -252,7 +259,7 @@ def test_get_session_403_for_other_user(
     assert response.status_code == 403
 
 
-def test_get_session_404_when_missing(client: TestClient, seed: dict[str, object]) -> None:
+def test_get_session_404_when_missing(client: TestClient, seed: _Seed) -> None:
     response = client.get(f"/sessions/{uuid4()}", headers=seed["headers"])
     assert response.status_code == 404
 
@@ -260,7 +267,7 @@ def test_get_session_404_when_missing(client: TestClient, seed: dict[str, object
 # ---------- POST /sessions/{id}/end ----------
 
 
-def test_end_session_happy_path(client: TestClient, seed: dict[str, object]) -> None:
+def test_end_session_happy_path(client: TestClient, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -273,9 +280,7 @@ def test_end_session_happy_path(client: TestClient, seed: dict[str, object]) -> 
     assert body["ended_at"] is not None
 
 
-def test_end_session_already_ended_returns_200_idempotent(
-    client: TestClient, seed: dict[str, object]
-) -> None:
+def test_end_session_already_ended_returns_200_idempotent(client: TestClient, seed: _Seed) -> None:
     """Calling /end on an already-ENDED session must return 200, not 409.
 
     Network retries and browser unload races both call /end twice;
@@ -302,9 +307,7 @@ def test_end_session_requires_auth(client: TestClient) -> None:
     assert response.status_code == 401
 
 
-def test_end_session_403_other_user(
-    client: TestClient, engine: Engine, seed: dict[str, object]
-) -> None:
+def test_end_session_403_other_user(client: TestClient, engine: Engine, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -320,12 +323,12 @@ def test_end_session_403_other_user(
     assert response.status_code == 403
 
 
-def test_end_session_404_when_missing(client: TestClient, seed: dict[str, object]) -> None:
+def test_end_session_404_when_missing(client: TestClient, seed: _Seed) -> None:
     response = client.post(f"/sessions/{uuid4()}/end", headers=seed["headers"])
     assert response.status_code == 404
 
 
-def test_after_end_event_ingest_returns_409(client: TestClient, seed: dict[str, object]) -> None:
+def test_after_end_event_ingest_returns_409(client: TestClient, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -345,7 +348,7 @@ def test_after_end_event_ingest_returns_409(client: TestClient, seed: dict[str, 
 # ---------- DELETE /sessions/{id} ----------
 
 
-def test_delete_active_session_returns_409(client: TestClient, seed: dict[str, object]) -> None:
+def test_delete_active_session_returns_409(client: TestClient, seed: _Seed) -> None:
     """DELETE on an ACTIVE session must 409; call /end first."""
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
@@ -357,7 +360,7 @@ def test_delete_active_session_returns_409(client: TestClient, seed: dict[str, o
     assert "/end" in response.json()["detail"]
 
 
-def test_delete_session_happy_path(client: TestClient, seed: dict[str, object]) -> None:
+def test_delete_session_happy_path(client: TestClient, seed: _Seed) -> None:
     """DELETE after /end must succeed (204)."""
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
@@ -374,7 +377,7 @@ def test_delete_session_happy_path(client: TestClient, seed: dict[str, object]) 
     assert follow_up.status_code == 404
 
 
-def test_delete_session_idempotent(client: TestClient, seed: dict[str, object]) -> None:
+def test_delete_session_idempotent(client: TestClient, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -394,9 +397,7 @@ def test_delete_session_requires_auth(client: TestClient) -> None:
     assert response.status_code == 401
 
 
-def test_delete_session_403_for_other_user(
-    client: TestClient, engine: Engine, seed: dict[str, object]
-) -> None:
+def test_delete_session_403_for_other_user(client: TestClient, engine: Engine, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -462,7 +463,7 @@ def test_prompt_version_parity() -> None:
 
 
 def test_delete_session_cascades_to_children(
-    client: TestClient, engine: Engine, seed: dict[str, object]
+    client: TestClient, engine: Engine, seed: _Seed
 ) -> None:
     """DELETE removes the session AND every child row keyed on session_id.
 
@@ -550,9 +551,7 @@ def _agent_headers() -> dict[str, str]:
     return {"X-Agent-Token": os.environ["API_AGENT_INGEST_TOKEN"]}
 
 
-def test_bootstrap_happy_path_returns_problem_payload(
-    client: TestClient, seed: dict[str, object]
-) -> None:
+def test_bootstrap_happy_path_returns_problem_payload(client: TestClient, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -569,9 +568,7 @@ def test_bootstrap_happy_path_returns_problem_payload(
     assert body["rubric_yaml"] == "dimensions: []"
 
 
-def test_bootstrap_missing_agent_token_returns_401(
-    client: TestClient, seed: dict[str, object]
-) -> None:
+def test_bootstrap_missing_agent_token_returns_401(client: TestClient, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -581,9 +578,7 @@ def test_bootstrap_missing_agent_token_returns_401(
     assert response.status_code == 401
 
 
-def test_bootstrap_wrong_agent_token_returns_403(
-    client: TestClient, seed: dict[str, object]
-) -> None:
+def test_bootstrap_wrong_agent_token_returns_403(client: TestClient, seed: _Seed) -> None:
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
     )
@@ -596,7 +591,7 @@ def test_bootstrap_wrong_agent_token_returns_403(
     assert response.status_code == 403
 
 
-def test_bootstrap_user_jwt_returns_401(client: TestClient, seed: dict[str, object]) -> None:
+def test_bootstrap_user_jwt_returns_401(client: TestClient, seed: _Seed) -> None:
     """Bootstrap is NOT user-JWT authenticated; a Bearer token is rejected."""
     create = client.post(
         "/sessions", json={"problem_slug": "url-shortener"}, headers=seed["headers"]
@@ -609,13 +604,13 @@ def test_bootstrap_user_jwt_returns_401(client: TestClient, seed: dict[str, obje
     assert response.status_code == 401
 
 
-def test_bootstrap_unknown_session_returns_404(client: TestClient, seed: dict[str, object]) -> None:
+def test_bootstrap_unknown_session_returns_404(client: TestClient, seed: _Seed) -> None:
     response = client.get(f"/sessions/{uuid4()}/bootstrap", headers=_agent_headers())
     assert response.status_code == 404
 
 
 def test_bootstrap_ended_session_returns_payload_with_ended_status(
-    client: TestClient, seed: dict[str, object]
+    client: TestClient, seed: _Seed
 ) -> None:
     """Bootstrap is status-agnostic by design.
 

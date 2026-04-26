@@ -195,7 +195,9 @@ async def test_happy_path_dispatches_router_event_and_snapshots_and_ledgers() ->
     # Ledger has the canvas_change row with parsed_text per R21.
     canvas_events = [p for et, p in ledger.appends if et == "canvas_change"]
     assert len(canvas_events) == 1
-    assert "<label>API Gateway</label>" in canvas_events[0]["parsed_text"]
+    parsed_text = canvas_events[0]["parsed_text"]
+    assert isinstance(parsed_text, str)
+    assert "<label>API Gateway</label>" in parsed_text
     assert canvas_events[0]["scene_fingerprint"] == "fp-abc"
 
     # R23: canvas_state.description applied to Redis BEFORE the brain call.
@@ -215,7 +217,9 @@ async def test_malformed_json_writes_canvas_parse_error_no_dispatch() -> None:
     assert canvas_snapshots.posts == []
     parse_errors = [p for et, p in ledger.appends if et == "canvas_parse_error"]
     assert len(parse_errors) == 1
-    assert "ValueError" in parse_errors[0]["error"] or "JSONDecodeError" in parse_errors[0]["error"]
+    error_text = parse_errors[0]["error"]
+    assert isinstance(error_text, str)
+    assert "ValueError" in error_text or "JSONDecodeError" in error_text
 
 
 @pytest.mark.asyncio

@@ -279,4 +279,4 @@ def test_malformed_input_propagates_typeerror() -> None:
     surface immediately, not be papered over.
     """
     with pytest.raises((TypeError, AttributeError, KeyError)):
-        parse_scene("not a scene")  # type: ignore[arg-type]
+        parse_scene("not a scene")  # ty: ignore[invalid-argument-type]
