@@ -28,6 +28,11 @@ class SessionEventType(StrEnum):
     SILENCE_CHECK = "silence_check"
     INTERRUPTION = "interruption"
     ERROR = "error"
+    # M4 Unit 5/6: emitted when Haiku compaction folds dropped
+    # transcript turns into `session_summary`. Replay tooling reads
+    # these rows to reconstruct the (input_tokens, output_tokens,
+    # cost_usd, dropped_turn_count, summary_chars_before/after) timeline.
+    SUMMARY_COMPRESSED = "summary_compressed"
 
 
 class SessionEvent(SQLModel, table=True):

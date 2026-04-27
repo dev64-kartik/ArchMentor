@@ -138,6 +138,33 @@ def test_append_event_rejects_unknown_type(client: TestClient, session_id: UUID)
     assert response.status_code == 422
 
 
+def test_append_event_accepts_summary_compressed(client: TestClient, session_id: UUID) -> None:
+    """M4 Unit 5/6: the agent's ledger client emits `summary_compressed`
+    rows. The route must accept them post-migration; pre-Unit 6 these
+    would 422 with an unknown-enum error and the compaction history
+    would be silently lost."""
+    response = client.post(
+        f"/sessions/{session_id}/events",
+        json={
+            "t_ms": 125_000,
+            "type": "summary_compressed",
+            "payload_json": {
+                "model": "anthropic/claude-haiku-4-5",
+                "input_tokens": 1_240,
+                "output_tokens": 220,
+                "cost_usd": 0.00234,
+                "dropped_turn_count": 5,
+                "summary_chars_before": 0,
+                "summary_chars_after": 412,
+            },
+        },
+        headers=_agent_headers(),
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["type"] == "summary_compressed"
+
+
 def test_append_event_404_when_session_missing(client: TestClient) -> None:
     response = client.post(
         f"/sessions/{uuid4()}/events",
