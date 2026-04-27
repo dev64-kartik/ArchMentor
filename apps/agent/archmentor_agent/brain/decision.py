@@ -130,6 +130,18 @@ class BrainDecision:
     reason: str | None = None  # populated for non-happy paths only
     usage: BrainUsage = field(default_factory=BrainUsage)
     raw_input: dict[str, Any] = field(default_factory=dict)
+    # True only on the streaming-cancel-mid-stream factory below
+    # (`BrainDecision.partial`). All other factories leave it False so
+    # M5/M6 replay readers fail loudly on the unknown discriminator
+    # combination instead of silently classifying a partial-played row
+    # as an abstention. See M4 plan R3c.
+    #
+    # Field name uses `is_partial` rather than `partial` because
+    # frozen+slots dataclasses materialize each field as a member
+    # descriptor on the class, which would shadow the `partial(...)`
+    # classmethod factory below. Keep the factory's name canonical
+    # (matches the plan); rename the predicate.
+    is_partial: bool = False
 
     @classmethod
     def from_tool_block(
@@ -264,6 +276,39 @@ class BrainDecision:
         the ``cost_usd_total`` line in the next CAS apply doesn't move.
         """
         return cls._silent(reason="skipped_idempotent", confidence=1.0)
+
+    @classmethod
+    def partial(
+        cls,
+        *,
+        utterance: str,
+        reason: str,
+        usage: BrainUsage | None = None,
+    ) -> BrainDecision:
+        """Snapshot of a streaming dispatch cancelled after partial audio played.
+
+        Constructed when `task.cancel()` arrives mid-stream after the
+        brain has emitted at least one ``utterance`` delta and the
+        candidate has heard partial audio, but before the SDK reaches
+        ``message_stop``. The accumulated utterance string is preserved
+        so M5/M6 replay tooling can reconstruct exactly what the
+        candidate heard; ``decision`` collapses to ``stay_silent`` so
+        downstream consumers without the new ``partial`` discriminator
+        still treat it as "no further action this turn." The combination
+        ``decision="stay_silent" + reason=<...> + partial=True`` is the
+        explicit three-part discriminator. See M4 plan R3c.
+        """
+        return cls(
+            decision="stay_silent",
+            priority="low",
+            confidence=0.0,
+            reasoning="",
+            utterance=utterance,
+            reason=reason,
+            usage=usage or BrainUsage(),
+            raw_input={},
+            is_partial=True,
+        )
 
     @classmethod
     def skipped_cooldown(cls, *, cooldown_ms: int) -> BrainDecision:

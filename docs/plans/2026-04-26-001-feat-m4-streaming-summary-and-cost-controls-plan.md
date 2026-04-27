@@ -286,7 +286,7 @@ Ten units across seven phases (grouped as four waves in §Phased Delivery). Phas
 
 ### Phase 1 — Cost throttle quick wins (M3 dogfood carry-overs)
 
-- [ ] **Unit 1: Brain-input fingerprint skip + exponential backoff in `EventRouter`**
+- [x] **Unit 1: Brain-input fingerprint skip + exponential backoff in `EventRouter`** (landed `b29e345`)
 
 **Goal:** Cut Opus call count under active drawing without changing the candidate's experience. Land both throttling levers from master plan §695.
 
@@ -331,7 +331,7 @@ Ten units across seven phases (grouped as four waves in §Phased Delivery). Phas
 
 ---
 
-- [ ] **Unit 2: Queue-drain prioritisation + freshness-aware TTL**
+- [x] **Unit 2: Queue-drain prioritisation + freshness-aware TTL** (landed `6a6a2f4`)
 
 **Goal:** Stop dropping `speak` payloads when a competing event delays drain. Implements master plan §697 levers (a) and (b).
 
@@ -372,7 +372,7 @@ Ten units across seven phases (grouped as four waves in §Phased Delivery). Phas
 
 ### Phase 2 — Streaming brain client + sentence-chunked TTS
 
-- [ ] **Unit 3: Tool schema property reorder + streaming-friendly `BrainClient.decide`**
+- [x] **Unit 3: Tool schema property reorder + streaming-friendly `BrainClient.decide`**
 
 **Goal:** Switch the brain call to `messages.stream`, yield `utterance` deltas to the agent, keep schema validation and XML-spillover recovery intact. The largest M4 unit by line-count and risk.
 
@@ -585,7 +585,7 @@ The `try`/`except` skeleton must wrap both the `async with` block AND any code t
 
 ---
 
-- [ ] **Unit 6: API enum + Alembic migration for `SUMMARY_COMPRESSED`**
+- [x] **Unit 6: API enum + Alembic migration for `SUMMARY_COMPRESSED`** (landed `883f807`)
 
 **Goal:** Allow the new agent-side `summary_compressed` ledger writes to land in Postgres without ingest-422 rejection.
 

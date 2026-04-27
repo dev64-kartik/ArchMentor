@@ -31,12 +31,23 @@ INTERVIEW_DECISION_TOOL: ToolDescriptor = {
     "name": "interview_decision",
     "description": (
         "Emit the next interview decision. Call this on every turn. "
-        "Reasoning is private (not spoken). Utterance is what the candidate hears."
+        "Reasoning is private (not spoken). Utterance is what the candidate hears. "
+        "Emit `utterance` first when speaking so the candidate hears the first sentence sooner."
     ),
     "input_schema": {
         "type": "object",
         "required": ["reasoning", "decision", "priority", "confidence"],
+        # Property declaration order matters: Anthropic streams keys in
+        # declaration order. `utterance` is first so streaming TTS can
+        # start the moment the model commits to speaking; `reasoning`
+        # comes after because it is persisted, not spoken; `state_updates`
+        # is last because it is the largest object and the candidate
+        # never hears it. See M4 plan R6.
         "properties": {
+            "utterance": {
+                "type": ["string", "null"],
+                "description": "Spoken text. Null if decision != 'speak'.",
+            },
             "reasoning": {
                 "type": "string",
                 "description": "Private chain-of-thought. Never spoken.",
@@ -54,10 +65,6 @@ INTERVIEW_DECISION_TOOL: ToolDescriptor = {
                 "minimum": 0.0,
                 "maximum": 1.0,
                 "description": "Abstain from speaking below 0.6.",
-            },
-            "utterance": {
-                "type": ["string", "null"],
-                "description": "Spoken text. Null if decision != 'speak'.",
             },
             "can_be_skipped_if_stale": {
                 "type": "boolean",
