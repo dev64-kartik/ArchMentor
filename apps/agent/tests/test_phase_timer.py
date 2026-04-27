@@ -260,6 +260,60 @@ async def test_phase_advance_resets_elapsed_anchor() -> None:
     assert list(agent._brain.router._pending) == []
 
 
+async def test_router_phase_advance_anchors_next_phase_at_now_ms() -> None:
+    """End-to-end regression: when the brain dispatches a `phase_advance`,
+    the router's `_apply_decision` passes `now_ms=t_ms` into
+    `with_state_updates`, which sets `last_phase_change_s = t_ms // 1000`
+    on the new phase.
+
+    Previously ``elapsed_s`` (a dead field, always 0) was used as the
+    anchor, so every post-INTRO phase nudge fired immediately. This
+    test pins the live wall-clock anchor.
+    """
+    from archmentor_agent.brain.decision import BrainDecision
+    from archmentor_agent.events import EventType, RouterEvent
+
+    advance_decision = BrainDecision(
+        decision="speak",
+        priority="medium",
+        confidence=0.9,
+        reasoning="moving on",
+        utterance="Let's talk capacity.",
+        state_updates={"phase_advance": "capacity"},
+    )
+    brain = FakeBrainClient()
+    brain.enqueue(advance_decision)
+    agent, _ = _build_agent(
+        seed_state=_seed_state(phase=InterviewPhase.REQUIREMENTS, last_phase_change_s=0),
+        brain=brain,
+    )
+    assert agent._brain is not None
+
+    # Dispatch from the brain at t = 600 s.
+    _set_clock(agent, seconds=600)
+    await agent._brain.router.handle(
+        RouterEvent(
+            type=EventType.TURN_END,
+            t_ms=600_000,
+            payload={"text": "x"},
+        )
+    )
+    await agent._brain.router.wait_for_idle()
+
+    final_state = await agent._brain.store.load(SESSION_ID)
+    assert final_state is not None
+    assert final_state.phase is InterviewPhase.CAPACITY
+    # Anchor jumped to the dispatch's wall-clock anchor (t_ms=600_000 → 600 s).
+    assert final_state.last_phase_change_s == 600
+
+    # CAPACITY budget = 300; elapsed_in_phase right after advance = 0.
+    # Even at t = 700 s session elapsed (in-phase = 100 s), no nudge fires.
+    _set_clock(agent, seconds=700)
+    pending_before = len(agent._brain.router._pending)
+    await agent._maybe_dispatch_phase_timer_tick()
+    assert len(agent._brain.router._pending) == pending_before
+
+
 async def test_no_state_in_redis_logs_and_skips() -> None:
     """Tick when Redis is empty — no crash, no dispatch."""
     agent, _ = _build_agent(

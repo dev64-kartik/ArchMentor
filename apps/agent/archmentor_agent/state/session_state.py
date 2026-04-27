@@ -274,11 +274,16 @@ class SessionState(BaseModel):
             data["phase"] = phase_advance
             # M4 Unit 7: refresh ``last_phase_change_s`` so the new
             # phase's timer starts from zero rather than carrying the
-            # prior phase's elapsed time. ``elapsed_s`` is the agent's
-            # session-relative clock at the moment the brain emitted
-            # the advance — the closest available "now" inside this
-            # pure-sync method (Redis CAS contract: no awaits).
-            data["last_phase_change_s"] = data.get("elapsed_s", 0)
+            # prior phase's elapsed time. The router passes ``now_ms``
+            # (the dispatch's wall-clock anchor); fall back to
+            # ``elapsed_s`` for replay/test paths that don't carry
+            # ``now_ms``. ``elapsed_s`` is currently a dead field
+            # (always 0) — bug tracked separately; the ``now_ms``
+            # branch is the production-correct path until then.
+            if now_ms is not None:
+                data["last_phase_change_s"] = now_ms // 1000
+            else:
+                data["last_phase_change_s"] = data.get("elapsed_s", 0)
 
         rubric_delta = updates.get("rubric_coverage_delta")
         if rubric_delta:

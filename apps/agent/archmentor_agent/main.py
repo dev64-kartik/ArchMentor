@@ -526,13 +526,14 @@ class MentorAgent(Agent):
         Each tick:
 
         1. Load `SessionState` from Redis (no-op if evicted).
-        2. Compute ``elapsed_in_phase_s = state.elapsed_s - state.last_phase_change_s``.
-           ``state.elapsed_s`` is updated by other code paths (or
-           the agent's own clock) — for M4 we read the agent's own
-           ``now_relative_ms()`` because the brain dispatch path
-           doesn't yet refresh ``elapsed_s`` on every tick. The
-           comparison is then ``now_s - last_phase_change_s``, which
-           is the same quantity computed against a different anchor.
+        2. Compute ``elapsed_in_phase_s = now_s - state.last_phase_change_s``,
+           where ``now_s`` is the agent's session-relative wall clock.
+           ``last_phase_change_s`` is set by ``with_state_updates`` from
+           ``now_ms // 1000`` whenever the brain emits ``phase_advance``
+           (the router passes ``now_ms`` to ``with_state_updates``).
+           ``state.elapsed_s`` is currently a dead field (seeded to 0,
+           never updated) — left in place for future timeline code that
+           may use it.
         3. If `_should_nudge` returns True, dispatch a `PHASE_TIMER`
            event with bucketed ``over_budget_pct_tier``.
         4. Per-phase dedup history updated only on dispatch.

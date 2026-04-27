@@ -168,10 +168,9 @@ def test_with_state_updates_appends_to_existing_summary() -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_phase_advance_refreshes_last_phase_change_s() -> None:
-    """`with_state_updates({"phase_advance": ...})` must reset the
-    phase-timer anchor so the new phase doesn't immediately fire a nudge
-    from the prior phase's overrun.
+def test_phase_advance_refreshes_last_phase_change_s_from_elapsed_s_fallback() -> None:
+    """Replay path (no ``now_ms``): ``last_phase_change_s`` falls back
+    to ``elapsed_s`` so old M2/M3-era snapshots still translate.
     """
     state = SessionState(
         problem=_problem(),
@@ -183,6 +182,28 @@ def test_phase_advance_refreshes_last_phase_change_s() -> None:
     updated = state.with_state_updates({"phase_advance": "capacity"})
     assert updated.phase is InterviewPhase.CAPACITY
     assert updated.last_phase_change_s == 420
+
+
+def test_phase_advance_uses_now_ms_when_provided() -> None:
+    """Production path: ``now_ms`` (passed by the router) wins over
+    ``elapsed_s``. Regression test for a real bug — ``elapsed_s`` is a
+    dead field (seeded to 0, never updated), so without the ``now_ms``
+    branch, every post-INTRO phase nudge fired immediately because the
+    anchor never advanced past 0.
+    """
+    state = SessionState(
+        problem=_problem(),
+        system_prompt_version="v0",
+        started_at=datetime.now(UTC),
+        elapsed_s=0,  # the production-truthful value (dead field)
+        last_phase_change_s=0,
+    )
+    updated = state.with_state_updates(
+        {"phase_advance": "capacity"},
+        now_ms=600_000,  # 10 minutes into the session
+    )
+    assert updated.phase is InterviewPhase.CAPACITY
+    assert updated.last_phase_change_s == 600  # now_ms // 1000
 
 
 def test_phase_advance_absent_keeps_last_phase_change_s() -> None:
