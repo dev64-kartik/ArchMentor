@@ -141,6 +141,7 @@ class EventRouter:
         now_ms: Callable[[], int],
         synthetic_emitter: SyntheticUtteranceEmitter | None = None,
         recovery_text: str = "",
+        pre_dispatch_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._session_id = session_id
         self._brain = brain
@@ -152,6 +153,14 @@ class EventRouter:
         self._now_ms = now_ms
         self._emit_synthetic = synthetic_emitter
         self._recovery_text = recovery_text
+        # Pre-dispatch hook (Unit 2 / R22). The router invokes this
+        # before each dispatch loop iteration when a queued speak is
+        # fresh (`UtteranceQueue.peek_fresh` is non-None). The agent's
+        # `_drain_utterance_queue` is the registered closure; it plays
+        # the queued utterance through TTS before the next brain call
+        # starts, so a TURN_END speak that lost its dispatch slot to a
+        # following CANVAS_CHANGE is delivered, not aged out.
+        self._pre_dispatch_callback = pre_dispatch_callback
 
         self._lock = asyncio.Lock()
         self._pending: list[RouterEvent] = []
@@ -277,6 +286,11 @@ class EventRouter:
         so a follow-up `handle(...)` spawns a fresh loop.
         """
         while True:
+            # Pre-dispatch hook (Unit 2 / R22). Drain a fresh queued
+            # speak from the prior dispatch BEFORE starting the next
+            # brain call so the TURN_END→CANVAS_CHANGE (and inverse)
+            # M3-dogfood TTL-drop reproducer doesn't recur.
+            await self._maybe_drain_pre_dispatch()
             async with self._lock:
                 batch = list(self._pending)
                 self._pending.clear()
@@ -307,6 +321,27 @@ class EventRouter:
                 # so future events can still dispatch.
                 log.exception("router.dispatch.unexpected", batch_size=len(batch))
 
+    async def _maybe_drain_pre_dispatch(self) -> None:
+        """Drain one queued utterance before the next dispatch when fresh.
+
+        Cheap when no callback is registered (kill-switch / test path)
+        or no fresh utterance is waiting — the ``peek_fresh`` check is
+        ``O(stale-prefix)`` and runs without a brain or network call.
+        Errors in the callback are logged but never propagate; the
+        dispatch loop must stay alive.
+        """
+        if self._pre_dispatch_callback is None:
+            return
+        if self._queue.peek_fresh() is None:
+            return
+        try:
+            await self._pre_dispatch_callback()
+            log.info("router.pre_dispatch.drained")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("router.pre_dispatch.callback_error")
+
     async def _dispatch(self, batch: list[RouterEvent]) -> None:
         """One coalesced brain call + state update + snapshot."""
         merged = coalesce(batch)
@@ -317,80 +352,93 @@ class EventRouter:
         # happen to be equal (e.g. clock granularity).
         snapshot_t_ms = max(self._now_ms(), merged.t_ms)
         event_payload = _event_to_payload(merged)
+        # Track wall-clock duration of the dispatch; used in `finally`
+        # to extend queued-utterance TTLs by the time we held the slot
+        # so a queued speak doesn't age out purely because a competing
+        # event delayed its drain (Unit 2 / R23).
+        dispatch_start_ms = self._now_ms()
 
-        state = await self._load_state()
-        if state is None:
-            log.error(
-                "router.state_missing",
-                session_id=str(self._session_id),
-                t_ms=snapshot_t_ms,
-            )
-            return
-
-        # Cost-throttle gates run after state load + before the brain
-        # call. Order matters: cost-cap is the M2-established final
-        # word (router goes silent for the rest of the session); the
-        # idempotent/cooldown gates only meaningfully fire on a healthy
-        # session.
-        fingerprint = self._compute_fingerprint(state, merged)
-
-        if self._cost_capped or state.cost_usd_total >= state.cost_cap_usd:
-            self._cost_capped = True
-            decision = BrainDecision.cost_capped()
-            log.info(
-                "router.cost_capped",
-                t_ms=snapshot_t_ms,
-                cost_usd_total=state.cost_usd_total,
-                cost_cap_usd=state.cost_cap_usd,
-            )
-        elif self._should_skip_idempotent(fingerprint, merged):
-            decision = BrainDecision.skipped_idempotent()
-            log.info(
-                "router.cost_throttle.skipped",
-                reason="skipped_idempotent",
-                t_ms=snapshot_t_ms,
-                consecutive_n=self._consecutive_stay_silent,
-                cooldown_ms=0,
-                event_type=merged.type.value,
-            )
-        elif self._should_skip_cooldown(snapshot_t_ms, merged):
-            cooldown_ms = self._active_cooldown_ms()
-            decision = BrainDecision.skipped_cooldown(cooldown_ms=cooldown_ms)
-            log.info(
-                "router.cost_throttle.skipped",
-                reason="stay_silent_backoff",
-                t_ms=snapshot_t_ms,
-                consecutive_n=self._consecutive_stay_silent,
-                cooldown_ms=cooldown_ms,
-                event_type=merged.type.value,
-            )
-        else:
-            try:
-                decision = await self._brain.decide(
-                    state=state,
-                    event=event_payload,
+        try:
+            state = await self._load_state()
+            if state is None:
+                log.error(
+                    "router.state_missing",
+                    session_id=str(self._session_id),
                     t_ms=snapshot_t_ms,
                 )
-            except asyncio.CancelledError:
-                # Router's outer loop re-prepends the batch; nothing to
-                # write here because the call never completed.
-                raise
-            except Exception:
-                log.exception("router.brain.unexpected", t_ms=snapshot_t_ms)
-                decision = BrainDecision.stay_silent("brain_unexpected")
+                return
 
-        # Apply state updates BEFORE pushing an utterance: rolling the
-        # transcript / decisions log forward is the durable bit; if the
-        # process dies before TTS plays, the decision is still in Redis
-        # and the snapshot.
-        applied_state = await self._apply_decision(state, decision, snapshot_t_ms)
+            # Cost-throttle gates run after state load + before the brain
+            # call. Order matters: cost-cap is the M2-established final
+            # word (router goes silent for the rest of the session); the
+            # idempotent/cooldown gates only meaningfully fire on a healthy
+            # session.
+            fingerprint = self._compute_fingerprint(state, merged)
 
-        self._post_snapshot(snapshot_t_ms, applied_state, event_payload, decision)
-        self._emit_brain_decision_event(snapshot_t_ms, decision)
-        self._update_violation_counter(decision)
-        self._update_throttle_state(decision, fingerprint, merged, snapshot_t_ms)
-        self._maybe_push_utterance(decision, snapshot_t_ms)
-        self._maybe_emit_recovery_utterance(decision)
+            if self._cost_capped or state.cost_usd_total >= state.cost_cap_usd:
+                self._cost_capped = True
+                decision = BrainDecision.cost_capped()
+                log.info(
+                    "router.cost_capped",
+                    t_ms=snapshot_t_ms,
+                    cost_usd_total=state.cost_usd_total,
+                    cost_cap_usd=state.cost_cap_usd,
+                )
+            elif self._should_skip_idempotent(fingerprint, merged):
+                decision = BrainDecision.skipped_idempotent()
+                log.info(
+                    "router.cost_throttle.skipped",
+                    reason="skipped_idempotent",
+                    t_ms=snapshot_t_ms,
+                    consecutive_n=self._consecutive_stay_silent,
+                    cooldown_ms=0,
+                    event_type=merged.type.value,
+                )
+            elif self._should_skip_cooldown(snapshot_t_ms, merged):
+                cooldown_ms = self._active_cooldown_ms()
+                decision = BrainDecision.skipped_cooldown(cooldown_ms=cooldown_ms)
+                log.info(
+                    "router.cost_throttle.skipped",
+                    reason="stay_silent_backoff",
+                    t_ms=snapshot_t_ms,
+                    consecutive_n=self._consecutive_stay_silent,
+                    cooldown_ms=cooldown_ms,
+                    event_type=merged.type.value,
+                )
+            else:
+                try:
+                    decision = await self._brain.decide(
+                        state=state,
+                        event=event_payload,
+                        t_ms=snapshot_t_ms,
+                    )
+                except asyncio.CancelledError:
+                    # Router's outer loop re-prepends the batch; nothing to
+                    # write here because the call never completed.
+                    raise
+                except Exception:
+                    log.exception("router.brain.unexpected", t_ms=snapshot_t_ms)
+                    decision = BrainDecision.stay_silent("brain_unexpected")
+
+            # Apply state updates BEFORE pushing an utterance: rolling the
+            # transcript / decisions log forward is the durable bit; if the
+            # process dies before TTS plays, the decision is still in Redis
+            # and the snapshot.
+            applied_state = await self._apply_decision(state, decision, snapshot_t_ms)
+
+            self._post_snapshot(snapshot_t_ms, applied_state, event_payload, decision)
+            self._emit_brain_decision_event(snapshot_t_ms, decision)
+            self._update_violation_counter(decision)
+            self._update_throttle_state(decision, fingerprint, merged, snapshot_t_ms)
+            self._maybe_push_utterance(decision, snapshot_t_ms)
+            self._maybe_emit_recovery_utterance(decision)
+        finally:
+            # Bump TTLs of every queued utterance by the dispatch's
+            # wall-clock duration. Runs even on cancellation so a
+            # queued speak from a prior dispatch survives the wait.
+            elapsed_ms = self._now_ms() - dispatch_start_ms
+            if elapsed_ms > 0:
+                self._queue.bump_ttls(elapsed_ms)
 
     async def _load_state(self) -> SessionState | None:
         return await self._store.load(self._session_id)

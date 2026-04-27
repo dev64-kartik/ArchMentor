@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -89,7 +90,10 @@ def _make_router(
     store = store or FakeSessionStore()
     snapshots = snapshots or FakeSnapshotClient()
     clock = clock or _FakeClock()
-    queue = queue or UtteranceQueue(clock.now)
+    # `UtteranceQueue.__len__` makes empty queues falsy — use `is None`
+    # so a caller-passed empty queue isn't silently replaced.
+    if queue is None:
+        queue = UtteranceQueue(clock.now)
     log_events = log_events if log_events is not None else []
 
     state = seed_state if seed_state is not None else _make_state()
@@ -1114,6 +1118,321 @@ async def test_fingerprint_concurrent_transcripts_order_invariant() -> None:
     assert router._compute_fingerprint(state, event_a) == router._compute_fingerprint(
         state, event_b
     )
+
+
+# ---------------------------------------------------------------------------
+# Unit 2 — Queue-drain prioritisation + freshness-aware TTL (R22, R23)
+# ---------------------------------------------------------------------------
+
+
+def _make_router_with_callback(
+    callback: Callable[[], Awaitable[None]] | None,
+    *,
+    brain: FakeBrainClient | None = None,
+    clock: _FakeClock | None = None,
+    queue: UtteranceQueue | None = None,
+    seed_state: SessionState | None = None,
+) -> tuple[
+    EventRouter,
+    FakeBrainClient,
+    FakeSessionStore,
+    FakeSnapshotClient,
+    UtteranceQueue,
+    list[tuple[str, dict[str, Any]]],
+    list[asyncio.Task[Any]],
+]:
+    """Variant of `_make_router` that passes a pre-dispatch callback."""
+    brain = brain or FakeBrainClient()
+    store = FakeSessionStore()
+    snapshots = FakeSnapshotClient()
+    clock = clock or _FakeClock()
+    # `UtteranceQueue` defines ``__len__`` so the empty queue evaluates
+    # as falsy — `queue or UtteranceQueue(...)` would silently create a
+    # new instance and break identity. Use `is None` instead.
+    if queue is None:
+        queue = UtteranceQueue(clock.now)
+    log_events: list[tuple[str, dict[str, Any]]] = []
+
+    state = seed_state if seed_state is not None else _make_state()
+    asyncio.get_event_loop()
+    store._states[SESSION_ID] = state
+
+    snapshot_tasks: list[asyncio.Task[Any]] = []
+
+    def schedule(coro: Any) -> None:
+        snapshot_tasks.append(asyncio.create_task(coro))
+
+    def log(event_type: str, payload: dict[str, Any]) -> None:
+        log_events.append((event_type, dict(payload)))
+
+    router = EventRouter(
+        session_id=SESSION_ID,
+        brain=cast(BrainClient, brain),
+        store=cast(RedisSessionStore, store),
+        snapshot_client=cast(SnapshotClient, snapshots),
+        snapshot_scheduler=schedule,
+        utterance_queue=queue,
+        log_event=log,
+        now_ms=clock.now,
+        pre_dispatch_callback=callback,
+    )
+    return router, brain, store, snapshots, queue, log_events, snapshot_tasks
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_callback_drains_queued_utterance_before_next_call() -> None:
+    """A queued speak from a prior dispatch is delivered before the
+    next brain call starts (master plan §697 lever (a))."""
+    from archmentor_agent.events.types import Priority
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    clock = _FakeClock(t0_ms=1_000)
+    queue = UtteranceQueue(clock.now)
+    drained: list[PendingUtterance] = []
+
+    async def drain() -> None:
+        item = queue.pop_if_fresh()
+        if item is not None:
+            drained.append(item)
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("post-canvas")
+    router, _, _, _, _, _, snap_tasks = _make_router_with_callback(
+        drain, brain=brain, clock=clock, queue=queue
+    )
+
+    # Pre-seed the queue with a fresh utterance from a "prior" dispatch.
+    queue.push(
+        PendingUtterance(text="hello from prior", generated_at_ms=clock.now(), ttl_ms=10_000)
+    )
+
+    # Now fire a CANVAS_CHANGE — the router must drain the queue first.
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=clock.now() + 50,
+            payload={"scene_text": "x"},
+            priority=Priority.HIGH,
+        )
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(drained) == 1
+    assert drained[0].text == "hello from prior"
+    assert len(brain.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_callback_skipped_when_queue_empty() -> None:
+    """No callback invocation when peek_fresh returns None — cheap path."""
+    clock = _FakeClock(t0_ms=1_000)
+    queue = UtteranceQueue(clock.now)
+
+    invocations = 0
+
+    async def drain() -> None:
+        nonlocal invocations
+        invocations += 1
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("nothing queued")
+    router, _, _, _, _, _, snap_tasks = _make_router_with_callback(
+        drain, brain=brain, clock=clock, queue=queue
+    )
+
+    await router.handle(
+        RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}),
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert invocations == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_callback_none_preserves_m3_behaviour() -> None:
+    """Kill-switch / test path with no callback registered: dispatch
+    proceeds; no crash; no drain."""
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    clock = _FakeClock(t0_ms=1_000)
+    queue = UtteranceQueue(clock.now)
+    queue.push(
+        PendingUtterance(text="orphan", generated_at_ms=clock.now(), ttl_ms=10_000),
+    )
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("no callback")
+    router, _, _, _, _, _, snap_tasks = _make_router_with_callback(
+        None, brain=brain, clock=clock, queue=queue
+    )
+
+    await router.handle(
+        RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}),
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    # Brain still called; orphan utterance still in queue (no drain).
+    assert len(brain.calls) == 1
+    assert len(queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_callback_error_does_not_kill_dispatch_loop() -> None:
+    """Errors inside the pre-dispatch callback are logged but don't
+    stop the dispatch — the brain call still runs."""
+    from archmentor_agent.events.types import Priority
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    clock = _FakeClock(t0_ms=1_000)
+    queue = UtteranceQueue(clock.now)
+    queue.push(PendingUtterance(text="x", generated_at_ms=clock.now(), ttl_ms=10_000))
+
+    async def boom() -> None:
+        raise RuntimeError("intentional callback failure")
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("recovered")
+    router, _, _, _, _, _, snap_tasks = _make_router_with_callback(
+        boom, brain=brain, clock=clock, queue=queue
+    )
+
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=clock.now(),
+            payload={"scene_text": "x"},
+            priority=Priority.HIGH,
+        ),
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(brain.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ttl_bump_extends_queued_utterance_freshness() -> None:
+    """An utterance queued just before a slow brain call must NOT age
+    past TTL purely because the call held the dispatch slot
+    (master plan §697 lever (b))."""
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    clock = _FakeClock(t0_ms=1_000)
+    queue = UtteranceQueue(clock.now, ttl_ms=10_000)
+
+    # Push first, simulating a queued speak from a prior dispatch.
+    queue.push(PendingUtterance(text="needs to survive", generated_at_ms=clock.now()))
+
+    # Build a brain client that advances the clock during decide() so
+    # the dispatch's start→end window covers a 9-second wait.
+    class _SlowBrain(FakeBrainClient):
+        async def decide(  # type: ignore[override]
+            self, *, state: SessionState, event: dict[str, Any], t_ms: int
+        ) -> Any:
+            clock.advance(9_000)
+            return await super().decide(state=state, event=event, t_ms=t_ms)
+
+    brain = _SlowBrain()
+    brain.enqueue_stay_silent("slow")
+    router, _, _, _, _, _, snap_tasks = _make_router_with_callback(
+        None, brain=brain, clock=clock, queue=queue
+    )
+
+    await router.handle(
+        RouterEvent(EventType.TURN_END, t_ms=clock.now(), payload={"text": "x"}),
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    # 9_000 ms have elapsed; without bump the utterance would be 9_000 ms
+    # past TTL — but bump set ttl_ms to ~19_000 so it's still fresh.
+    peeked = queue.peek_fresh()
+    assert peeked is not None
+    assert peeked.text == "needs to survive"
+    assert peeked.ttl_ms >= 19_000
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_callback_fires_on_canvas_after_queued_turn_end_speak() -> None:
+    """M3-dogfood reproducer (i): TURN_END speak queued; subsequent
+    CANVAS_CHANGE dispatch chain → speak delivered, not dropped.
+
+    Pre-Unit 2, the queued TURN_END speak aged past TTL during the
+    CANVAS_CHANGE dispatch and was dropped on the next pop_if_fresh.
+    """
+    from archmentor_agent.events.types import Priority
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    clock = _FakeClock(t0_ms=1_000)
+    queue = UtteranceQueue(clock.now)
+
+    drained: list[PendingUtterance] = []
+
+    async def drain() -> None:
+        item = queue.pop_if_fresh()
+        if item is not None:
+            drained.append(item)
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("canvas-only ack")
+    router, _, _, _, _, _, snap_tasks = _make_router_with_callback(
+        drain, brain=brain, clock=clock, queue=queue
+    )
+
+    # Simulate a TURN_END dispatch having pushed a fresh speak; then
+    # 12s later a CANVAS_CHANGE arrives — pre-Unit 2 the speak was lost.
+    queue.push(PendingUtterance(text="from turn_end", generated_at_ms=clock.now(), ttl_ms=10_000))
+    clock.advance(2_000)  # leaving 8s of life
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=clock.now(),
+            payload={"scene_text": "drawing"},
+            priority=Priority.HIGH,
+        ),
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(drained) == 1
+    assert drained[0].text == "from turn_end"
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_callback_fires_on_turn_end_after_queued_canvas_speak() -> None:
+    """M3-dogfood reproducer (ii): CANVAS_CHANGE speak queued; following
+    TURN_END dispatch → canvas speak delivered, not dropped."""
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    clock = _FakeClock(t0_ms=1_000)
+    queue = UtteranceQueue(clock.now)
+
+    drained: list[PendingUtterance] = []
+
+    async def drain() -> None:
+        item = queue.pop_if_fresh()
+        if item is not None:
+            drained.append(item)
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("turn_end ack")
+    router, _, _, _, _, _, snap_tasks = _make_router_with_callback(
+        drain, brain=brain, clock=clock, queue=queue
+    )
+
+    queue.push(PendingUtterance(text="from canvas", generated_at_ms=clock.now(), ttl_ms=10_000))
+    clock.advance(3_000)
+    await router.handle(
+        RouterEvent(EventType.TURN_END, t_ms=clock.now(), payload={"text": "candidate"}),
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(drained) == 1
+    assert drained[0].text == "from canvas"
 
 
 # Property test (binding, refinements R1) — fingerprint stable across

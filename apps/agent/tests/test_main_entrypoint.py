@@ -868,6 +868,111 @@ async def test_publish_state_swallows_publish_data_error() -> None:
     assert "engine" in failed_logs[0]["reason"]
 
 
+# ---------------------------------------------------------------------------
+# Unit 2 — Pre-dispatch queue drain wired through `build_brain_wiring`
+# (R22 / R23, integration coverage)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_brain_wiring_registers_pre_dispatch_callback() -> None:
+    """`build_brain_wiring` must register a callable on `router._pre_dispatch_callback`
+    so the M3-dogfood TTL-drop reproducers stay fixed."""
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True)
+    assert agent._brain is not None
+    assert agent._brain.router._pre_dispatch_callback is not None
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_drain_delivers_queued_speak_before_canvas_dispatch() -> None:
+    """End-to-end M3-dogfood reproducer (i):
+    A SPEAK utterance from a prior dispatch is delivered (`session.say` called)
+    before the next CANVAS_CHANGE dispatch's brain call starts."""
+    from archmentor_agent.events import EventType, RouterEvent
+    from archmentor_agent.events.types import Priority
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("post-canvas")  # the canvas dispatch's outcome
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    assert agent._brain is not None
+
+    # Pre-seed the queue as if a prior dispatch produced a SPEAK that
+    # was about to be drained when a competing CANVAS_CHANGE arrived.
+    agent._brain.queue.push(
+        PendingUtterance(
+            text="from prior dispatch",
+            generated_at_ms=agent.now_relative_ms(),
+            ttl_ms=10_000,
+        )
+    )
+
+    # Default gate state is "not speaking" (no prior `mark_speaking`
+    # call), so the pre-dispatch drain isn't suppressed.
+
+    # Fire a CANVAS_CHANGE — under M3, the queued speak would have aged
+    # past TTL during the canvas dispatch and been dropped on the next
+    # pop_if_fresh. Under Unit 2 it's drained pre-dispatch.
+    await agent._brain.router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=agent.now_relative_ms() + 10,
+            payload={"scene_text": "<label>API</label>"},
+            priority=Priority.HIGH,
+        )
+    )
+    # Wait for both the pre-dispatch drain + the dispatch loop to finish.
+    if agent._brain.router._in_flight is not None:
+        await agent._brain.router._in_flight
+    await _drain_tasks(agent)
+
+    assert "from prior dispatch" in fake_session.said
+    assert len(brain.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_drain_skipped_when_candidate_speaking() -> None:
+    """Plan §365 edge case: candidate is mid-speech when the callback
+    fires → drain is suppressed by the speech-check gate; the queued
+    speak waits for a quieter moment."""
+    from archmentor_agent.events import EventType, RouterEvent
+    from archmentor_agent.events.types import Priority
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    assert agent._brain is not None
+
+    agent._brain.queue.push(
+        PendingUtterance(
+            text="should not barge",
+            generated_at_ms=agent.now_relative_ms(),
+            ttl_ms=10_000,
+        )
+    )
+
+    # Candidate is mid-speech.
+    agent._brain.gate.mark_speaking()
+
+    await agent._brain.router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=agent.now_relative_ms() + 10,
+            payload={"scene_text": "x"},
+            priority=Priority.HIGH,
+        )
+    )
+    if agent._brain.router._in_flight is not None:
+        await agent._brain.router._in_flight
+    await _drain_tasks(agent)
+
+    # No barge — gate suppressed the drain.
+    assert "should not barge" not in fake_session.said
+    # Item is still in the queue (drain didn't pop it).
+    assert agent._brain.queue.peek_fresh() is not None
+
+
 # Suppress unused-import warnings — these types are used via `cast`.
 _ = BrainUsage
 _ = BrainDecision

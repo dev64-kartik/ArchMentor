@@ -1098,6 +1098,22 @@ def build_brain_wiring(
     queue = UtteranceQueue(agent.now_relative_ms)
     gate = SpeechCheckGate(agent.now_relative_ms)
 
+    # Pre-dispatch hook (Unit 2 / R22). Closure so the router can ask
+    # the agent to drain a queued speak from the prior dispatch before
+    # the next brain call starts. Two gates fire here:
+    #
+    # - The router has already verified `peek_fresh` is non-None.
+    # - The candidate-speech gate (`SpeechCheckGate.is_candidate_speaking`)
+    #   is the second line of defence: the candidate may be mid-utterance
+    #   when a CANVAS_CHANGE arrives. Pre-M4 the drain only ran from the
+    #   turn_end path where the gate is guaranteed "done"; under M4 the
+    #   drain can fire from any event type, so this check is load-bearing.
+    async def _drain_if_fresh() -> None:
+        if agent._brain is not None and agent._brain.gate.is_candidate_speaking():
+            log.info("agent.drain.skipped_speaking")
+            return
+        await agent._drain_utterance_queue()
+
     router = EventRouter(
         session_id=agent.session_id,
         brain=brain,
@@ -1109,6 +1125,7 @@ def build_brain_wiring(
         now_ms=agent.now_relative_ms,
         synthetic_emitter=agent.emit_synthetic,
         recovery_text=SYNTHETIC_RECOVERY_UTTERANCE,
+        pre_dispatch_callback=_drain_if_fresh,
     )
     return _BrainWiring(
         brain=brain,

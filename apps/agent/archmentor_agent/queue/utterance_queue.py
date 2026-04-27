@@ -87,6 +87,53 @@ class UtteranceQueue:
             return head
         return None
 
+    def peek_fresh(self) -> PendingUtterance | None:
+        """Return the next non-stale utterance WITHOUT popping it.
+
+        Same TTL gating as ``pop_if_fresh`` — stale items in front are
+        dropped (the queue can't hand back a ghost), but the returned
+        item stays at the head. Used by the router as a cheap "is
+        there a queued speak worth playing?" check before invoking the
+        agent's drain callback (Unit 2 / R22).
+        """
+        now = self._now_ms()
+        while self._items:
+            head = self._items[0]
+            if now - head.generated_at_ms > head.ttl_ms:
+                self._items.popleft()
+                log.info(
+                    "queue.dropped_stale",
+                    generated_at_ms=head.generated_at_ms,
+                    age_ms=now - head.generated_at_ms,
+                    ttl_ms=head.ttl_ms,
+                )
+                if self._on_stale is not None:
+                    self._on_stale(head)
+                continue
+            return head
+        return None
+
+    def bump_ttls(self, extra_ms: int) -> None:
+        """Extend every queued item's TTL by ``extra_ms``.
+
+        The router calls this in ``_dispatch``'s ``finally`` block with
+        the duration of the brain call so a queued speak doesn't
+        expire on the next ``pop_if_fresh`` purely because a competing
+        event delayed drain (master plan §697 lever (b); Unit 2 / R23).
+
+        Per-item update via ``model_copy`` — different items entered
+        the queue at different times and the right invariant is "every
+        item gets the full TTL it would have had if no other event
+        had stolen the dispatch slot." Non-positive ``extra_ms`` is a
+        no-op so the call site doesn't have to guard.
+        """
+        if extra_ms <= 0:
+            return
+        bumped: deque[PendingUtterance] = deque()
+        for item in self._items:
+            bumped.append(item.model_copy(update={"ttl_ms": item.ttl_ms + extra_ms}))
+        self._items = bumped
+
     def clear_stale_on_new_turn(self, turn_t_ms: int) -> int:
         """Drop every queued utterance generated before `turn_t_ms`.
 
