@@ -566,6 +566,40 @@ async def test_schema_violation_counter_escalates_on_third() -> None:
 
 
 @pytest.mark.asyncio
+async def test_schema_violation_partial_recovery_counts_toward_escalation() -> None:
+    """M4 R3d — `schema_violation_partial_recovery` is a payload-level
+    discriminator only; the consecutive-violations counter still treats
+    it as schema_violation so three back-to-back failures still escalate."""
+    brain = FakeBrainClient()
+    # Two regular schema violations, then one partial-recovery — total 3
+    # → escalates.
+    brain.enqueue_schema_violation()
+    brain.enqueue_schema_violation()
+    partial_recovery = BrainDecision(
+        decision="stay_silent",
+        priority="low",
+        confidence=0.0,
+        reasoning="",
+        utterance=None,
+        reason="schema_violation_partial_recovery",
+    )
+    brain.enqueue(partial_recovery)
+    router, _, _, _, _, log_events, snap_tasks = _make_router(brain=brain)
+
+    for t in (1_000, 1_100, 1_200):
+        await router.handle(RouterEvent(EventType.TURN_END, t_ms=t, payload={"text": "x"}))
+        await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    escalated = [
+        e
+        for e in log_events
+        if e[0] == "brain_decision" and e[1].get("reason") == "schema_violation_escalated"
+    ]
+    assert len(escalated) == 1
+
+
+@pytest.mark.asyncio
 async def test_schema_violation_counter_resets_on_valid_decision() -> None:
     brain = FakeBrainClient()
     brain.enqueue_schema_violation()

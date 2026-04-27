@@ -996,12 +996,13 @@ class TestStreamingPath:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    async def test_post_stream_schema_violation(self) -> None:
-        """Final `tool_use.input` fails jsonschema → `schema_violation`.
-        Listener may have seen partial utterance audio already; that's
-        fine — by design the audio is not rolled back (M4 plan R4)."""
-        # Stream emits a valid utterance; final message has confidence
-        # out of range → schema violation.
+    async def test_post_stream_schema_violation_with_partial_audio_pushes_tail(
+        self,
+    ) -> None:
+        """M4 R3d — Final `tool_use.input` fails jsonschema validation,
+        but partial audio already played → push the closing tail through
+        the listener and discriminate as `schema_violation_partial_recovery`
+        so the candidate hears a graceful close instead of a half-sentence."""
         utterance = "Walk me through capacity."
         events = utterance_deltas(utterance, chunks=2)
         bad_input = _valid_tool_input(decision="speak", utterance=utterance, confidence=1.5)
@@ -1020,9 +1021,40 @@ class TestStreamingPath:
             state=_state(), event={}, t_ms=0, utterance_listener=listener
         )
         assert decision.decision == "stay_silent"
+        assert decision.reason == "schema_violation_partial_recovery"
+        # Original utterance reached the listener.
+        assert "".join(deltas[:-1]) == utterance
+        # The closing tail was pushed through the same listener.
+        assert "let me think again" in deltas[-1]
+
+    async def test_post_stream_schema_violation_no_partial_audio_no_tail(
+        self,
+    ) -> None:
+        """When the schema violation occurs without any partial audio
+        having played (e.g. listener never invoked because `utterance`
+        key never appeared), R3d does NOT push a closing tail and the
+        reason stays `schema_violation`. The candidate heard nothing,
+        so there's nothing to gracefully close."""
+        # Stream emits zero `utterance` events; final has bad confidence.
+        events: list[FakeStreamEvent] = []
+        bad_input = _valid_tool_input(decision="stay_silent", confidence=1.5)
+        final_msg = _make_message(tool_input=bad_input)
+
+        def stream_responder(_k: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(events=events, final_message=final_msg)
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+        deltas: list[str] = []
+
+        async def listener(d: str) -> None:
+            deltas.append(d)
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.decision == "stay_silent"
         assert decision.reason == "schema_violation"
-        # Audio already played to listener; not rolled back.
-        assert "".join(deltas) == utterance
+        assert deltas == []
 
     async def test_post_stream_xml_tool_input_recovered(self) -> None:
         """XML-spillover recovery runs only on the final accumulated dict,

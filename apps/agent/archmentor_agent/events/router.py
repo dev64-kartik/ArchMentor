@@ -608,7 +608,13 @@ class EventRouter:
         )
 
     def _update_violation_counter(self, decision: BrainDecision) -> None:
-        if decision.reason == "schema_violation":
+        # `schema_violation_partial_recovery` is the streaming-path
+        # discriminator when the post-stream tool_use.input failed
+        # validation but partial audio already played (M4 R3d). For
+        # the consecutive-violations counter, treat it as a regular
+        # schema_violation — the suffix is a payload-level discriminator
+        # for replay tooling, not a separate counter category.
+        if decision.reason in ("schema_violation", "schema_violation_partial_recovery"):
             self._consecutive_schema_violations += 1
             if (
                 self._consecutive_schema_violations >= _SCHEMA_VIOLATION_ESCALATION

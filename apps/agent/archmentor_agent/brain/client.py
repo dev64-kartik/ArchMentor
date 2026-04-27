@@ -65,6 +65,12 @@ _MAX_TOKENS = 1024
 # note on first-sentence minimum length.
 _UTTERANCE_LISTENER_MIN_CHARS = 2
 
+# M4 R3d — closing fragment pushed through the streaming TTS when
+# post-stream validation rejects the tool_use input after partial audio
+# has played. The surrounding "—" matches M3 R27/R28 voice and the lower
+# minimum sentence length so the SentenceTokenizer flushes promptly.
+_SCHEMA_VIOLATION_TAIL = " — actually, let me think again."
+
 # Bounds a single Anthropic call. Without this, the SDK default of 600 s
 # combined with `max_retries=2` (= 3 total attempts) would let a hung
 # gateway hold the router's serialization gate for ~30 min. Opus
@@ -459,7 +465,37 @@ class BrainClient:
             )
 
         usage = _usage_from_response(getattr(final_message, "usage", None), model=self._model)
-        return _assemble_decision_from_message(final_message, t_ms=t_ms, usage=usage)
+        decision = _assemble_decision_from_message(final_message, t_ms=t_ms, usage=usage)
+
+        # M4 R3d — schema-violation tail in the interviewer's voice.
+        # When post-stream validation rejects the tool_use input AND the
+        # candidate already heard partial audio, push a closing token
+        # through the SAME listener so the half-sentence resolves on a
+        # complete clause. Without this, the next dispatch may steelman
+        # an unrelated point and the candidate hears jarring jumps like
+        # "Walk me through capacit— [pause] — How would you partition?".
+        # Discriminate the row as `schema_violation_partial_recovery` so
+        # the eval harness can filter it; the router treats it the same
+        # as `schema_violation` for the consecutive-violations counter.
+        if decision.reason == "schema_violation" and utterance_high_water > 0:
+            try:
+                await utterance_listener(_SCHEMA_VIOLATION_TAIL)
+            except Exception:
+                log.exception(
+                    "brain.stream.schema_violation_tail_failed",
+                    t_ms=t_ms,
+                )
+            decision = BrainDecision.schema_violation(
+                decision.raw_input or None,
+                usage=usage,
+            )
+            decision = _replace_decision_reason(decision, "schema_violation_partial_recovery")
+            log.info(
+                "brain.stream.schema_violation_partial_recovery",
+                t_ms=t_ms,
+            )
+
+        return decision
 
     async def aclose(self) -> None:
         """Close the underlying httpx pool. Idempotent."""
@@ -472,6 +508,29 @@ def _extract_tool_block(response: Message) -> ToolUseBlock | None:
         if isinstance(block, ToolUseBlock) and block.name == INTERVIEW_DECISION_TOOL["name"]:
             return block
     return None
+
+
+def _replace_decision_reason(decision: BrainDecision, reason: str) -> BrainDecision:
+    """Return a copy of ``decision`` with a new ``reason`` discriminator.
+
+    Used for the streaming-path post-recovery cases where the decision
+    shape is otherwise unchanged but the reason needs a more specific
+    suffix for replay tooling. ``BrainDecision`` is a frozen dataclass,
+    so we materialise a new instance rather than mutating in place.
+    """
+    return BrainDecision(
+        decision=decision.decision,
+        priority=decision.priority,
+        confidence=decision.confidence,
+        reasoning=decision.reasoning,
+        utterance=decision.utterance,
+        can_be_skipped_if_stale=decision.can_be_skipped_if_stale,
+        state_updates=dict(decision.state_updates),
+        reason=reason,
+        usage=decision.usage,
+        raw_input=dict(decision.raw_input),
+        is_partial=decision.is_partial,
+    )
 
 
 def _assemble_decision_from_message(
