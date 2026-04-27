@@ -61,7 +61,22 @@ OPUS_4_7_RATES = TokenRates(
 )
 
 
-# Register both the provider-prefixed and bare Opus 4.7 ids so a snapshot
+# Haiku 4.5 rates. Re-verify against Anthropic's published rate card at
+# implementation time — these are the placeholder published rates as of
+# 2026-04 (input $1.00/M, output $5.00/M, cache write $1.25/M, cache
+# read $0.10/M). Used by `HaikuClient` for the per-session summary
+# compaction call (M4 Unit 5). Adding the Haiku id here is mandatory:
+# `estimate_cost_usd` raises `KeyError` on an unknown model id rather
+# than silently pricing it at zero — see the `BRAIN_RATES` comment.
+HAIKU_4_5_RATES = TokenRates(
+    input_per_token=1.0 / 1_000_000,
+    output_per_token=5.0 / 1_000_000,
+    cache_write_per_token=1.25 / 1_000_000,
+    cache_read_per_token=0.10 / 1_000_000,
+)
+
+
+# Register both the provider-prefixed and bare model ids so a snapshot
 # captured against one gateway still prices correctly when replayed
 # against another. Keep this list explicit rather than stripping the
 # prefix at lookup time — a silent prefix strip would also mask a real
@@ -69,6 +84,8 @@ OPUS_4_7_RATES = TokenRates(
 BRAIN_RATES: dict[str, TokenRates] = {
     "anthropic/claude-opus-4-7": OPUS_4_7_RATES,
     "claude-opus-4-7": OPUS_4_7_RATES,
+    "anthropic/claude-haiku-4-5": HAIKU_4_5_RATES,
+    "claude-haiku-4-5": HAIKU_4_5_RATES,
 }
 
 

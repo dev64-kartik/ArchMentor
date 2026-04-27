@@ -100,6 +100,16 @@ class Settings(BaseSettings):
         "`claude-opus-4-7` for direct Anthropic. Must be a key in "
         "`brain/pricing.py::BRAIN_RATES` or cost estimation raises.",
     )
+    brain_haiku_model: str = Field(
+        default="anthropic/claude-haiku-4-5",
+        description="Model id for the per-session summary compactor "
+        "(M4 Unit 5). Default is the Unbound provider-prefixed form; "
+        "set to `claude-haiku-4-5` for direct Anthropic. Must be a key "
+        "in `brain/pricing.py::BRAIN_RATES`. The compaction-trigger "
+        "threshold is intentionally NOT a Settings field — it lives as "
+        "the inline `_SUMMARY_COMPACTION_THRESHOLD` constant in "
+        "`brain/haiku_client.py` next to the prompt builder.",
+    )
 
     # ─── Redis ──────────────────────────────────────────────────────────
     # Plain str (not SecretStr): redis.asyncio.from_url consumes the URL
