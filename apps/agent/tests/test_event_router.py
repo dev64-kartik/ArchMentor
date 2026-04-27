@@ -77,6 +77,7 @@ def _make_router(
     log_events: list[tuple[str, dict[str, Any]]] | None = None,
     seed_state: SessionState | None = None,
     recovery_text: str = "",
+    streaming_tts_factory: Any = None,
 ) -> tuple[
     EventRouter,
     FakeBrainClient,
@@ -120,6 +121,7 @@ def _make_router(
         log_event=log,
         now_ms=clock.now,
         recovery_text=recovery_text,
+        streaming_tts_factory=streaming_tts_factory,
     )
     return router, brain, store, snapshots, queue, log_events, snapshot_tasks
 
@@ -1330,10 +1332,20 @@ async def test_dispatch_ttl_bump_extends_queued_utterance_freshness() -> None:
     # the dispatch's start→end window covers a 9-second wait.
     class _SlowBrain(FakeBrainClient):
         async def decide(  # type: ignore[override]
-            self, *, state: SessionState, event: dict[str, Any], t_ms: int
+            self,
+            *,
+            state: SessionState,
+            event: dict[str, Any],
+            t_ms: int,
+            utterance_listener: Any = None,
         ) -> Any:
             clock.advance(9_000)
-            return await super().decide(state=state, event=event, t_ms=t_ms)
+            return await super().decide(
+                state=state,
+                event=event,
+                t_ms=t_ms,
+                utterance_listener=utterance_listener,
+            )
 
     brain = _SlowBrain()
     brain.enqueue_stay_silent("slow")
@@ -1522,6 +1534,208 @@ def test_fingerprint_changes_with_transcript_turn_count(turn_count_a: int) -> No
         assert fp_a != fp_b
     finally:
         loop.close()
+
+
+# ─────────────────── M4 streaming TTS factory wiring ─────────────────
+
+
+class _FakeStreamingTtsHandle:
+    """Records every delta the listener received and exposes
+    `audio_played` so router tests can assert the queue-skip path."""
+
+    def __init__(self) -> None:
+        self.deltas: list[str] = []
+        self.closed = False
+
+    async def listener(self, delta: str) -> None:
+        self.deltas.append(delta)
+
+    @property
+    def audio_played(self) -> bool:
+        return bool(self.deltas)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_streaming_factory_skips_queue_push_on_speak() -> None:
+    """When a streaming factory is wired and the brain returns `speak`,
+    the listener fires (audio plays live) and the queue is NOT pushed —
+    the candidate already heard the utterance."""
+    handles: list[_FakeStreamingTtsHandle] = []
+
+    def factory() -> _FakeStreamingTtsHandle:
+        h = _FakeStreamingTtsHandle()
+        handles.append(h)
+        return h
+
+    brain = FakeBrainClient()
+    brain.enqueue_speak("Walk me through capacity.", confidence=0.9)
+    router, _, _, _, queue, _, snap_tasks = _make_router(brain=brain, streaming_tts_factory=factory)
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(handles) == 1
+    assert handles[0].audio_played is True
+    assert handles[0].closed is True
+    # Queue did NOT get the utterance — streaming consumed it.
+    assert len(queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_factory_queue_push_preserved_on_stay_silent() -> None:
+    """`stay_silent` decisions don't invoke the listener; `audio_played`
+    is False; legacy queue-push semantics are unaffected (queue stays
+    empty either way for stay_silent — the unit test confirms the
+    listener was not called and the handle still closed cleanly)."""
+    handles: list[_FakeStreamingTtsHandle] = []
+
+    def factory() -> _FakeStreamingTtsHandle:
+        h = _FakeStreamingTtsHandle()
+        handles.append(h)
+        return h
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("stay")
+    router, _, _, _, queue, _, snap_tasks = _make_router(brain=brain, streaming_tts_factory=factory)
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(handles) == 1
+    assert handles[0].audio_played is False
+    assert handles[0].closed is True
+    assert len(queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_factory_handle_closed_even_on_brain_error() -> None:
+    """If `decide` raises an unexpected exception, the streaming handle
+    must still close (router shouldn't leak the SynthesizeStream)."""
+    handles: list[_FakeStreamingTtsHandle] = []
+
+    def factory() -> _FakeStreamingTtsHandle:
+        h = _FakeStreamingTtsHandle()
+        handles.append(h)
+        return h
+
+    brain = FakeBrainClient()
+    brain.raise_on_call = RuntimeError("boom")
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain, streaming_tts_factory=factory)
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(handles) == 1
+    assert handles[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_factory_skipped_paths_dont_open_handle() -> None:
+    """Cost-capped / idempotent / cooldown skip paths short-circuit
+    BEFORE the brain call — they must not open a streaming TTS handle
+    (would leak a fresh SynthesizeStream per skipped tick under heavy
+    canvas churn)."""
+    handles: list[_FakeStreamingTtsHandle] = []
+
+    def factory() -> _FakeStreamingTtsHandle:
+        h = _FakeStreamingTtsHandle()
+        handles.append(h)
+        return h
+
+    # Seed a state already at the cost cap.
+    state = _make_state()
+    state = state.model_copy(update={"cost_usd_total": 10.0, "cost_cap_usd": 5.0})
+    router, _, _, _, _, _, snap_tasks = _make_router(
+        seed_state=state, streaming_tts_factory=factory
+    )
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    # No factory invocation when the dispatch short-circuits.
+    assert handles == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_partial_audio_suppresses_r27() -> None:
+    """M4 R3b — when partial audio played during a streaming dispatch
+    AND the brain decision was `brain_timeout`, R27 is suppressed (the
+    candidate would otherwise hear "Walk me throu— Let me come back to
+    that — please continue.")."""
+
+    class _Handle(_FakeStreamingTtsHandle):
+        async def listener(self, delta: str) -> None:
+            await super().listener(delta)
+
+    fired: list[dict[str, Any]] = []
+
+    def emitter(*, text: str, reason: str) -> None:
+        fired.append({"text": text, "reason": reason})
+
+    handle = _Handle()
+    # Simulate "the streaming brain emitted some `utterance` deltas,
+    # then timed out". We do this by manually marking `audio_played`
+    # before the router checks it — easiest way: pre-stuff `deltas`.
+    handle.deltas.append("Walk me throu")
+
+    def factory() -> _Handle:
+        return handle
+
+    brain = FakeBrainClient()
+    brain.enqueue(
+        BrainDecision.stay_silent("brain_timeout"),
+    )
+    router, _, _, _, _, _, snap_tasks = _make_router(
+        brain=brain, streaming_tts_factory=factory, recovery_text="recovery"
+    )
+    router._emit_synthetic = emitter  # type: ignore[assignment]
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    # R27 suppressed because partial audio played.
+    assert fired == []
+    # `_apology_used` flipped True so future timeouts also don't fire.
+    assert router._apology_used is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_no_partial_audio_still_fires_r27() -> None:
+    """Inverse of the above — when the brain emits `reasoning` only
+    (no utterance), `audio_played` is False and R27 fires normally."""
+    handles: list[_FakeStreamingTtsHandle] = []
+
+    def factory() -> _FakeStreamingTtsHandle:
+        h = _FakeStreamingTtsHandle()
+        handles.append(h)
+        return h
+
+    fired: list[dict[str, Any]] = []
+
+    def emitter(*, text: str, reason: str) -> None:
+        fired.append({"text": text, "reason": reason})
+
+    brain = FakeBrainClient()
+    brain.enqueue(BrainDecision.stay_silent("brain_timeout"))
+    router, _, _, _, _, _, snap_tasks = _make_router(
+        brain=brain, streaming_tts_factory=factory, recovery_text="recovery"
+    )
+    router._emit_synthetic = emitter  # type: ignore[assignment]
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(fired) == 1
+    assert fired[0]["reason"] == "brain_timeout"
 
 
 # Silence noisy structlog ERRORs from intentional brain.unexpected logs.

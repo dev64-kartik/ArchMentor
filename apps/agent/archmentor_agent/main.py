@@ -34,7 +34,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -624,6 +624,30 @@ class MentorAgent(Agent):
         """
         await self.session.say(text)
 
+    def _start_streaming_say(self, deltas: AsyncIterator[str]) -> Any:
+        """TTS hand-off seam for the streaming brain pipe (M4 Unit 4).
+
+        Production calls `self.session.say(deltas)` — passing an async
+        iterable of text fragments lets the framework's TTS pipeline
+        sentence-tokenise and synthesise live. Returns the framework's
+        `SpeechHandle`, which `_StreamingTtsHandle.aclose` awaits.
+
+        Tests override this method to capture the iterable without
+        needing a live `AgentSession` (which would otherwise raise
+        "no activity context found"). The default returns ``None`` when
+        no live session is available so a misconfigured test still
+        produces a clean `audio_played=False, closed=True` shape.
+        """
+        try:
+            session = self.session
+        except RuntimeError:
+            log.warning(
+                "agent.streaming_tts.no_session",
+                reason="agent_not_running",
+            )
+            return None
+        return session.say(deltas)
+
     async def handle_interim_transcript(self, text: str) -> None:
         """Mark the gate + cancel any in-flight brain call (barge-in).
 
@@ -1078,6 +1102,136 @@ class MentorAgent(Agent):
         return max(0, int(time.monotonic() * 1000) - self._t0_ms)
 
 
+class _StreamingTtsHandle:
+    """Per-dispatch streaming TTS context for the router.
+
+    Wraps `session.say(async_iterable)` so each brain `utterance` delta
+    streams into the framework's TTS pipeline as soon as the model
+    surfaces it. The framework tokenises the deltas on sentence
+    boundaries and feeds each sentence to `KokoroStreamingTTS.stream()`,
+    which synthesises through `kokoro.synthesize(...)` atomically and
+    pushes int16 PCM frames into the LiveKit audio output.
+
+    Lifecycle (one instance per `EventRouter._dispatch`):
+
+    - Construction: open an asyncio.Queue + start `session.say(gen())`
+      where `gen` yields whatever the router's listener pushes.
+    - `listener(delta)`: push the delta onto the queue (and flip
+      ``audio_played`` True).
+    - `aclose()`: signal end-of-stream, await the SpeechHandle's
+      playout. Cancellation propagates so the router invariant I2
+      stays intact (cancel mid-stream tears the SynthesizeStream down).
+    """
+
+    __slots__ = (
+        "_agent",
+        "_audio_played",
+        "_closed",
+        "_handle",
+        "_queue",
+        "_started",
+        "_streamed_text",
+    )
+
+    def __init__(self, agent: MentorAgent) -> None:
+        self._agent = agent
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._handle: Any = None
+        self._audio_played = False
+        self._closed = False
+        # The session.say handle is started lazily on the first listener
+        # invocation so a stay_silent decision (no listener calls) does
+        # not enqueue an empty say + spin up an unused SynthesizeStream.
+        self._started = False
+        # Accumulates the full streamed utterance so `aclose` can append
+        # an AI turn to `transcript_window` once playout finishes — the
+        # brain needs the AI's prior utterances visible across turns,
+        # and streaming bypasses the legacy `_drain_utterance_queue`
+        # path that would otherwise have done the append.
+        self._streamed_text: list[str] = []
+
+    @property
+    def listener(self) -> Callable[[str], Awaitable[None]]:
+        return self._on_delta
+
+    @property
+    def audio_played(self) -> bool:
+        return self._audio_played
+
+    async def _on_delta(self, delta: str) -> None:
+        if not delta:
+            return
+        if not self._started:
+            await self._start_say()
+            self._started = True
+        if self._handle is None:
+            # `_start_streaming_say` returned None — agent has no live
+            # session (test harness or session teardown race). Do NOT
+            # flip `audio_played`; the candidate didn't actually hear
+            # anything, so the router should fall through to the legacy
+            # queue.push path and `_drain_utterance_queue` can deliver
+            # via the M3 fallback if needed.
+            return
+        self._audio_played = True
+        self._streamed_text.append(delta)
+        await self._queue.put(delta)
+
+    async def _start_say(self) -> None:
+        async def _delta_generator() -> AsyncIterator[str]:
+            while True:
+                item = await self._queue.get()
+                if item is None:
+                    return
+                yield item
+
+        try:
+            self._handle = self._agent._start_streaming_say(_delta_generator())
+        except Exception:
+            log.exception("agent.streaming_tts.start_failed")
+            self._handle = None
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if not self._started:
+            # No deltas ever arrived → no SpeechHandle was opened; nothing
+            # to drain or wait on.
+            return
+        # Signal the async generator to terminate so `session.say`'s
+        # internal TTS pipeline knows there's no more text.
+        await self._queue.put(None)
+        handle = self._handle
+        if handle is None:
+            return
+        try:
+            await handle.wait_for_playout()
+        except asyncio.CancelledError:
+            # Cancellation must propagate so router invariant I2 holds.
+            raise
+        except Exception:
+            log.exception("agent.streaming_tts.playout_error")
+        # Audio has played (or attempted to play). Append the
+        # candidate-visible utterance to the transcript ledger + window
+        # — the legacy queue.push + `_drain_utterance_queue` path that
+        # would have done this is now skipped because the streaming
+        # factory consumed the audio. Skipping this append leaves the
+        # brain blind to its own prior utterances (transcript_window
+        # only gets candidate turns, ai turns vanish).
+        if self._audio_played and self._streamed_text:
+            full_text = "".join(self._streamed_text)
+            ai_t_ms = self._agent.now_relative_ms()
+            self._agent._log("utterance_ai", {"text": full_text, "speaker": "ai"})
+            try:
+                await self._agent._append_transcript_turn(
+                    speaker="ai",
+                    text=full_text,
+                    t_ms=ai_t_ms,
+                )
+            except Exception:
+                log.exception("agent.streaming_tts.transcript_append_failed")
+
+
 def build_brain_wiring(
     agent: MentorAgent,
     *,
@@ -1114,6 +1268,18 @@ def build_brain_wiring(
             return
         await agent._drain_utterance_queue()
 
+    # Streaming TTS factory (M4 Unit 4 / R5). The router calls this per
+    # `_dispatch` to obtain a fresh handle whose `listener` receives the
+    # brain's `utterance` deltas as they arrive. The handle wraps a
+    # `session.say(async_iterable)` invocation: each delta pushed by the
+    # brain becomes a yielded string, which the framework's TTS pipeline
+    # tokenises into sentences and pumps through `KokoroStreamingTTS`'s
+    # `SynthesizeStream`. Audio plays live during the brain call —
+    # candidate hears the first sentence within ~1-2 s instead of after
+    # the full Opus latency (7-15 s observed in M3 dogfood).
+    def _streaming_tts_factory() -> _StreamingTtsHandle:
+        return _StreamingTtsHandle(agent)
+
     router = EventRouter(
         session_id=agent.session_id,
         brain=brain,
@@ -1126,6 +1292,7 @@ def build_brain_wiring(
         synthetic_emitter=agent.emit_synthetic,
         recovery_text=SYNTHETIC_RECOVERY_UTTERANCE,
         pre_dispatch_callback=_drain_if_fresh,
+        streaming_tts_factory=_streaming_tts_factory,
     )
     return _BrainWiring(
         brain=brain,

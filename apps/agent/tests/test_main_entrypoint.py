@@ -11,6 +11,7 @@ the brain-loop wiring against lightweight fakes — real `EventRouter`,
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -332,10 +333,16 @@ class _FakeAgentSession:
     brain's utterance from `TURN_ACK_UTTERANCE` on the kill-switch
     path. The return value matches the `say()` shape the agent awaits
     for the opening utterance only.
+
+    The `streamed_*` lists capture utterances delivered through the
+    M4 streaming TTS path (`_start_streaming_say`); declared up front
+    so static type checkers see the attributes.
     """
 
     def __init__(self, *, raise_on_say: bool = False) -> None:
         self.said: list[str] = []
+        self.streamed_deltas: list[str] = []
+        self.streamed_full: list[str] = []
         self._raise_on_say = raise_on_say
 
     def say(self, text: str) -> _FakeSpeechHandle:
@@ -453,6 +460,33 @@ def _build_agent_under_test(
         fake_session.said.append(text)
 
     agent._say = fake_say  # ty: ignore[invalid-assignment]
+
+    # Streaming TTS test seam — `_start_streaming_say` is the M4 hand-off
+    # for `session.say(async_iterable)`. The fake collects each delta
+    # into `fake_session.streamed_deltas` so tests can assert "streaming
+    # path was used" without needing a live `AgentSession`.
+    # Lists are pre-allocated on `_FakeAgentSession.__init__`; just
+    # reset them here in case the harness is reused across tests.
+    fake_session.streamed_deltas.clear()
+    fake_session.streamed_full.clear()
+
+    def fake_start_streaming_say(deltas: AsyncIterator[str]) -> Any:
+        async def _drain() -> None:
+            collected: list[str] = []
+            async for delta in deltas:
+                fake_session.streamed_deltas.append(delta)
+                collected.append(delta)
+            fake_session.streamed_full.append("".join(collected))
+
+        task = asyncio.create_task(_drain(), name="fake.streaming_say")
+
+        class _FakeStreamingHandle:
+            async def wait_for_playout(self) -> None:
+                await task
+
+        return _FakeStreamingHandle()
+
+    agent._start_streaming_say = fake_start_streaming_say  # ty: ignore[invalid-assignment]
     # Prime the t0 clock so `_now_relative_ms` returns deterministic
     # values. `on_enter` would normally do this.
     agent._t0_ms = 0
@@ -477,7 +511,11 @@ async def test_brain_enabled_speaks_brain_utterance_not_static_ack() -> None:
     await agent.handle_user_input("I'd use a 7-char base62 code.")
     await _drain_tasks(agent)
 
-    assert fake_session.said == ["Tell me how you'd index the short codes."]
+    # Streaming TTS path is the M4 production default — the brain
+    # utterance flows through `_start_streaming_say`, NOT the legacy
+    # one-shot `session.say(text)`. Tests that exercise the brain →
+    # speech wiring should observe `streamed_full`.
+    assert fake_session.streamed_full == ["Tell me how you'd index the short codes."]
     event_types = [et for et, _ in ledger.appends]
     assert "utterance_candidate" in event_types
     assert "brain_decision" in event_types
@@ -672,7 +710,9 @@ async def test_scripted_multi_turn_session_records_all_decisions() -> None:
         await agent.handle_user_input(f"turn {idx}: requirements")
     await _drain_tasks(agent)
 
-    assert fake_session.said == ["probe 1", "probe 2", "probe 3"]
+    # Streaming TTS path delivers each speak utterance live; the legacy
+    # `_say` path is unused under M4.
+    assert fake_session.streamed_full == ["probe 1", "probe 2", "probe 3"]
     assert len(snapshots.posts) == 5
     decisions = [p for et, p in ledger.appends if et == "brain_decision"]
     assert len(decisions) == 5
@@ -971,6 +1011,50 @@ async def test_pre_dispatch_drain_skipped_when_candidate_speaking() -> None:
     assert "should not barge" not in fake_session.said
     # Item is still in the queue (drain didn't pop it).
     assert agent._brain.queue.peek_fresh() is not None
+
+
+# ─────────────────────── M4 streaming TTS handle ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_streaming_dispatch_routes_speak_through_streaming_path() -> None:
+    """End-to-end: brain.decide returns `speak` → router invokes the
+    streaming factory → `_StreamingTtsHandle.listener` pushes the
+    utterance through `_start_streaming_say` → `audio_played` is True
+    → router skips queue.push → drain finds no AI utterance → no AI
+    transcript turn appended via the legacy queue path."""
+    brain = FakeBrainClient()
+    brain.enqueue_speak("Walk me through capacity.", confidence=0.9)
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    await agent.handle_user_input("How many users do we expect?")
+    if agent._brain is not None and agent._brain.router._in_flight is not None:
+        await agent._brain.router._in_flight
+    await _drain_tasks(agent)
+
+    # Streaming path delivered the utterance, not legacy `_say`.
+    assert fake_session.streamed_full == ["Walk me through capacity."]
+    # Legacy `say()` was NOT used for the streaming utterance (only
+    # whatever the test scaffolding pushed during opening).
+    assert "Walk me through capacity." not in fake_session.said
+
+
+@pytest.mark.asyncio
+async def test_streaming_dispatch_stay_silent_does_not_open_say() -> None:
+    """`stay_silent` decisions never invoke the listener; the streaming
+    factory's lazy-start path means no `session.say` is ever scheduled
+    (no SynthesizeStream warmed up for an utterance that won't play)."""
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("listening")
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    await agent.handle_user_input("Quick check.")
+    if agent._brain is not None and agent._brain.router._in_flight is not None:
+        await agent._brain.router._in_flight
+    await _drain_tasks(agent)
+
+    assert fake_session.streamed_deltas == []
+    assert fake_session.streamed_full == []
 
 
 # Suppress unused-import warnings — these types are used via `cast`.

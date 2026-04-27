@@ -108,6 +108,42 @@ shutdown drain catches it. See `MentorAgent` Unit 7 wiring.
 """
 
 
+class StreamingTtsHandle(Protocol):
+    """Per-dispatch streaming TTS context owned by the router.
+
+    The agent supplies a factory (`streaming_tts_factory`) that builds
+    one handle per `_dispatch` invocation. The router passes the
+    handle's `listener` to `BrainClient.decide(utterance_listener=...)`,
+    which awaits it on each new portion of the streamed `utterance`
+    field. After `decide` returns (or raises), the router awaits
+    `aclose()` to flush any tail through TTS and tear down the stream.
+
+    `audio_played` reflects whether `listener` was ever invoked with
+    non-empty text — used to skip queue.push (streaming already
+    delivered the audio) and to suppress R27 (M4 R3b) when partial
+    audio reached the candidate's ear.
+    """
+
+    @property
+    def listener(self) -> Callable[[str], Awaitable[None]]: ...
+
+    @property
+    def audio_played(self) -> bool: ...
+
+    async def aclose(self) -> None: ...
+
+
+StreamingTtsFactory = Callable[[], StreamingTtsHandle]
+"""Returns a fresh `StreamingTtsHandle` for one dispatch.
+
+When None (legacy / replay / kill-switch), the router falls through
+to the M2/M3 push-to-queue + agent-side-drain flow. When set, the
+router opens a handle per dispatch, threads the listener through
+`BrainClient.decide`, and skips `_maybe_push_utterance` because the
+audio already played live.
+"""
+
+
 class SyntheticUtteranceEmitter(Protocol):
     """Subset of `MentorAgent._emit_synthetic` the router needs.
 
@@ -142,6 +178,7 @@ class EventRouter:
         synthetic_emitter: SyntheticUtteranceEmitter | None = None,
         recovery_text: str = "",
         pre_dispatch_callback: Callable[[], Awaitable[None]] | None = None,
+        streaming_tts_factory: StreamingTtsFactory | None = None,
     ) -> None:
         self._session_id = session_id
         self._brain = brain
@@ -161,6 +198,13 @@ class EventRouter:
         # starts, so a TURN_END speak that lost its dispatch slot to a
         # following CANVAS_CHANGE is delivered, not aged out.
         self._pre_dispatch_callback = pre_dispatch_callback
+
+        # Streaming TTS factory (M4 Unit 4). When set, each dispatch
+        # opens a fresh handle; the brain's `utterance` deltas pipe
+        # through it in real time (sentence-chunked Kokoro). When None,
+        # the legacy push-to-queue + agent-drain path runs unchanged
+        # (replay determinism / kill-switch).
+        self._streaming_tts_factory = streaming_tts_factory
 
         self._lock = asyncio.Lock()
         self._pending: list[RouterEvent] = []
@@ -374,6 +418,10 @@ class EventRouter:
             # idempotent/cooldown gates only meaningfully fire on a healthy
             # session.
             fingerprint = self._compute_fingerprint(state, merged)
+            # Declared at outer scope so `streamed_audio` below can
+            # observe it from any branch (skipped/cost-capped paths
+            # never open a handle).
+            tts_handle: StreamingTtsHandle | None = None
 
             if self._cost_capped or state.cost_usd_total >= state.cost_cap_usd:
                 self._cost_capped = True
@@ -406,19 +454,42 @@ class EventRouter:
                     event_type=merged.type.value,
                 )
             else:
+                # Open a streaming TTS handle for this dispatch when
+                # the agent registered a factory. The handle's listener
+                # is awaited inline by `BrainClient._decide_streaming`
+                # on each new portion of `utterance`; audio reaches the
+                # candidate live during the brain call. If no factory
+                # is registered, `BrainClient.decide` runs the legacy
+                # blocking path (`messages.create`).
+                if self._streaming_tts_factory is not None:
+                    tts_handle = self._streaming_tts_factory()
+                listener = tts_handle.listener if tts_handle is not None else None
                 try:
                     decision = await self._brain.decide(
                         state=state,
                         event=event_payload,
                         t_ms=snapshot_t_ms,
+                        utterance_listener=listener,
                     )
                 except asyncio.CancelledError:
                     # Router's outer loop re-prepends the batch; nothing to
-                    # write here because the call never completed.
+                    # write here because the call never completed. The
+                    # streaming TTS handle is closed in the `finally`
+                    # below (cancel flushes any pending sentence + tears
+                    # down the framework SynthesizeStream).
                     raise
                 except Exception:
                     log.exception("router.brain.unexpected", t_ms=snapshot_t_ms)
                     decision = BrainDecision.stay_silent("brain_unexpected")
+                finally:
+                    if tts_handle is not None:
+                        try:
+                            await tts_handle.aclose()
+                        except Exception:
+                            log.exception(
+                                "router.streaming_tts.close_error",
+                                t_ms=snapshot_t_ms,
+                            )
 
             # Apply state updates BEFORE pushing an utterance: rolling the
             # transcript / decisions log forward is the durable bit; if the
@@ -430,8 +501,14 @@ class EventRouter:
             self._emit_brain_decision_event(snapshot_t_ms, decision)
             self._update_violation_counter(decision)
             self._update_throttle_state(decision, fingerprint, merged, snapshot_t_ms)
-            self._maybe_push_utterance(decision, snapshot_t_ms)
-            self._maybe_emit_recovery_utterance(decision)
+            # Skip queue.push when streaming consumed the audio live —
+            # the candidate already heard it. Pre-streaming behaviour
+            # (push to queue, agent drains via `_drain_utterance_queue`)
+            # is preserved when no streaming factory is wired.
+            streamed_audio = tts_handle is not None and tts_handle.audio_played
+            if not streamed_audio:
+                self._maybe_push_utterance(decision, snapshot_t_ms)
+            self._maybe_emit_recovery_utterance(decision, partial_audio_played=streamed_audio)
         finally:
             # Bump TTLs of every queued utterance by the dispatch's
             # wall-clock duration. Runs even on cancellation so a
@@ -562,7 +639,12 @@ class EventRouter:
         self._consecutive_schema_violations = 0
         self._escalation_emitted = False
 
-    def _maybe_emit_recovery_utterance(self, decision: BrainDecision) -> None:
+    def _maybe_emit_recovery_utterance(
+        self,
+        decision: BrainDecision,
+        *,
+        partial_audio_played: bool = False,
+    ) -> None:
         """Fire R27's synthetic recovery utterance on brain timeout.
 
         Routes through `MentorAgent._emit_synthetic` (the speech-check
@@ -582,6 +664,14 @@ class EventRouter:
           deadline has elapsed. Functionally identical to a timeout from
           the candidate's perspective.
 
+        M4 R3b — when ``partial_audio_played`` is True (streaming TTS
+        already pushed at least one delta to the candidate's ear during
+        this dispatch), suppress the spoken recovery line. The half-
+        sentence the candidate already heard plus R24's elapsed-time
+        copy carries the visible signal; layering R27 on top produces
+        audible double-talk. Still flip ``_apology_used`` so R27 doesn't
+        re-attempt later in the same session.
+
         No-op when no `synthetic_emitter` was wired (tests / kill-
         switch paths) — the router stays callable without one.
         """
@@ -593,6 +683,12 @@ class EventRouter:
         if self._apology_used:
             return
         self._apology_used = True
+        if partial_audio_played:
+            log.info(
+                "agent.r27.suppressed_partial_played",
+                reason=decision.reason,
+            )
+            return
         self._emit_synthetic(text=self._recovery_text, reason=decision.reason or "brain_timeout")
 
     def _compute_fingerprint(self, state: SessionState, merged: RouterEvent) -> str:
