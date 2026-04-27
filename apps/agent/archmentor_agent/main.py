@@ -62,6 +62,10 @@ from archmentor_agent.brain.bootstrap import (
     build_dev_problem_card,
 )
 from archmentor_agent.brain.client import BrainClient
+from archmentor_agent.brain.haiku_client import (
+    _SUMMARY_COMPACTION_THRESHOLD,
+    HaikuClient,
+)
 from archmentor_agent.canvas import CanvasSnapshotClient, CanvasSnapshotClientConfig, parse_scene
 from archmentor_agent.config import Settings, get_settings
 from archmentor_agent.events.router import EventRouter
@@ -71,12 +75,17 @@ from archmentor_agent.queue import SpeechCheckGate, UtteranceQueue
 from archmentor_agent.snapshots.client import SnapshotClient, SnapshotClientConfig
 from archmentor_agent.state.redis_store import RedisCasExhaustedError, RedisSessionStore
 from archmentor_agent.state.session_state import (
+    PHASE_SOFT_BUDGETS_S,
     CanvasState,
+    InterviewPhase,
     PendingUtterance,
     ProblemCard,
     SessionState,
     TranscriptTurn,
+    _bucket_over_budget_pct,
+    _should_nudge,
 )
+from archmentor_agent.telemetry import SessionTelemetry
 
 AiState = Literal["speaking", "listening", "thinking"]
 AI_STATE_TOPIC = "ai_state"
@@ -93,15 +102,6 @@ class CanvasNoBaselineStateError(Exception):
 
 # Default 45-minute session budget, mirrors `InterviewSession.duration_s_planned`.
 _DEFAULT_SESSION_SECONDS = 2700
-
-# Rolling-transcript window cap (turns). The brain reads the full
-# `transcript_window` on every call, so an unbounded list would inflate
-# every prompt's token count linearly with session length. 30 turns =
-# roughly 2-3 minutes of conversation, matching the M2 plan's "verbatim,
-# last 2-3 min" intent. M4's Haiku session-summary compression replaces
-# this hard cap with summarise-and-trim semantics; until then this is
-# the single back-pressure on prompt size.
-_TRANSCRIPT_WINDOW_CAP = 30
 
 
 class TranscriptNoBaselineStateError(Exception):
@@ -159,6 +159,16 @@ CANVAS_SCENE_TOPIC = "canvas-scene"
 # a candidate would have to draw continuously for 60 seconds to hit it.
 CANVAS_RATE_LIMIT_EVENTS = 60
 CANVAS_RATE_LIMIT_WINDOW_S = 60.0
+
+# Phase-timer producer tick (M4 Unit 7). The loop wakes every 30 s,
+# checks elapsed-in-phase against `PHASE_SOFT_BUDGETS_S`, and dispatches
+# a `PHASE_TIMER` event when over budget. 30 s is a coarse cadence — at
+# 50% over a 5-min budget (i.e. 7m30s elapsed) the next tick fires
+# within 30 s, which is well below human salience for a soft budget
+# nudge. Dropping below 30 s would burn cycles for no candidate-perceived
+# improvement; raising above 60 s leaves an unacceptably long blind gap
+# at the bucket transitions (50 → 100 → 200%).
+_PHASE_TIMER_TICK_S = 30.0
 
 
 # Whisper emits bracketed sound tags on silence/non-speech:
@@ -260,6 +270,7 @@ class _BrainWiring:
     """
 
     brain: BrainClient
+    haiku: HaikuClient | None
     store: RedisSessionStore
     snapshot_client: SnapshotClient
     canvas_snapshot_client: CanvasSnapshotClient
@@ -360,6 +371,30 @@ class MentorAgent(Agent):
         # (`None`, not `bool`) and shutdown drains them in their own
         # asyncio.gather to keep the typing tight.
         self._synthetic_tasks: set[asyncio.Task[None]] = set()
+        # Per-session Haiku compactor tasks (M4 Unit 5). One in-flight
+        # at a time per session — `_summary_in_flight` is the gate.
+        # Drained in `shutdown` between `_synthetic_tasks` and the
+        # ledger drain so any in-flight Haiku call finishes cleanly
+        # before the HTTP pool closes; the resulting `summary_compressed`
+        # ledger row still needs the open ledger client to land.
+        self._summary_tasks: set[asyncio.Task[None]] = set()
+        self._summary_in_flight: bool = False
+        # Long-running per-session phase-timer producer (M4 Unit 7).
+        # Single asyncio.Task started from `on_enter`, cancelled in
+        # `shutdown`. Tracked as a single field (not a set) because at
+        # most one runs per session and shutdown can refer to it
+        # directly.
+        self._phase_timer_task: asyncio.Task[None] | None = None
+        # Per-phase last-nudge timestamps (in session-relative seconds)
+        # so the dedup gate can suppress repeated dispatches inside the
+        # 90 s window. Starts empty; the first nudge for a phase
+        # populates the entry.
+        self._phase_nudge_history: dict[InterviewPhase, int] = {}
+        # Six per-session counters surfaced as one structured-log line
+        # at session end. See `archmentor_agent.telemetry`. The router,
+        # queue, streaming TTS handle, and `_run_compaction` all
+        # increment through this object.
+        self._telemetry: SessionTelemetry = SessionTelemetry()
         # Serializes `_drain_utterance_queue` across concurrent
         # `_run_brain_turn` tasks. Without this, two rapid turn_end
         # finals (e.g. the noisy-room "Thank you." hallucination
@@ -399,6 +434,7 @@ class MentorAgent(Agent):
         # Surface the error, then unblock STT in `finally`.
         try:
             await self._initialize_brain_state(problem=self._bootstrap_problem)
+            self._start_phase_timer_task()
             await self._publish_state("speaking")
             log.info("agent.opening.say.begin", text=OPENING_UTTERANCE)
             # `allow_interruptions=False` keeps the intro playing through
@@ -468,6 +504,127 @@ class MentorAgent(Agent):
             problem_slug=state.problem.slug,
             cost_cap_usd=state.cost_cap_usd,
         )
+
+    def _start_phase_timer_task(self) -> None:
+        """Spawn the M4 Unit 7 phase-timer producer.
+
+        No-op when the brain is disabled or already started. The task
+        runs for the lifetime of the session; ``shutdown`` cancels it.
+        """
+        if not self._brain_enabled or self._brain is None:
+            return
+        if self._phase_timer_task is not None:
+            return
+        self._phase_timer_task = asyncio.create_task(
+            self._run_phase_timer_loop(),
+            name="agent.phase_timer",
+        )
+
+    async def _run_phase_timer_loop(self) -> None:
+        """Sleep ``_PHASE_TIMER_TICK_S``, evaluate, dispatch if over budget.
+
+        Each tick:
+
+        1. Load `SessionState` from Redis (no-op if evicted).
+        2. Compute ``elapsed_in_phase_s = state.elapsed_s - state.last_phase_change_s``.
+           ``state.elapsed_s`` is updated by other code paths (or
+           the agent's own clock) — for M4 we read the agent's own
+           ``now_relative_ms()`` because the brain dispatch path
+           doesn't yet refresh ``elapsed_s`` on every tick. The
+           comparison is then ``now_s - last_phase_change_s``, which
+           is the same quantity computed against a different anchor.
+        3. If `_should_nudge` returns True, dispatch a `PHASE_TIMER`
+           event with bucketed ``over_budget_pct_tier``.
+        4. Per-phase dedup history updated only on dispatch.
+
+        Lifecycle: cancelled by `shutdown`. ``CancelledError``
+        propagates so the surrounding ``asyncio.gather`` catches it.
+        """
+        if self._brain is None:
+            return
+        log.info("agent.phase_timer.started", tick_s=_PHASE_TIMER_TICK_S)
+        try:
+            while True:
+                await asyncio.sleep(_PHASE_TIMER_TICK_S)
+                try:
+                    await self._maybe_dispatch_phase_timer_tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Loop must survive any per-tick failure — a
+                    # transient Redis blip or schema-validation glitch
+                    # shouldn't kill the producer for the rest of the
+                    # session.
+                    log.exception("agent.phase_timer.tick_error")
+        except asyncio.CancelledError:
+            log.info("agent.phase_timer.cancelled")
+            raise
+
+    async def _maybe_dispatch_phase_timer_tick(self) -> None:
+        """One pass of the phase-timer loop. Pure logic; testable on its own."""
+        if self._brain is None:
+            return
+        state = await self._brain.store.load(self._session_id)
+        if state is None:
+            log.info("agent.phase_timer.tick.no_state")
+            return
+        now_s = self._now_relative_ms() // 1000
+        budget_s = PHASE_SOFT_BUDGETS_S.get(state.phase, 0)
+        elapsed_in_phase_s = max(0, now_s - state.last_phase_change_s)
+        last_nudge_s = self._phase_nudge_history.get(state.phase, -10_000)
+        if budget_s > 0:
+            over_budget_pct = max(0, int((elapsed_in_phase_s / budget_s - 1.0) * 100))
+        else:
+            over_budget_pct = 0
+        log.info(
+            "agent.phase_timer.tick",
+            phase=state.phase.value,
+            elapsed_in_phase_s=elapsed_in_phase_s,
+            over_budget_pct=over_budget_pct,
+            budget_s=budget_s,
+        )
+        if not _should_nudge(
+            elapsed_in_phase_s=elapsed_in_phase_s,
+            budget_s=budget_s,
+            last_nudge_s=last_nudge_s,
+            now_s=now_s,
+        ):
+            return
+        tier = _bucket_over_budget_pct(over_budget_pct)
+        await self._dispatch_phase_timer_event(
+            phase=state.phase, tier=tier, t_ms=self._now_relative_ms()
+        )
+        self._phase_nudge_history[state.phase] = now_s
+
+    async def _dispatch_phase_timer_event(
+        self,
+        *,
+        phase: InterviewPhase,
+        tier: int,
+        t_ms: int,
+    ) -> None:
+        """Emit one `PHASE_TIMER` `RouterEvent` with the bucketed tier payload."""
+        if self._brain is None:
+            return
+        event = RouterEvent(
+            type=EventType.PHASE_TIMER,
+            t_ms=t_ms,
+            payload={
+                "phase": phase.value,
+                "over_budget_pct_tier": tier,
+            },
+            priority=default_priority(EventType.PHASE_TIMER),
+        )
+        log.info(
+            "agent.phase_timer.dispatched",
+            phase=phase.value,
+            over_budget_pct_tier=tier,
+            t_ms=t_ms,
+        )
+        try:
+            await self._brain.router.handle(event)
+        except Exception:
+            log.exception("agent.phase_timer.router_handle_failed")
 
     async def handle_user_input(self, text: str) -> None:
         """Called from the session's `user_input_transcribed` final event.
@@ -668,9 +825,19 @@ class MentorAgent(Agent):
         Order matters (plan Unit 7 "Shutdown drain ordering"):
         router.drain() finishes the current dispatch and drops pending;
         `_snapshot_tasks` drains post-dispatch snapshot POSTs;
+        `_summary_tasks` drains the Haiku compactor;
         `_ledger_tasks` drains everything else; `store.delete` removes
         the no-TTL session key; client aclose() frees HTTP pools.
+
+        Cancel the phase-timer producer FIRST so a tick fired between
+        `await sleep(30)` and the router drain doesn't append a stale
+        `PHASE_TIMER` event the drain would just discard.
         """
+        if self._phase_timer_task is not None and not self._phase_timer_task.done():
+            self._phase_timer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._phase_timer_task
+
         if self._brain_enabled and self._brain is not None:
             log.info("agent.shutdown.router_drain.begin")
             await self._brain.router.drain()
@@ -693,6 +860,17 @@ class MentorAgent(Agent):
                     count=len(self._synthetic_tasks),
                 )
                 await asyncio.gather(*self._synthetic_tasks, return_exceptions=True)
+            if self._summary_tasks:
+                # Drain Haiku compactor tasks AFTER the router and
+                # synthetic tasks but BEFORE the ledger drain — a
+                # successful compaction emits a `summary_compressed`
+                # ledger row that the ledger client must still be open
+                # to ship.
+                log.info(
+                    "agent.shutdown.drain_summary_tasks",
+                    count=len(self._summary_tasks),
+                )
+                await asyncio.gather(*self._summary_tasks, return_exceptions=True)
 
         if self._ledger_tasks:
             log.info(
@@ -708,6 +886,14 @@ class MentorAgent(Agent):
             # absence is visible during teardown debugging.
             with contextlib.suppress(Exception):
                 await self._brain.store.delete(self._session_id)
+
+        # Emit one structured telemetry log line per session. Replay
+        # tooling and the M4 dogfood gate parse this line; emitting
+        # AFTER all task drains gives the histogram every TTFA sample
+        # produced by the streaming TTS path during this session.
+        # The line emits even on the kill-switch path so the log shape
+        # is stable across configurations (counters will be zero).
+        log.info("agent.session.telemetry", **self._telemetry.as_log_payload())
 
     async def _publish_state(self, state: AiState) -> None:
         """Tell the browser which phase the agent is in.
@@ -1020,11 +1206,15 @@ class MentorAgent(Agent):
         the next ``decide(...)`` reads a state that already includes the
         just-emitted turn.
 
-        Capped at ``_TRANSCRIPT_WINDOW_CAP`` turns. Older entries are
-        dropped from the head. M4 replaces the hard cap with a Haiku
-        session-summary compression cycle (``session_summary`` field
-        accumulates compressed history; transcript_window holds the
-        recent uncompressed tail).
+        Compaction (M4 Unit 5): on threshold-crossing
+        (``len(transcript_window) > _SUMMARY_COMPACTION_THRESHOLD``)
+        and when no compactor is in flight, a fire-and-forget
+        ``_run_compaction`` task is spawned. The CAS append itself
+        does NOT truncate; the compactor's CAS apply removes the
+        compressed turns from the head once Haiku returns. Until then
+        the window may carry threshold + N turns, which is well within
+        the prompt-cost budget (Haiku is bounded by N here, not by the
+        full window growth rate).
         """
         if self._brain is None:
             # Static-ack path or brain disabled — no Redis state to update.
@@ -1044,14 +1234,10 @@ class MentorAgent(Agent):
                     "no baseline state for transcript_window apply"
                 )
             updated_window = [*current.transcript_window, new_turn]
-            if len(updated_window) > _TRANSCRIPT_WINDOW_CAP:
-                # Drop oldest. M4 will replace this with summarise-into
-                # `session_summary` before discarding.
-                updated_window = updated_window[-_TRANSCRIPT_WINDOW_CAP:]
             return current.model_copy(update={"transcript_window": updated_window})
 
         try:
-            await store.apply(self._session_id, _mutator)
+            applied = await store.apply(self._session_id, _mutator)
         except TranscriptNoBaselineStateError:
             log.warning(
                 "agent.transcript.no_baseline_state",
@@ -1059,6 +1245,7 @@ class MentorAgent(Agent):
                 t_ms=t_ms,
                 speaker=speaker,
             )
+            return
         except RedisCasExhaustedError:
             # Brain may see a one-cycle-stale transcript on the next
             # dispatch; subsequent turns still append cleanly.
@@ -1068,6 +1255,180 @@ class MentorAgent(Agent):
                 t_ms=t_ms,
                 speaker=speaker,
             )
+            return
+
+        # Threshold-triggered compaction (M4 Unit 5). Only attempted
+        # when a Haiku client is wired AND no compactor is already
+        # running for this session. The compactor's CAS apply runs
+        # outside this CAS so the threshold-crossing tick may briefly
+        # observe a window of size THRESHOLD + 1; the compactor's
+        # mutator drops the oldest N turns once Haiku returns.
+        if (
+            self._brain.haiku is not None
+            and not self._summary_in_flight
+            and len(applied.transcript_window) > _SUMMARY_COMPACTION_THRESHOLD
+        ):
+            self._summary_in_flight = True
+            task = asyncio.create_task(self._run_compaction())
+            self._summary_tasks.add(task)
+            task.add_done_callback(self._summary_tasks.discard)
+
+    async def _run_compaction(self) -> None:
+        """Compact the oldest N transcript turns into ``session_summary``.
+
+        Spawned by ``_append_transcript_turn`` when the rolling window
+        crosses ``_SUMMARY_COMPACTION_THRESHOLD`` and no compactor is
+        already running. Steps:
+
+        1. Load current state from Redis.
+        2. Slice the oldest ``len(window) - threshold`` turns.
+        3. Call Haiku synchronously (one HTTP call, ~sub-second).
+        4. CAS-apply: append the new summary fragment to ``session_summary``,
+           drop the compressed turns from ``transcript_window``, and roll
+           in the Haiku call's token + cost usage.
+        5. Write a ``summary_compressed`` ledger row + telemetry counter.
+
+        Failure modes (all degrade to "log + skip; next threshold tick
+        retries"):
+
+        - Haiku raises (5xx, timeout, connection): logged as
+          ``agent.summary.compaction.failed``; ledger row records
+          ``summary_compression_failed``; ``_summary_in_flight`` is
+          released so the next threshold tick can try again.
+        - ``RedisCasExhaustedError``: log + skip. ``transcript_window``
+          keeps growing; the next tick sees a window N+1 and retries.
+          One missed compaction means the prompt carries a few extra
+          turns until the next attempt — well within budget.
+        - ``current is None`` (Redis evicted): log + skip; the agent's
+          other code paths will rebuild state on next interaction.
+
+        Telemetry: ``compactions_run`` increments at the TOP, before
+        any await — counts compactor ATTEMPTS (the threshold fired and
+        we entered the body), not Haiku calls billed. Failed
+        compactions show up separately in ``agent.summary.compaction.failed``.
+
+        Concurrency: ``_summary_in_flight`` is set BEFORE this task is
+        spawned and reset in ``finally`` here. The caller must NOT spawn
+        a second task while the flag is True.
+        """
+        self._telemetry.record_compaction()
+        if self._brain is None or self._brain.haiku is None:
+            self._summary_in_flight = False
+            return
+        store = self._brain.store
+        haiku = self._brain.haiku
+        session_id = self._session_id
+        try:
+            current = await store.load(session_id)
+            if current is None:
+                log.warning("agent.summary.compaction.no_baseline_state")
+                return
+            excess = len(current.transcript_window) - _SUMMARY_COMPACTION_THRESHOLD
+            if excess <= 0:
+                # The window shrank between the trigger and the load —
+                # another writer (e.g. a prior compactor's CAS apply or
+                # transcript-side rollback we don't currently emit) got
+                # there first. Nothing to do.
+                return
+            dropped_turns = list(current.transcript_window[:excess])
+            existing_summary = current.session_summary
+
+            log.info(
+                "agent.summary.compaction.begin",
+                session_id=str(session_id),
+                dropped_turns=len(dropped_turns),
+                summary_chars_before=len(existing_summary),
+                window_size=len(current.transcript_window),
+            )
+            try:
+                new_summary, usage = await haiku.compress(
+                    existing_summary=existing_summary,
+                    dropped_turns=dropped_turns,
+                )
+            except Exception:
+                log.exception(
+                    "agent.summary.compaction.failed",
+                    session_id=str(session_id),
+                    dropped_turns=len(dropped_turns),
+                )
+                self._log(
+                    "summary_compression_failed",
+                    {"dropped_turns": len(dropped_turns)},
+                )
+                return
+
+            # Capture the pre-apply summary length for the post-apply
+            # log line; the `_mutator` closure may run multiple times
+            # under CAS retry and `s.session_summary` reflects whatever
+            # Redis had on the last successful read, so reading it
+            # outside the loop gives a stable "before" measurement.
+            summary_chars_before_apply = len(existing_summary)
+
+            def _mutator(s: SessionState | None) -> SessionState:
+                # `s` here is whatever Redis has now — may have
+                # additional turns appended by the candidate-handler
+                # CAS while Haiku was running. We drop the same
+                # ``excess`` count (the oldest turns) because those are
+                # what the summary was built from; newer turns at the
+                # tail are preserved.
+                if s is None:
+                    raise TranscriptNoBaselineStateError("no baseline state for compaction apply")
+                sep = "\n\n" if s.session_summary else ""
+                merged_summary = f"{s.session_summary}{sep}{new_summary}".strip()
+                # Defensive: if Haiku produced an empty summary, do not
+                # overwrite the existing one with the separator-only string.
+                effective_summary = merged_summary if new_summary else s.session_summary
+                return s.model_copy(
+                    update={
+                        "transcript_window": list(s.transcript_window[excess:]),
+                        "session_summary": effective_summary,
+                        "tokens_input_total": s.tokens_input_total + usage.tokens_input_total,
+                        "tokens_output_total": s.tokens_output_total + usage.output_tokens,
+                        "cost_usd_total": s.cost_usd_total + usage.cost_usd,
+                    }
+                )
+
+            try:
+                applied = await store.apply(session_id, _mutator)
+            except TranscriptNoBaselineStateError:
+                log.warning(
+                    "agent.summary.compaction.no_baseline_state",
+                    session_id=str(session_id),
+                )
+                return
+            except RedisCasExhaustedError:
+                log.error(
+                    "agent.summary.compaction.cas_exhausted",
+                    session_id=str(session_id),
+                    dropped_turns=len(dropped_turns),
+                )
+                return
+
+            log.info(
+                "agent.summary.compaction.end",
+                session_id=str(session_id),
+                dropped_turns=len(dropped_turns),
+                summary_chars_before=summary_chars_before_apply,
+                summary_chars_after=len(applied.session_summary),
+                cost_usd=usage.cost_usd,
+            )
+            # The `summary_compressed` ledger row needs Unit 6's API
+            # enum extension (`SUMMARY_COMPRESSED`) to land in the API
+            # before the agent emits — the ingest route 422s otherwise.
+            # Unit 6 has shipped (commit `883f807`), so this is safe.
+            self._log(
+                "summary_compressed",
+                {
+                    "dropped_turns": len(dropped_turns),
+                    "summary_chars_before": summary_chars_before_apply,
+                    "summary_chars_after": len(applied.session_summary),
+                    "cost_usd": usage.cost_usd,
+                    "tokens_input": usage.tokens_input_total,
+                    "tokens_output": usage.output_tokens,
+                },
+            )
+        finally:
+            self._summary_in_flight = False
 
     def log_event(self, event_type: str, payload: dict[str, Any]) -> None:
         """Router → ledger shim.
@@ -1127,6 +1488,7 @@ class _StreamingTtsHandle:
         "_agent",
         "_audio_played",
         "_closed",
+        "_dispatch_start_ms",
         "_handle",
         "_queue",
         "_started",
@@ -1149,6 +1511,14 @@ class _StreamingTtsHandle:
         # and streaming bypasses the legacy `_drain_utterance_queue`
         # path that would otherwise have done the append.
         self._streamed_text: list[str] = []
+        # Capture the dispatch's wall-clock origin at handle construction
+        # so `_on_delta` can compute time-to-first-audio (TTFA) on the
+        # first non-empty delta. The router builds this handle at the
+        # top of `_dispatch` (before `decide()`), so this anchors TTFA
+        # to "router started reasoning" — matches the candidate's
+        # perceived latency from "I stopped speaking" to "agent voice
+        # starts," modulo the small router-entry overhead.
+        self._dispatch_start_ms = agent.now_relative_ms()
 
     @property
     def listener(self) -> Callable[[str], Awaitable[None]]:
@@ -1172,6 +1542,19 @@ class _StreamingTtsHandle:
             # queue.push path and `_drain_utterance_queue` can deliver
             # via the M3 fallback if needed.
             return
+        # First non-empty delta that actually reaches the live session:
+        # record TTFA (M4 R4 / Unit 5). Sample the clock once and only
+        # when `_audio_played` is about to flip — subsequent deltas in
+        # the same dispatch are not first-audio events.
+        if not self._audio_played:
+            ttfa_ms = self._agent.now_relative_ms() - self._dispatch_start_ms
+            if ttfa_ms < 0:
+                ttfa_ms = 0
+            self._agent._telemetry.record_ttfa_ms(ttfa_ms)
+            log.info(
+                "agent.streaming_tts.ttfa",
+                ttfa_ms=ttfa_ms,
+            )
         self._audio_played = True
         self._streamed_text.append(delta)
         await self._queue.put(delta)
@@ -1239,6 +1622,7 @@ def build_brain_wiring(
     store: RedisSessionStore,
     snapshot_client: SnapshotClient,
     canvas_snapshot_client: CanvasSnapshotClient,
+    haiku: HaikuClient | None = None,
 ) -> _BrainWiring:
     """Construct the per-session brain collaborators.
 
@@ -1248,8 +1632,23 @@ def build_brain_wiring(
     rather than fetched here — tests can pass mock implementations,
     and production's `entrypoint` resolves them via the `get_*`
     helpers before calling.
+
+    `haiku` is optional so existing tests that don't exercise the
+    summary compactor can omit it; production wires it via
+    `get_haiku_client(settings)` from `entrypoint`. When omitted, the
+    rolling transcript window grows unbounded (per-call prompt-token
+    cost climbs linearly) — kept as the deliberate fallback for
+    replay/dev paths that don't want network calls during tests.
     """
-    queue = UtteranceQueue(agent.now_relative_ms)
+
+    # `on_stale` increments the dropped-stale telemetry counter every
+    # time the queue discards a `PendingUtterance`. Both freshness
+    # paths (TTL drop in `pop_if_fresh` / `peek_fresh` and turn-supersede
+    # in `clear_stale_on_new_turn`) call back through this single hook.
+    def _on_stale(_utterance: PendingUtterance) -> None:
+        agent._telemetry.record_dropped_stale()
+
+    queue = UtteranceQueue(agent.now_relative_ms, on_stale=_on_stale)
     gate = SpeechCheckGate(agent.now_relative_ms)
 
     # Pre-dispatch hook (Unit 2 / R22). Closure so the router can ask
@@ -1293,9 +1692,11 @@ def build_brain_wiring(
         recovery_text=SYNTHETIC_RECOVERY_UTTERANCE,
         pre_dispatch_callback=_drain_if_fresh,
         streaming_tts_factory=_streaming_tts_factory,
+        telemetry=agent._telemetry,
     )
     return _BrainWiring(
         brain=brain,
+        haiku=haiku,
         store=store,
         snapshot_client=snapshot_client,
         canvas_snapshot_client=canvas_snapshot_client,
@@ -1414,6 +1815,7 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     if settings.brain_enabled:
         from archmentor_agent.brain.client import get_brain_client
+        from archmentor_agent.brain.haiku_client import get_haiku_client
         from archmentor_agent.state.redis_store import get_redis_store
 
         mentor.attach_brain(
@@ -1423,6 +1825,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 store=get_redis_store(settings),
                 snapshot_client=snapshot_client,
                 canvas_snapshot_client=canvas_snapshot_client,
+                haiku=get_haiku_client(settings),
             )
         )
 

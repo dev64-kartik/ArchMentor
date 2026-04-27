@@ -1772,5 +1772,211 @@ async def test_streaming_no_partial_audio_still_fires_r27() -> None:
     assert fired[0]["reason"] == "brain_timeout"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# M4 Unit 8 — counter-argument FSM end-to-end (router → CAS → state)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _argument_speak_decision(
+    *,
+    new_active_argument: dict[str, Any] | None,
+    utterance: str = "Are you sure about consistency here?",
+) -> BrainDecision:
+    """Build a `speak` BrainDecision carrying ``new_active_argument`` in
+    state_updates. Used to drive the router's FSM end-to-end."""
+    return BrainDecision(
+        decision="speak",
+        priority="medium",
+        confidence=0.9,
+        reasoning="probing",
+        utterance=utterance,
+        state_updates={"new_active_argument": new_active_argument},
+    )
+
+
+def _stay_silent_with_state_updates(state_updates: dict[str, Any]) -> BrainDecision:
+    """Build a `stay_silent` decision that DOES carry state_updates so the
+    router still applies the FSM (covers the omitted-key path).
+    """
+    return BrainDecision(
+        decision="stay_silent",
+        priority="low",
+        confidence=0.0,
+        reasoning="",
+        state_updates=state_updates,
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_opens_and_advances_argument_across_three_turns() -> None:
+    """Three turns on the same topic → rounds = 1, 2, 3."""
+    brain = FakeBrainClient()
+    brain.enqueue(
+        _argument_speak_decision(
+            new_active_argument={
+                "topic": "consistency",
+                "candidate_pushed_back": False,
+            }
+        )
+    )
+    brain.enqueue(
+        _argument_speak_decision(
+            new_active_argument={
+                "topic": "consistency",
+                "candidate_pushed_back": True,
+            }
+        )
+    )
+    brain.enqueue(
+        _argument_speak_decision(
+            new_active_argument={
+                "topic": "consistency",
+                "candidate_pushed_back": True,
+            }
+        )
+    )
+    router, _, store, _, _, _, snap_tasks = _make_router(brain=brain)
+
+    for i in range(3):
+        await router.handle(
+            RouterEvent(EventType.TURN_END, t_ms=1_000 + i * 1_000, payload={"text": "t"})
+        )
+        await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    final = await store.load(SESSION_ID)
+    assert final is not None
+    assert final.active_argument is not None
+    assert final.active_argument.topic == "consistency"
+    assert final.active_argument.rounds == 3
+    # opened_at_ms preserved from the very first opener.
+    assert final.active_argument.opened_at_ms <= 1_000
+
+
+@pytest.mark.asyncio
+async def test_router_explicit_null_closes_open_argument() -> None:
+    """First turn opens; second turn emits explicit `null` → cleared."""
+    brain = FakeBrainClient()
+    brain.enqueue(
+        _argument_speak_decision(
+            new_active_argument={
+                "topic": "consistency",
+                "candidate_pushed_back": False,
+            }
+        )
+    )
+    brain.enqueue(_argument_speak_decision(new_active_argument=None, utterance="Moving on."))
+    router, _, store, _, _, _, snap_tasks = _make_router(brain=brain)
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "a"}))
+    await _await_loop(router)
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=2_000, payload={"text": "b"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    final = await store.load(SESSION_ID)
+    assert final is not None
+    assert final.active_argument is None
+
+
+@pytest.mark.asyncio
+async def test_router_omitted_key_preserves_open_argument() -> None:
+    """A turn whose `state_updates` omits `new_active_argument` keeps prior."""
+    brain = FakeBrainClient()
+    brain.enqueue(
+        _argument_speak_decision(
+            new_active_argument={
+                "topic": "consistency",
+                "candidate_pushed_back": False,
+            }
+        )
+    )
+    # Second turn: state_updates carries OTHER keys but NOT new_active_argument.
+    brain.enqueue(
+        _stay_silent_with_state_updates({"session_summary_append": "Candidate elaborated."})
+    )
+    router, _, store, _, _, _, snap_tasks = _make_router(brain=brain)
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "a"}))
+    await _await_loop(router)
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=2_000, payload={"text": "b"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    final = await store.load(SESSION_ID)
+    assert final is not None
+    assert final.active_argument is not None
+    assert final.active_argument.topic == "consistency"
+    assert final.active_argument.rounds == 1
+
+
+@pytest.mark.asyncio
+async def test_router_different_topic_starts_fresh_argument() -> None:
+    brain = FakeBrainClient()
+    brain.enqueue(
+        _argument_speak_decision(
+            new_active_argument={
+                "topic": "consistency",
+                "candidate_pushed_back": False,
+            }
+        )
+    )
+    brain.enqueue(
+        _argument_speak_decision(
+            new_active_argument={
+                "topic": "caching_strategy",
+                "candidate_pushed_back": False,
+            }
+        )
+    )
+    router, _, store, _, _, _, snap_tasks = _make_router(brain=brain)
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "a"}))
+    await _await_loop(router)
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=2_000, payload={"text": "b"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    final = await store.load(SESSION_ID)
+    assert final is not None
+    assert final.active_argument is not None
+    assert final.active_argument.topic == "caching_strategy"
+    assert final.active_argument.rounds == 1
+
+
+@pytest.mark.asyncio
+async def test_router_passes_now_ms_to_enable_stale_auto_clear() -> None:
+    """A prior at rounds=0 older than 3 minutes auto-clears even if the brain
+    omits `new_active_argument` on this turn. Pre-seed the store with a
+    stale opener; the router's `_apply_decision` passes `now_ms=t_ms` to
+    `with_state_updates`, which triggers the safety-net branch.
+    """
+    from archmentor_agent.state.session_state import ActiveArgument
+
+    state = _make_state()
+    seeded = state.model_copy(
+        update={
+            "active_argument": ActiveArgument(
+                topic="leaked_topic",
+                opened_at_ms=0,
+                rounds=0,
+                candidate_pushed_back=False,
+            ),
+        }
+    )
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("nothing to add")
+    router, _, store, _, _, _, snap_tasks = _make_router(brain=brain, seed_state=seeded)
+
+    # t_ms = 200_000 ms = 200 s > the 180 s stale window.
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=200_000, payload={"text": "x"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    final = await store.load(SESSION_ID)
+    assert final is not None
+    assert final.active_argument is None
+
+
 # Silence noisy structlog ERRORs from intentional brain.unexpected logs.
 logging.getLogger("archmentor_agent.events.router").setLevel(logging.CRITICAL)

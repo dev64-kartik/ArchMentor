@@ -144,6 +144,23 @@ audio already played live.
 """
 
 
+class TelemetryRecorder(Protocol):
+    """Subset of `SessionTelemetry` the router needs.
+
+    The router increments three counters: total brain calls (every
+    dispatch, including router-side skips so the throttle's
+    effectiveness is computable as ``skipped/calls``), idempotent
+    short-circuits, and cooldown short-circuits. Decoupled via Protocol
+    so the router doesn't import the agent's telemetry module
+    directly — keeps the dependency graph one-directional and lets
+    tests pass a list-appending fake.
+    """
+
+    def record_brain_call(self) -> None: ...
+    def record_skipped_idempotent(self) -> None: ...
+    def record_skipped_cooldown(self) -> None: ...
+
+
 class SyntheticUtteranceEmitter(Protocol):
     """Subset of `MentorAgent._emit_synthetic` the router needs.
 
@@ -179,6 +196,7 @@ class EventRouter:
         recovery_text: str = "",
         pre_dispatch_callback: Callable[[], Awaitable[None]] | None = None,
         streaming_tts_factory: StreamingTtsFactory | None = None,
+        telemetry: TelemetryRecorder | None = None,
     ) -> None:
         self._session_id = session_id
         self._brain = brain
@@ -205,6 +223,14 @@ class EventRouter:
         # the legacy push-to-queue + agent-drain path runs unchanged
         # (replay determinism / kill-switch).
         self._streaming_tts_factory = streaming_tts_factory
+
+        # Telemetry recorder (M4 Unit 5 / R4). Optional so the kill-
+        # switch and test paths that don't care about session-end counts
+        # can omit it. Three increment hooks: every dispatch entry
+        # (`record_brain_call`), the idempotent short-circuit, and the
+        # cooldown short-circuit. Aggregate ratios are computed at
+        # session-end by `MentorAgent.shutdown`.
+        self._telemetry = telemetry
 
         self._lock = asyncio.Lock()
         self._pending: list[RouterEvent] = []
@@ -434,6 +460,8 @@ class EventRouter:
                 )
             elif self._should_skip_idempotent(fingerprint, merged):
                 decision = BrainDecision.skipped_idempotent()
+                if self._telemetry is not None:
+                    self._telemetry.record_skipped_idempotent()
                 log.info(
                     "router.cost_throttle.skipped",
                     reason="skipped_idempotent",
@@ -445,6 +473,8 @@ class EventRouter:
             elif self._should_skip_cooldown(snapshot_t_ms, merged):
                 cooldown_ms = self._active_cooldown_ms()
                 decision = BrainDecision.skipped_cooldown(cooldown_ms=cooldown_ms)
+                if self._telemetry is not None:
+                    self._telemetry.record_skipped_cooldown()
                 log.info(
                     "router.cost_throttle.skipped",
                     reason="stay_silent_backoff",
@@ -491,6 +521,14 @@ class EventRouter:
                                 t_ms=snapshot_t_ms,
                             )
 
+            # Telemetry: count every dispatch entry here, AFTER the
+            # decision is fixed — captures cost-capped, idempotent, and
+            # cooldown short-circuits on the same axis as a real Anthropic
+            # call so the dogfood gate can read throttle effectiveness as
+            # ``skipped/calls`` (R4 / Unit 5).
+            if self._telemetry is not None:
+                self._telemetry.record_brain_call()
+
             # Apply state updates BEFORE pushing an utterance: rolling the
             # transcript / decisions log forward is the durable bit; if the
             # process dies before TTS plays, the decision is still in Redis
@@ -534,6 +572,18 @@ class EventRouter:
         mute for the rest of the session is worse.
         """
         usage = decision.usage
+        # M4 Unit 8 — counter-argument FSM. The schema for
+        # `new_active_argument` is `{type: ["object", "null"]}`; the
+        # brain emits an object to set/replace, an explicit `null` to
+        # close, and OMITS the key for "no change." `BrainDecision.state_updates`
+        # is `dict(tool_input.get("state_updates") or {})`, which
+        # preserves the inner-key presence and any explicit-null value
+        # — so we can derive `key_present` from the decision directly
+        # without needing the raw `tool_input` dict the router never
+        # receives. Replay-deterministic: pre-M4 snapshots have no
+        # `new_active_argument` key → `key_present=False` → resolver
+        # preserves prior unchanged (matches M2/M3-era semantics).
+        key_present_for_active_argument = "new_active_argument" in decision.state_updates
 
         def _mutator(current: SessionState | None) -> SessionState:
             base = current or baseline
@@ -549,9 +599,18 @@ class EventRouter:
             # NOT match SessionState field names. `with_state_updates`
             # translates them and re-validates — a direct `model_copy`
             # would silently drop them.
-            if decision.state_updates:
-                updated = updated.with_state_updates(dict(decision.state_updates))
-            return updated
+            #
+            # Also pass `now_ms=t_ms` so the M4 Unit 8 stale-opener
+            # auto-clear (3 min, rounds=0) can fire even when the brain
+            # didn't emit `new_active_argument` this turn. Always call
+            # the helper (even when `decision.state_updates` is empty)
+            # so the auto-clear branch isn't conditional on the brain
+            # speaking — that would defeat the safety-net invariant.
+            return updated.with_state_updates(
+                dict(decision.state_updates),
+                key_present_for_active_argument=key_present_for_active_argument,
+                now_ms=t_ms,
+            )
 
         try:
             return await self._store.apply(self._session_id, _mutator)
@@ -914,4 +973,5 @@ __all__ = [
     "LedgerLogger",
     "SnapshotScheduler",
     "SyntheticUtteranceEmitter",
+    "TelemetryRecorder",
 ]

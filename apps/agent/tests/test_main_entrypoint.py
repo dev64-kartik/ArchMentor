@@ -404,6 +404,40 @@ def _seed_state(cost_usd_total: float = 0.0, cost_cap_usd: float = 5.0) -> Sessi
     )
 
 
+class FakeHaikuClient:
+    """Records compaction calls; returns a scripted summary text."""
+
+    def __init__(
+        self,
+        *,
+        summary_text: str = "[compressed summary]",
+        cost_usd: float = 0.001,
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self.summary_text = summary_text
+        self.cost_usd = cost_usd
+        self.raise_exc = raise_exc
+        self.calls: list[tuple[str, list[str]]] = []
+
+    async def compress(
+        self,
+        *,
+        existing_summary: str,
+        dropped_turns: list[Any],
+    ) -> tuple[str, BrainUsage]:
+        self.calls.append((existing_summary, [t.text for t in dropped_turns]))
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.summary_text, BrainUsage(
+            input_tokens=120,
+            output_tokens=40,
+            cost_usd=self.cost_usd,
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
 def _build_agent_under_test(
     *,
     brain_enabled: bool,
@@ -413,6 +447,7 @@ def _build_agent_under_test(
     canvas_snapshots: FakeCanvasSnapshotClient | None = None,
     seed_state: SessionState | None = None,
     session_raises: bool = False,
+    haiku: FakeHaikuClient | None = None,
 ) -> tuple[
     MentorAgent,
     _FakeAgentSession,
@@ -448,6 +483,7 @@ def _build_agent_under_test(
             store=cast(RedisSessionStore, store),
             snapshot_client=cast(SnapshotClient, snapshots),
             canvas_snapshot_client=cast(CanvasSnapshotClient, canvas_snapshots),
+            haiku=cast(Any, haiku),
         )
         agent.attach_brain(wiring)
 
@@ -496,6 +532,8 @@ def _build_agent_under_test(
 async def _drain_tasks(agent: MentorAgent) -> None:
     if agent._snapshot_tasks:
         await asyncio.gather(*agent._snapshot_tasks, return_exceptions=True)
+    if agent._summary_tasks:
+        await asyncio.gather(*agent._summary_tasks, return_exceptions=True)
     if agent._ledger_tasks:
         await asyncio.gather(*agent._ledger_tasks, return_exceptions=True)
 
@@ -818,14 +856,20 @@ async def test_static_ack_path_appends_both_candidate_and_ai_turns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transcript_window_caps_at_30_turns() -> None:
-    """Window holds the most-recent 30 turns; older entries fall off the head."""
+async def test_transcript_window_grows_past_threshold_without_haiku() -> None:
+    """Without a Haiku client wired, the window grows unbounded.
+
+    M4 Unit 5 replaced the M2/M3 hard-truncate-at-30 contract with a
+    Haiku-compactor flow: the rolling window keeps growing until a
+    threshold-crossing tick spawns ``_run_compaction``, which then
+    drops the oldest N turns via CAS. With no Haiku client wired
+    (the default for `_build_agent_under_test`), the compactor never
+    runs and the window grows freely. Replay/dev paths intentionally
+    rely on this — they don't want a network call during tests.
+    """
     from archmentor_agent.state.session_state import TranscriptTurn
 
     brain = FakeBrainClient()
-    # Pre-seed a state with 30 existing turns so a single new append
-    # forces the cap to engage. Re-using FakeBrainClient with stay_silent
-    # avoids a second AI turn being appended (which would be 31 total).
     seed = _seed_state()
     seeded = seed.model_copy(
         update={
@@ -844,9 +888,11 @@ async def test_transcript_window_caps_at_30_turns() -> None:
 
     final_state = await store.load(SESSION_ID)
     assert final_state is not None
-    assert len(final_state.transcript_window) == 30
-    # Head was dropped (turn-0); tail is the new turn.
-    assert final_state.transcript_window[0].text == "turn-1"
+    # Without a Haiku client wired, the M4 compactor never runs and the
+    # window keeps every turn. The old "hard truncate at 30" contract
+    # was deliberately removed — see M4 plan Unit 5.
+    assert len(final_state.transcript_window) == 31
+    assert final_state.transcript_window[0].text == "turn-0"
     assert final_state.transcript_window[-1].text == "the 31st turn"
 
 
@@ -1055,6 +1101,282 @@ async def test_streaming_dispatch_stay_silent_does_not_open_say() -> None:
 
     assert fake_session.streamed_deltas == []
     assert fake_session.streamed_full == []
+
+
+# ──────────────────────────────────────────────────────────────────────
+# M4 Unit 5 — Haiku compactor + SessionTelemetry
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _make_window_state(*, turn_count: int, summary: str = "") -> SessionState:
+    """Seed state with `turn_count` candidate turns + an existing summary."""
+    from archmentor_agent.state.session_state import TranscriptTurn
+
+    return _seed_state().model_copy(
+        update={
+            "transcript_window": [
+                TranscriptTurn(t_ms=i * 100, speaker="candidate", text=f"turn-{i}")
+                for i in range(turn_count)
+            ],
+            "session_summary": summary,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_compactor_runs_when_window_crosses_threshold() -> None:
+    """Threshold-crossing append spawns the Haiku compactor task.
+
+    Seeds 30 turns; the next candidate turn brings the window to 31,
+    which is the first cross of `_SUMMARY_COMPACTION_THRESHOLD = 30`.
+    The compactor must (a) call Haiku, (b) drop the oldest 1 turn,
+    (c) append to `session_summary`, (d) roll usage into cost_usd_total,
+    (e) emit a `summary_compressed` ledger row.
+    """
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient(summary_text="Compressed window slice.", cost_usd=0.005)
+
+    seed = _make_window_state(turn_count=30, summary="prior digest")
+    agent, _, ledger, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    await agent.handle_user_input("the 31st turn")
+    await _drain_tasks(agent)
+
+    # Compactor ran exactly once and saw the existing summary + dropped slice.
+    assert len(haiku.calls) == 1
+    existing, dropped_texts = haiku.calls[0]
+    assert existing == "prior digest"
+    assert dropped_texts == ["turn-0"]
+
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    # Window dropped the oldest turn; tail still has the new candidate turn.
+    assert len(final_state.transcript_window) == 30
+    assert final_state.transcript_window[0].text == "turn-1"
+    assert final_state.transcript_window[-1].text == "the 31st turn"
+    # Summary appended with the new fragment.
+    assert "prior digest" in final_state.session_summary
+    assert "Compressed window slice." in final_state.session_summary
+    # Cost rolled in (compactor adds 0.005 to whatever the brain dispatch added).
+    assert final_state.cost_usd_total >= 0.005
+    # `summary_compressed` ledger row landed.
+    summary_rows = [p for et, p in ledger.appends if et == "summary_compressed"]
+    assert len(summary_rows) == 1
+    assert summary_rows[0]["dropped_turns"] == 1
+    # Telemetry counter incremented.
+    assert agent._telemetry.compactions_run == 1
+
+
+@pytest.mark.asyncio
+async def test_compactor_does_not_run_below_threshold() -> None:
+    """30 turns or fewer leaves the window untouched; no Haiku call fires."""
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient()
+
+    seed = _make_window_state(turn_count=28)
+    agent, _, _, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    await agent.handle_user_input("turn 29")
+    await _drain_tasks(agent)
+
+    assert haiku.calls == []
+    assert agent._telemetry.compactions_run == 0
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    # Window kept all 29 (28 seeded + 1 new) — no truncation, no compaction.
+    assert len(final_state.transcript_window) == 29
+
+
+@pytest.mark.asyncio
+async def test_compactor_does_not_run_when_haiku_not_wired() -> None:
+    """No Haiku client → window grows unbounded; no compaction attempted.
+
+    This is the contract for replay/dev paths that don't want a network
+    call during tests. The threshold trigger checks `self._brain.haiku is None`.
+    """
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    seed = _make_window_state(turn_count=30)
+    agent, _, _, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=None
+    )
+
+    await agent.handle_user_input("turn 31")
+    await _drain_tasks(agent)
+
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    # Window grew past 30 — no Haiku, no compactor, no truncation.
+    assert len(final_state.transcript_window) == 31
+    assert agent._telemetry.compactions_run == 0
+
+
+@pytest.mark.asyncio
+async def test_compactor_failure_records_failed_ledger_row_and_releases_in_flight_flag() -> None:
+    """A Haiku exception is logged, surfaces as `summary_compression_failed`,
+    and resets `_summary_in_flight` so the next threshold tick can retry.
+    """
+    import structlog.testing
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    boom = RuntimeError("haiku 5xx")
+    haiku = FakeHaikuClient(raise_exc=boom)
+
+    seed = _make_window_state(turn_count=30)
+    agent, _, ledger, _, _, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await agent.handle_user_input("turn 31")
+        await _drain_tasks(agent)
+
+    failed_rows = [p for et, p in ledger.appends if et == "summary_compression_failed"]
+    assert len(failed_rows) == 1
+    assert failed_rows[0]["dropped_turns"] == 1
+    failed_logs = [le for le in logs if le.get("event") == "agent.summary.compaction.failed"]
+    assert len(failed_logs) == 1
+    assert agent._summary_in_flight is False
+    # Counter still increments (counts attempts, not Haiku-billed calls).
+    assert agent._telemetry.compactions_run == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_threshold_crossings_short_circuit_via_in_flight_flag() -> None:
+    """Two threshold-crossings in quick succession: the second short-circuits
+    because `_summary_in_flight` is True — exactly one Haiku call fires.
+
+    Drives the case where the flag is set by the first tick before its
+    task awaits `haiku.compress` — a second tick that arrives between
+    the spawn and the flag-clear should NOT spawn a duplicate task.
+    """
+    import asyncio as _asyncio
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    brain.enqueue_stay_silent("ack")
+
+    # Custom fake that blocks until released so we can land a second
+    # `handle_user_input` while the first compactor is mid-flight.
+    release = _asyncio.Event()
+
+    class _SlowHaiku(FakeHaikuClient):
+        async def compress(self, *, existing_summary: str, dropped_turns: list[Any]):
+            self.calls.append((existing_summary, [t.text for t in dropped_turns]))
+            await release.wait()
+            return self.summary_text, BrainUsage(
+                input_tokens=10,
+                output_tokens=5,
+                cost_usd=0.0001,
+            )
+
+    haiku = _SlowHaiku()
+    seed = _make_window_state(turn_count=30)
+    agent, _, _, _, _, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    # First trigger — spawns the compactor task; it parks on `release`.
+    await agent.handle_user_input("turn 31")
+    # Second trigger — must short-circuit (one in-flight already).
+    await agent.handle_user_input("turn 32")
+    assert agent._summary_in_flight is True
+    assert len(haiku.calls) == 1
+    # Release the in-flight compactor and drain.
+    release.set()
+    await _drain_tasks(agent)
+    assert agent._summary_in_flight is False
+    # Only one Haiku call across both triggers.
+    assert len(haiku.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_telemetry_emits_log_line_on_shutdown() -> None:
+    """Single `agent.session.telemetry` line per session, with all 6 fields."""
+    import structlog.testing
+
+    brain = FakeBrainClient()
+    brain.enqueue_speak("first answer")
+    brain.enqueue_stay_silent("nothing more")
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    await agent.handle_user_input("first turn")
+    await agent.handle_user_input("second turn")
+    await _drain_tasks(agent)
+
+    with structlog.testing.capture_logs() as logs:
+        await agent.shutdown()
+
+    telemetry_lines = [le for le in logs if le.get("event") == "agent.session.telemetry"]
+    assert len(telemetry_lines) == 1
+    line = telemetry_lines[0]
+    # Six fields, all present.
+    assert "ttfa_ms_histogram" in line
+    assert "brain_calls_made" in line
+    assert "skipped_idempotent_count" in line
+    assert "skipped_cooldown_count" in line
+    assert "dropped_stale_count" in line
+    assert "compactions_run" in line
+    # Two dispatches → two recorded brain calls.
+    assert line["brain_calls_made"] == 2
+    # The streaming TTS path produced at least one TTFA sample for the speak.
+    assert isinstance(line["ttfa_ms_histogram"], list)
+    assert len(line["ttfa_ms_histogram"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_telemetry_log_line_emits_even_under_kill_switch() -> None:
+    """Stable log shape across configurations — kill-switch emits zeros."""
+    import structlog.testing
+
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=False)
+
+    with structlog.testing.capture_logs() as logs:
+        await agent.shutdown()
+
+    telemetry_lines = [le for le in logs if le.get("event") == "agent.session.telemetry"]
+    assert len(telemetry_lines) == 1
+    line = telemetry_lines[0]
+    assert line["brain_calls_made"] == 0
+    assert line["compactions_run"] == 0
+    assert line["dropped_stale_count"] == 0
+    assert line["ttfa_ms_histogram"] == []
+
+
+@pytest.mark.asyncio
+async def test_router_increments_skipped_idempotent_telemetry() -> None:
+    """Repeat dispatches with identical state + payload short-circuit; counter rises."""
+    from archmentor_agent.events.types import EventType, RouterEvent
+
+    brain = FakeBrainClient()
+    # First call: stay_silent → arms the fingerprint.
+    brain.enqueue_stay_silent("nothing")
+    # Second call should NOT reach the brain; it short-circuits.
+    brain.enqueue_speak("would-be-spoken")
+
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    assert agent._brain is not None
+    router = agent._brain.router
+
+    payload = {"phase": "intro"}
+    await router.handle(RouterEvent(type=EventType.PHASE_TIMER, t_ms=100, payload=payload))
+    await router.wait_for_idle()
+    await router.handle(RouterEvent(type=EventType.PHASE_TIMER, t_ms=200, payload=payload))
+    await router.wait_for_idle()
+    await _drain_tasks(agent)
+
+    # Second dispatch was skipped — only one Anthropic-side call.
+    assert len(brain.calls) == 1
+    assert agent._telemetry.skipped_idempotent_count == 1
+    # Both dispatches counted toward total brain calls (skipped paths included).
+    assert agent._telemetry.brain_calls_made == 2
 
 
 # Suppress unused-import warnings — these types are used via `cast`.

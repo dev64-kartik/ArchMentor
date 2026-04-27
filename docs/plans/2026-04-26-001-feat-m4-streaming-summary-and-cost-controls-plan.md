@@ -518,7 +518,7 @@ The `try`/`except` skeleton must wrap both the `async with` block AND any code t
 
 ### Phase 3 — Haiku session-summary compression
 
-- [ ] **Unit 5: `HaikuClient` + pricing rows + per-session compactor task**
+- [x] **Unit 5: `HaikuClient` + pricing rows + per-session compactor task**
 
 **Goal:** Stop hard-truncating `transcript_window`; fold dropped turns into `session_summary` via a non-blocking Haiku call.
 
@@ -620,7 +620,7 @@ The `try`/`except` skeleton must wrap both the `async with` block AND any code t
 
 ### Phase 4 — Content-based phase transitions + soft nudges
 
-- [ ] **Unit 7: Per-session phase-timer producer task + budgets**
+- [x] **Unit 7: Per-session phase-timer producer task + budgets**
 
 **Goal:** Wire the existing `EventType.PHASE_TIMER` taxonomy to a real producer; surface a verbal nudge to the brain when a phase exceeds its soft budget.
 
@@ -665,7 +665,7 @@ The `try`/`except` skeleton must wrap both the `async with` block AND any code t
 
 ### Phase 5 — Counter-argument state machine
 
-- [ ] **Unit 8: Router-side `active_argument.rounds` counter + auto-clear**
+- [x] **Unit 8: Router-side `active_argument.rounds` counter + auto-clear**
 
 **Goal:** Make `active_argument` actually advance through rounds rather than relying on the brain to remember.
 
