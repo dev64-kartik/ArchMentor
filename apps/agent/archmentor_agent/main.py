@@ -90,6 +90,18 @@ from archmentor_agent.telemetry import SessionTelemetry
 AiState = Literal["speaking", "listening", "thinking"]
 AI_STATE_TOPIC = "ai_state"
 
+# Topic for the cost-budget telemetry channel (M4 Unit 9 / R24). Sibling
+# of `ai_state`; same `publishData` transport. Frontend renders a thin
+# progress bar (`<CostBudgetIndicator>`) showing burn vs cap. Payload is
+# fixed-size (~80 bytes serialised) so the M3 "fixed-size telemetry →
+# publishData" rule still holds.
+AI_TELEMETRY_TOPIC = "ai_telemetry"
+# Soft ceiling for the JSON payload size in bytes. Five integer/float
+# fields encode well under this; the assert exists to catch accidental
+# field-creep that would push us toward the SCTP per-frame limit
+# (~16 KiB) — not a real risk, but the budget rule should fail loudly.
+_TELEMETRY_PAYLOAD_MAX_BYTES = 256
+
 
 class CanvasNoBaselineStateError(Exception):
     """Raised when no SessionState baseline exists in Redis for a canvas CAS apply.
@@ -924,6 +936,60 @@ class MentorAgent(Agent):
             # two stack traces per session for what is benign teardown.
             log.warning("agent.publish_state_failed", state=state, reason=str(exc))
 
+    async def _publish_telemetry(self, state: SessionState) -> None:
+        """Surface session cost burn to the candidate (M4 Unit 9 / R24).
+
+        Mirrors `_publish_state` exactly — fixed-size JSON, fire-and-forget
+        over `publishData`, errors swallowed so a mid-teardown room can't
+        break the voice loop. Cadence: once per brain dispatch (router
+        invokes the dispatch-complete callback) plus once per Haiku
+        compaction completion. Emitting on every streaming-TTS chunk
+        would flood the data channel for zero candidate-perceived
+        information gain.
+
+        Payload contract (binding, ~80 bytes serialised):
+            cost_usd_total: float — running session cost
+            cost_cap_usd: float — per-session budget seeded at on_enter
+            calls_made: int — total brain dispatches (incl. router-side
+                skips); read from `_telemetry.brain_calls_made` so the
+                frontend sees the same denominator the dogfood gate uses
+            tokens_in_total: int — input tokens across all brain calls
+            tokens_out_total: int — output tokens across all brain calls
+
+        Field-creep is caught at runtime by the
+        `_TELEMETRY_PAYLOAD_MAX_BYTES` assertion; the SCTP per-frame limit
+        is two orders of magnitude larger but the budget rule should
+        fail loudly so future additions go through review.
+        """
+        payload = json.dumps(
+            {
+                "cost_usd_total": round(state.cost_usd_total, 4),
+                "cost_cap_usd": state.cost_cap_usd,
+                "calls_made": self._telemetry.brain_calls_made,
+                "tokens_in_total": state.tokens_input_total,
+                "tokens_out_total": state.tokens_output_total,
+            }
+        )
+        if len(payload) > _TELEMETRY_PAYLOAD_MAX_BYTES:
+            raise AssertionError(
+                f"ai_telemetry payload exceeds {_TELEMETRY_PAYLOAD_MAX_BYTES}B "
+                f"budget ({len(payload)}B) — review field set"
+            )
+        try:
+            await self._room.local_participant.publish_data(
+                payload,
+                topic=AI_TELEMETRY_TOPIC,
+            )
+        except (ConnectionError, OSError, RuntimeError, PublishDataError) as exc:
+            log.warning("agent.publish_telemetry_failed", reason=str(exc))
+        else:
+            log.info(
+                "agent.telemetry.publish",
+                cost_usd_total=round(state.cost_usd_total, 4),
+                cost_cap_usd=state.cost_cap_usd,
+                calls_made=self._telemetry.brain_calls_made,
+            )
+
     def _log(self, event_type: str, payload: dict[str, object]) -> None:
         """Schedule a fire-and-forget ledger append.
 
@@ -1428,6 +1494,10 @@ class MentorAgent(Agent):
                     "tokens_output": usage.output_tokens,
                 },
             )
+            # M4 Unit 9 / R24: surface the new cost burn after a
+            # compaction so the candidate sees Haiku spend land on the
+            # progress bar at the same cadence the dispatch path emits.
+            await self._publish_telemetry(applied)
         finally:
             self._summary_in_flight = False
 
@@ -1694,6 +1764,7 @@ def build_brain_wiring(
         pre_dispatch_callback=_drain_if_fresh,
         streaming_tts_factory=_streaming_tts_factory,
         telemetry=agent._telemetry,
+        dispatch_complete_callback=agent._publish_telemetry,
     )
     return _BrainWiring(
         brain=brain,

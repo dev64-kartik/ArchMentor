@@ -721,7 +721,7 @@ The `try`/`except` skeleton must wrap both the `async with` block AND any code t
 
 ### Phase 6 — Frontend cost telemetry
 
-- [ ] **Unit 9: Agent `ai_telemetry` publisher + frontend `<CostBudgetIndicator>`**
+- [x] **Unit 9: Agent `ai_telemetry` publisher + frontend `<CostBudgetIndicator>`**
 
 **Goal:** Surface session cost burn so the candidate (and operator dogfooding) can see budget remaining.
 
@@ -761,7 +761,7 @@ The `try`/`except` skeleton must wrap both the `async with` block AND any code t
 
 ### Phase 7 — Verification, regressions, and dogfood
 
-- [ ] **Unit 10: M3-dogfood regressions + transcript_window=0 retest**
+- [x] **Unit 10: M3-dogfood regressions + transcript_window=0 retest** (manual dogfood gate still pending)
 
 **Goal:** Guarantee the M3-dogfood pain points stay fixed under M4's new code paths.
 

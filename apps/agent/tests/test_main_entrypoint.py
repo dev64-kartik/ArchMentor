@@ -11,6 +11,7 @@ the brain-loop wiring against lightweight fakes — real `EventRouter`,
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -1377,6 +1378,147 @@ async def test_router_increments_skipped_idempotent_telemetry() -> None:
     assert agent._telemetry.skipped_idempotent_count == 1
     # Both dispatches counted toward total brain calls (skipped paths included).
     assert agent._telemetry.brain_calls_made == 2
+
+
+# ---------------------------------------------------------------------------
+# Unit 9 — `ai_telemetry` publish + post-dispatch callback wiring (R24)
+# ---------------------------------------------------------------------------
+
+
+def _published_telemetry_frames(agent: MentorAgent) -> list[dict[str, Any]]:
+    """Return the parsed JSON payloads sent to the `ai_telemetry` topic."""
+    participant = cast(_FakeLocalParticipant, agent._room.local_participant)
+    frames: list[dict[str, Any]] = []
+    for topic, payload in participant.published:
+        if topic != "ai_telemetry":
+            continue
+        frames.append(json.loads(payload))
+    return frames
+
+
+@pytest.mark.asyncio
+async def test_dispatch_complete_publishes_ai_telemetry_frame() -> None:
+    """Every brain dispatch publishes one `ai_telemetry` frame mirroring SessionState."""
+    brain = FakeBrainClient()
+    brain.enqueue_speak("First nudge.", cost_usd=0.012)
+    seed = _seed_state(cost_usd_total=0.0, cost_cap_usd=5.0)
+    agent, _, _, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed
+    )
+
+    await agent.handle_user_input("Initial requirements walk-through.")
+    await _drain_tasks(agent)
+
+    frames = _published_telemetry_frames(agent)
+    assert len(frames) == 1
+    frame = frames[0]
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    assert frame["cost_usd_total"] == round(final_state.cost_usd_total, 4)
+    assert frame["cost_cap_usd"] == 5.0
+    assert frame["calls_made"] == agent._telemetry.brain_calls_made
+    assert frame["tokens_in_total"] == final_state.tokens_input_total
+    assert frame["tokens_out_total"] == final_state.tokens_output_total
+
+
+@pytest.mark.asyncio
+async def test_compaction_publishes_ai_telemetry_frame() -> None:
+    """Haiku compaction emits an extra telemetry frame so the bar updates after Haiku spend."""
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient(summary_text="Compressed slice.", cost_usd=0.003)
+    seed = _make_window_state(turn_count=30, summary="prior digest")
+    agent, _, _, _, _, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    await agent.handle_user_input("the 31st turn")
+    await _drain_tasks(agent)
+
+    frames = _published_telemetry_frames(agent)
+    # Two frames: one from the dispatch callback, one from the compactor.
+    assert len(frames) == 2
+    # Final frame reflects post-compaction cost (>= compactor's 0.003 add).
+    assert frames[-1]["cost_usd_total"] >= 0.003
+
+
+@pytest.mark.asyncio
+async def test_publish_telemetry_swallows_publish_data_error() -> None:
+    """Mid-teardown PublishDataError must not break the voice loop."""
+    import structlog.testing
+    from livekit.rtc.participant import PublishDataError
+
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=False)
+
+    async def _raise_engine_closed(payload: str, *, topic: str) -> None:
+        _ = payload, topic
+        raise PublishDataError("engine: connection error: engine is closed")
+
+    agent._room.local_participant.publish_data = _raise_engine_closed  # ty: ignore[invalid-assignment]
+
+    state = _seed_state(cost_usd_total=0.42, cost_cap_usd=5.0)
+    with structlog.testing.capture_logs() as logs:
+        await agent._publish_telemetry(state)
+
+    failed = [le for le in logs if le.get("event") == "agent.publish_telemetry_failed"]
+    assert len(failed) == 1
+    assert "engine" in failed[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_publish_telemetry_payload_under_size_budget() -> None:
+    """Payload stays comfortably under `_TELEMETRY_PAYLOAD_MAX_BYTES`."""
+    from archmentor_agent.main import _TELEMETRY_PAYLOAD_MAX_BYTES
+
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=False)
+    # Use generous values to stress-test the budget — millions of tokens
+    # / four-digit cost still has to fit.
+    agent._telemetry.brain_calls_made = 9999
+    state = _seed_state(cost_usd_total=4.9876, cost_cap_usd=5.0)
+    state = state.model_copy(
+        update={
+            "tokens_input_total": 9_876_543,
+            "tokens_output_total": 1_234_567,
+        }
+    )
+    await agent._publish_telemetry(state)
+    frames = _published_telemetry_frames(agent)
+    assert len(frames) == 1
+    raw = json.dumps(frames[0])
+    assert len(raw) < _TELEMETRY_PAYLOAD_MAX_BYTES
+
+
+# ---------------------------------------------------------------------------
+# Unit 10 — M3-dogfood transcript_window=0 regression (commit ce90164)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transcript_window_populates_after_two_user_turns() -> None:
+    """Regression: `state.transcript_window` length >= 2 after two finals.
+
+    Master plan §696 logged a M3 dogfood finding where the agent's
+    in-memory `transcript_window` stayed empty after the first turn
+    because the CAS apply path was passing `state` instead of mutating
+    `transcript_window`. Fixed in `ce90164`. This test pins the fix so
+    a future refactor of `_append_transcript_turn` doesn't regress it.
+    """
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("first")
+    brain.enqueue_stay_silent("second")
+    agent, _, _, _, store, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    await agent.handle_user_input("Talk about partitioning first.")
+    await agent.handle_user_input("Then we should walk capacity.")
+    await _drain_tasks(agent)
+
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    candidate_turns = [t for t in final_state.transcript_window if t.speaker == "candidate"]
+    assert len(candidate_turns) >= 2, (
+        f"transcript_window has {len(candidate_turns)} candidate turn(s); "
+        "M3 dogfood regression — should have at least 2 after two finals."
+    )
 
 
 # Suppress unused-import warnings — these types are used via `cast`.

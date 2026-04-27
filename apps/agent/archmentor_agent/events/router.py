@@ -144,6 +144,17 @@ audio already played live.
 """
 
 
+DispatchCompleteCallback = Callable[[SessionState], Awaitable[None]]
+"""Hook invoked once per dispatch after state is applied (M4 Unit 9).
+
+The router awaits this with the post-apply `SessionState` so the agent
+can publish cost telemetry (`ai_telemetry` topic) at the natural
+once-per-decision cadence the M4 plan specifies. Errors are caught
+inside the router so a mid-teardown publish never aborts the dispatch
+loop.
+"""
+
+
 class TelemetryRecorder(Protocol):
     """Subset of `SessionTelemetry` the router needs.
 
@@ -197,6 +208,7 @@ class EventRouter:
         pre_dispatch_callback: Callable[[], Awaitable[None]] | None = None,
         streaming_tts_factory: StreamingTtsFactory | None = None,
         telemetry: TelemetryRecorder | None = None,
+        dispatch_complete_callback: DispatchCompleteCallback | None = None,
     ) -> None:
         self._session_id = session_id
         self._brain = brain
@@ -231,6 +243,14 @@ class EventRouter:
         # cooldown short-circuit. Aggregate ratios are computed at
         # session-end by `MentorAgent.shutdown`.
         self._telemetry = telemetry
+
+        # Post-dispatch callback (M4 Unit 9 / R24). Receives the
+        # post-apply `SessionState` so the agent can publish a
+        # cost-telemetry frame on `ai_telemetry`. Optional — replay /
+        # kill-switch leaves it None and no telemetry leaves the agent.
+        # Errors raised by the callback are caught inside the dispatch
+        # loop so a mid-teardown publish never aborts a brain decision.
+        self._dispatch_complete_callback = dispatch_complete_callback
 
         self._lock = asyncio.Lock()
         self._pending: list[RouterEvent] = []
@@ -547,6 +567,21 @@ class EventRouter:
             if not streamed_audio:
                 self._maybe_push_utterance(decision, snapshot_t_ms)
             self._maybe_emit_recovery_utterance(decision, partial_audio_played=streamed_audio)
+
+            # Post-dispatch hook (M4 Unit 9 / R24). One frame per
+            # dispatch — including router-side skips and cost-cap
+            # short-circuits, so the frontend's progress bar reflects
+            # the actual call count the dogfood gate sees in
+            # `SessionTelemetry.brain_calls_made`. Errors are isolated;
+            # a mid-teardown publish must not abort the dispatch loop.
+            if self._dispatch_complete_callback is not None:
+                try:
+                    await self._dispatch_complete_callback(applied_state)
+                except Exception:
+                    log.exception(
+                        "router.dispatch_complete_callback.error",
+                        t_ms=snapshot_t_ms,
+                    )
         finally:
             # Bump TTLs of every queued utterance by the dispatch's
             # wall-clock duration. Runs even on cancellation so a
@@ -969,6 +1004,7 @@ def _decision_payload(decision: BrainDecision) -> dict[str, Any]:
 
 
 __all__ = [
+    "DispatchCompleteCallback",
     "EventRouter",
     "LedgerLogger",
     "SnapshotScheduler",
