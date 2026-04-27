@@ -447,7 +447,7 @@ The `try`/`except` skeleton must wrap both the `async with` block AND any code t
 
 ---
 
-- [ ] **Unit 4: Streaming Kokoro TTS adapter + agent wiring**
+- [x] **Unit 4: Streaming Kokoro TTS adapter + agent wiring** (core flow + R3b/R3d landed; R3a + R3c deferred)
 
 **Goal:** Connect Unit 3's `utterance_listener` to a livekit-agents `SynthesizeStream` that pipes sentence-bounded text through `KokoroEngine.synthesize` and emits PCM frames to the LiveKit audio pipe. End-to-end: candidate finishes turn → first sentence audible within 1-2 s.
 
