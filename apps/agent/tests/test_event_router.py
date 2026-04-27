@@ -681,5 +681,529 @@ def _build_404_response(status: int) -> Any:
     return httpx.Response(status, request=request)
 
 
+# ---------------------------------------------------------------------------
+# Unit 1 — Cost-throttle: fingerprint skip + exponential backoff
+# (R20, R21; refinements R1, R2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_idempotent_skips_second_canvas_change() -> None:
+    """Two identical CANVAS_CHANGE events back-to-back → second short-circuits.
+
+    First call dispatches and gets ``stay_silent``; second skips with
+    ``BrainDecision.skipped_idempotent()``, no Anthropic call, snapshot
+    + ``brain_decision`` ledger row still emit, and BrainUsage is empty.
+    """
+    from archmentor_agent.events.types import Priority
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("nothing to add")
+    router, _, _, snapshots, queue, log_events, snap_tasks = _make_router(brain=brain)
+
+    payload = {"scene_text": "Components: <label>API</label>"}
+    for t in (1_000, 1_100):
+        await router.handle(
+            RouterEvent(
+                EventType.CANVAS_CHANGE,
+                t_ms=t,
+                payload=dict(payload),
+                priority=Priority.HIGH,
+            )
+        )
+        await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    # Brain called exactly once (the second was skipped).
+    assert len(brain.calls) == 1
+    # Two snapshots posted (skipped path still emits for replay).
+    assert len(snapshots.posts) == 2
+    # Two brain_decision ledger rows; second has reason=skipped_idempotent.
+    decisions = [e for e in log_events if e[0] == "brain_decision"]
+    assert len(decisions) == 2
+    assert decisions[1][1]["reason"] == "skipped_idempotent"
+    # No utterance pushed on either.
+    assert queue.pop_if_fresh() is None
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_skip_does_not_apply_to_turn_end() -> None:
+    """Identical CANVAS_CHANGE events sandwiching a TURN_END → both dispatch.
+
+    TURN_END resets the fingerprint cache to its own value, so the
+    second CANVAS_CHANGE does not match the first's fingerprint.
+    """
+    from archmentor_agent.events.types import Priority
+
+    brain = FakeBrainClient()
+    for _ in range(3):
+        brain.enqueue_stay_silent("ack")
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain)
+
+    canvas_payload = {"scene_text": "<label>Cache</label>"}
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=1_000,
+            payload=dict(canvas_payload),
+            priority=Priority.HIGH,
+        )
+    )
+    await _await_loop(router)
+    await router.handle(
+        RouterEvent(EventType.TURN_END, t_ms=2_000, payload={"text": "hello"}),
+    )
+    await _await_loop(router)
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=3_000,
+            payload=dict(canvas_payload),
+            priority=Priority.HIGH,
+        )
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    # All three dispatched (no skipped_idempotent in the chain).
+    assert len(brain.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_cooldown_short_circuits_after_two_stay_silent() -> None:
+    """Two stay_silent outcomes from non-skipped Opus calls →
+    next CANVAS_CHANGE within 8 s short-circuits to skipped_cooldown."""
+    from archmentor_agent.events.types import Priority
+
+    clock = _FakeClock(t0_ms=1_000)
+    brain = FakeBrainClient()
+    # Two distinct stay_silent calls (different payloads → different
+    # fingerprints) so each makes a real call and increments the counter.
+    brain.enqueue_stay_silent("a")
+    brain.enqueue_stay_silent("b")
+    router, _, _, _, _, log_events, snap_tasks = _make_router(brain=brain, clock=clock)
+
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=clock.now(),
+            payload={"scene_text": "v1"},
+            priority=Priority.HIGH,
+        )
+    )
+    await _await_loop(router)
+
+    clock.advance(2_000)
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=clock.now(),
+            payload={"scene_text": "v2"},
+            priority=Priority.HIGH,
+        )
+    )
+    await _await_loop(router)
+
+    # Counter is now 2; cooldown of 8000ms is set from t=3000 → t=11000.
+    assert router._consecutive_stay_silent == 2
+    assert router._cooldown_until_ms == clock.now() + 8_000
+
+    # A CANVAS_CHANGE within the cooldown window is short-circuited.
+    clock.advance(1_000)
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=clock.now(),
+            payload={"scene_text": "v3"},
+            priority=Priority.HIGH,
+        )
+    )
+    await _await_loop(router)
+
+    assert len(brain.calls) == 2  # third was skipped_cooldown
+    decisions = [e for e in log_events if e[0] == "brain_decision"]
+    assert decisions[-1][1]["reason"] == "stay_silent_backoff"
+    await _await_snapshots(snap_tasks)
+
+
+@pytest.mark.asyncio
+async def test_cooldown_clamps_at_60_seconds() -> None:
+    """At N=10, cooldown_ms clamps at 60_000, not 4_000 * 2^9 = 2_048_000."""
+    router, _, _, _, _, _, _ = _make_router()
+    router._consecutive_stay_silent = 10
+    assert router._active_cooldown_ms() == 60_000
+
+
+@pytest.mark.asyncio
+async def test_cost_capped_runs_before_throttle_gates() -> None:
+    """Cost-capped session → cost_capped fires; fingerprint/cooldown
+    paths are bypassed entirely."""
+    state = _make_state(cost_usd_total=5.01, cost_cap_usd=5.0)
+    router, brain, _, _snapshots, _, log_events, snap_tasks = _make_router(
+        seed_state=state,
+    )
+    brain.enqueue_speak("would not run")
+
+    await router.handle(RouterEvent(EventType.TURN_END, t_ms=1_000, payload={"text": "x"}))
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(brain.calls) == 0
+    assert router._cost_capped is True
+    decisions = [e for e in log_events if e[0] == "brain_decision"]
+    assert decisions[0][1]["reason"] == "cost_capped"
+
+
+@pytest.mark.asyncio
+async def test_consecutive_stay_silent_resets_on_speak() -> None:
+    """A speak decision after two stay_silent resets the counter to 0."""
+    clock = _FakeClock(t0_ms=1_000)
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("first")
+    brain.enqueue_stay_silent("second")
+    brain.enqueue_speak("now I have something", confidence=0.9)
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain, clock=clock)
+
+    for label, t_offset in (("a", 0), ("b", 2_000), ("c", 4_000)):
+        clock.advance(t_offset)
+        await router.handle(
+            RouterEvent(EventType.TURN_END, t_ms=clock.now(), payload={"text": label}),
+        )
+        await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert router._consecutive_stay_silent == 0
+    assert router._cooldown_until_ms == 0
+
+
+@pytest.mark.asyncio
+async def test_skipped_idempotent_does_not_count_toward_cooldown() -> None:
+    """Two skipped_idempotent paths must not arm the backoff cooldown.
+
+    Otherwise the throttle eats its own tail — backoff produces more
+    skips which extend backoff.
+    """
+    from archmentor_agent.events.types import Priority
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("seed")  # only one real call expected
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain)
+
+    payload = {"scene_text": "stable scene"}
+    for t in (1_000, 1_100, 1_200):
+        await router.handle(
+            RouterEvent(
+                EventType.CANVAS_CHANGE,
+                t_ms=t,
+                payload=dict(payload),
+                priority=Priority.HIGH,
+            )
+        )
+        await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(brain.calls) == 1
+    # One real stay_silent → counter=1; two skipped_idempotents → still 1.
+    assert router._consecutive_stay_silent == 1
+    assert router._cooldown_until_ms == 0
+
+
+@pytest.mark.asyncio
+async def test_phase_timer_bypasses_cooldown() -> None:
+    """Refinements R2: a PHASE_TIMER fired during an active cooldown
+    dispatches normally — it exists *to break a stuck silence*."""
+    from archmentor_agent.events.types import Priority
+
+    clock = _FakeClock(t0_ms=1_000)
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("a")
+    brain.enqueue_stay_silent("b")
+    brain.enqueue_speak("we should advance phase", confidence=0.9)
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain, clock=clock)
+
+    # Two CANVAS_CHANGEs to arm the cooldown.
+    for v in ("v1", "v2"):
+        clock.advance(1_000)
+        await router.handle(
+            RouterEvent(
+                EventType.CANVAS_CHANGE,
+                t_ms=clock.now(),
+                payload={"scene_text": v},
+                priority=Priority.HIGH,
+            )
+        )
+        await _await_loop(router)
+
+    assert router._consecutive_stay_silent == 2
+    cooldown_until = router._cooldown_until_ms
+    assert cooldown_until > clock.now()  # cooldown is active
+
+    # PHASE_TIMER inside the cooldown window dispatches anyway.
+    clock.advance(500)
+    await router.handle(
+        RouterEvent(
+            EventType.PHASE_TIMER,
+            t_ms=clock.now(),
+            payload={"phase": "requirements", "over_budget_pct_tier": 50},
+            priority=Priority.LOW,
+        )
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    # Three real brain calls: two CANVAS_CHANGE + the PHASE_TIMER bypass.
+    assert len(brain.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_phase_timer_does_not_reset_consecutive_stay_silent() -> None:
+    """Refinements R2: an over-budget phase silence shouldn't mask a
+    stuck-silence state. PHASE_TIMER does NOT reset the counter."""
+    from archmentor_agent.events.types import Priority
+
+    clock = _FakeClock(t0_ms=1_000)
+    brain = FakeBrainClient()
+    # First CANVAS_CHANGE → stay_silent (n=1). PHASE_TIMER → also stay_silent.
+    # Expect counter = 2 after PHASE_TIMER, not 1.
+    brain.enqueue_stay_silent("a")
+    brain.enqueue_stay_silent("b")
+    router, _, _, _, _, _, snap_tasks = _make_router(brain=brain, clock=clock)
+
+    await router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=clock.now(),
+            payload={"scene_text": "v1"},
+            priority=Priority.HIGH,
+        )
+    )
+    await _await_loop(router)
+    assert router._consecutive_stay_silent == 1
+
+    clock.advance(1_000)
+    await router.handle(
+        RouterEvent(
+            EventType.PHASE_TIMER,
+            t_ms=clock.now(),
+            payload={"phase": "requirements", "over_budget_pct_tier": 50},
+            priority=Priority.LOW,
+        )
+    )
+    await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    # PHASE_TIMER must NOT reset the counter. Real stay_silent →
+    # counter increments to 2.
+    assert router._consecutive_stay_silent == 2
+
+
+@pytest.mark.asyncio
+async def test_phase_timer_subject_to_fingerprint_skip() -> None:
+    """Refinements R2: PHASE_TIMER passes through the fingerprint-skip gate.
+
+    Two PHASE_TIMER events with identical bucketed ``over_budget_pct_tier``
+    short-circuit to skipped_idempotent — Unit 7's bucketing keeps the
+    payload stable within a tier so cost stays bounded during stuck-silence.
+    """
+    from archmentor_agent.events.types import Priority
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("phase ack")
+    router, _, _, _, _, log_events, snap_tasks = _make_router(brain=brain)
+
+    payload = {"phase": "requirements", "over_budget_pct_tier": 50}
+    for t in (1_000, 1_100):
+        await router.handle(
+            RouterEvent(
+                EventType.PHASE_TIMER,
+                t_ms=t,
+                payload=dict(payload),
+                priority=Priority.LOW,
+            )
+        )
+        await _await_loop(router)
+    await _await_snapshots(snap_tasks)
+
+    assert len(brain.calls) == 1
+    decisions = [e for e in log_events if e[0] == "brain_decision"]
+    assert decisions[-1][1]["reason"] == "skipped_idempotent"
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_excludes_irrelevant_state_fields() -> None:
+    """Two states differing only in ``cost_usd_total``, ``tokens_*_total``,
+    ``session_summary``, ``canvas_state.description``, and ``pending_utterance``
+    must produce the same fingerprint.
+
+    Refinements R1: those fields are not in the brain's decision surface
+    relative to whether to speak; they should not flip the throttle hash.
+    """
+    from archmentor_agent.events.types import Priority
+
+    state_a = _make_state()
+    state_b = state_a.model_copy(
+        update={
+            "cost_usd_total": 1.234,
+            "tokens_input_total": 500,
+            "tokens_output_total": 200,
+            "session_summary": "A long compaction summary added by Haiku.",
+            "canvas_state": state_a.canvas_state.model_copy(
+                update={"description": "[label=API]"},
+            ),
+        }
+    )
+
+    router, _, _, _, _, _, _ = _make_router()
+    event = RouterEvent(
+        EventType.CANVAS_CHANGE,
+        t_ms=1_000,
+        payload={"scene_text": "stable"},
+        priority=Priority.HIGH,
+    )
+    fp_a = router._compute_fingerprint(state_a, event)
+    fp_b = router._compute_fingerprint(state_b, event)
+    assert fp_a == fp_b
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_excludes_t_ms_and_merged_from() -> None:
+    """Two events differing only in ``t_ms`` and ``merged_from`` produce
+    the same fingerprint."""
+    from archmentor_agent.events.types import Priority
+
+    state = _make_state()
+    router, _, _, _, _, _, _ = _make_router(seed_state=state)
+
+    event_a = RouterEvent(
+        EventType.CANVAS_CHANGE,
+        t_ms=1_000,
+        payload={"scene_text": "x", "merged_from": ["canvas_change"]},
+        priority=Priority.HIGH,
+    )
+    event_b = RouterEvent(
+        EventType.CANVAS_CHANGE,
+        t_ms=9_999_999,
+        payload={"scene_text": "x", "merged_from": ["canvas_change", "turn_end"]},
+        priority=Priority.HIGH,
+    )
+    assert router._compute_fingerprint(state, event_a) == router._compute_fingerprint(
+        state, event_b
+    )
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_concurrent_transcripts_order_invariant() -> None:
+    """``concurrent_transcripts`` arrival order must not flicker the hash."""
+    from archmentor_agent.events.types import Priority
+
+    state = _make_state()
+    router, _, _, _, _, _, _ = _make_router(seed_state=state)
+
+    event_a = RouterEvent(
+        EventType.CANVAS_CHANGE,
+        t_ms=1_000,
+        payload={"scene_text": "x", "concurrent_transcripts": ["alpha", "beta"]},
+        priority=Priority.HIGH,
+    )
+    event_b = RouterEvent(
+        EventType.CANVAS_CHANGE,
+        t_ms=1_000,
+        payload={"scene_text": "x", "concurrent_transcripts": ["beta", "alpha"]},
+        priority=Priority.HIGH,
+    )
+    assert router._compute_fingerprint(state, event_a) == router._compute_fingerprint(
+        state, event_b
+    )
+
+
+# Property test (binding, refinements R1) — fingerprint stable across
+# `session_summary` mutation that does NOT change `transcript_turn_count`.
+from hypothesis import given, settings  # noqa: E402
+from hypothesis import strategies as st  # noqa: E402
+
+
+@settings(max_examples=50, deadline=None)
+@given(
+    summary_a=st.text(min_size=0, max_size=200),
+    summary_b=st.text(min_size=0, max_size=200),
+)
+def test_fingerprint_stable_across_session_summary_mutation(summary_a: str, summary_b: str) -> None:
+    """Compaction's parallel ``session_summary`` mutation must not flip
+    the fingerprint when ``transcript_turn_count`` is unchanged.
+
+    Without this invariant, the cost throttle silently degrades to
+    no-op whenever the Haiku compactor appends to ``session_summary``
+    between two otherwise-identical brain inputs (per refinements R1).
+    """
+    from archmentor_agent.events.types import Priority
+
+    base_state = _make_state()
+    state_a = base_state.model_copy(update={"session_summary": summary_a})
+    state_b = base_state.model_copy(update={"session_summary": summary_b})
+
+    # Construct a router synchronously — `_make_router` requires an
+    # event loop, but `_compute_fingerprint` does not, so build the
+    # bare collaborator graph inline.
+    import asyncio as _asyncio
+
+    loop = _asyncio.new_event_loop()
+    try:
+        _asyncio.set_event_loop(loop)
+        router, _, _, _, _, _, _ = _make_router(seed_state=base_state)
+        event = RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=1_000,
+            payload={"scene_text": "stable"},
+            priority=Priority.HIGH,
+        )
+        fp_a = router._compute_fingerprint(state_a, event)
+        fp_b = router._compute_fingerprint(state_b, event)
+        assert fp_a == fp_b
+    finally:
+        loop.close()
+
+
+@settings(max_examples=30, deadline=None)
+@given(turn_count_a=st.integers(min_value=0, max_value=200))
+def test_fingerprint_changes_with_transcript_turn_count(turn_count_a: int) -> None:
+    """Compaction's transcript-window decrement DOES flip the fingerprint
+    (correct behaviour — brain reads compressed summary plus a smaller
+    window). Different turn counts → different hashes."""
+    from archmentor_agent.events.types import Priority
+    from archmentor_agent.state.session_state import TranscriptTurn
+
+    base_state = _make_state()
+
+    def _state_with_turn_count(n: int) -> SessionState:
+        return base_state.model_copy(
+            update={
+                "transcript_window": [
+                    TranscriptTurn(t_ms=i * 1_000, speaker="candidate", text="x") for i in range(n)
+                ],
+            },
+        )
+
+    state_a = _state_with_turn_count(turn_count_a)
+    state_b = _state_with_turn_count(turn_count_a + 1)
+
+    import asyncio as _asyncio
+
+    loop = _asyncio.new_event_loop()
+    try:
+        _asyncio.set_event_loop(loop)
+        router, _, _, _, _, _, _ = _make_router(seed_state=base_state)
+        event = RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=1_000,
+            payload={"scene_text": "stable"},
+            priority=Priority.HIGH,
+        )
+        fp_a = router._compute_fingerprint(state_a, event)
+        fp_b = router._compute_fingerprint(state_b, event)
+        assert fp_a != fp_b
+    finally:
+        loop.close()
+
+
 # Silence noisy structlog ERRORs from intentional brain.unexpected logs.
 logging.getLogger("archmentor_agent.events.router").setLevel(logging.CRITICAL)

@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 from uuid import UUID
@@ -46,9 +48,9 @@ from uuid import UUID
 import structlog
 
 from archmentor_agent.brain.client import BrainClient
-from archmentor_agent.brain.decision import BrainDecision
+from archmentor_agent.brain.decision import BrainDecision, DecisionKind
 from archmentor_agent.events.coalescer import coalesce
-from archmentor_agent.events.types import RouterEvent
+from archmentor_agent.events.types import EventType, RouterEvent
 from archmentor_agent.queue import UtteranceQueue
 from archmentor_agent.snapshots.client import SnapshotClient
 from archmentor_agent.snapshots.serializer import build_snapshot
@@ -66,6 +68,23 @@ log = structlog.get_logger(__name__)
 
 _MIN_CONFIDENCE = 0.6
 _SCHEMA_VIOLATION_ESCALATION = 3
+
+# Cost-throttle (refinements R1, R2). Once `_consecutive_stay_silent`
+# reaches `_BACKOFF_TRIGGER_N`, the next non-TURN_END / non-PHASE_TIMER
+# event is skipped for `min(_BACKOFF_MAX_MS, _BACKOFF_BASE_MS * 2 ** (N-1))`
+# ms. The cap protects against pathologically long silences from
+# producing 30-min cooldowns.
+_BACKOFF_TRIGGER_N = 2
+_BACKOFF_BASE_MS = 4_000
+_BACKOFF_MAX_MS = 60_000
+
+# Decision reasons that should NOT count toward the consecutive
+# stay_silent counter. Real Anthropic stay_silent decisions count;
+# router-side skipped paths and cost-cap don't (otherwise the throttle
+# eats its own tail — backoff triggers more skips which extend backoff).
+_THROTTLE_NONCOUNTING_REASONS = frozenset(
+    {"skipped_idempotent", "stay_silent_backoff", "cost_capped"}
+)
 
 
 class LedgerLogger(Protocol):
@@ -148,6 +167,27 @@ class EventRouter:
         # gate let it through — repeated brain timeouts must not spam
         # the candidate with the same line.
         self._apology_used = False
+
+        # Cost-throttle state (Unit 1 / R20, R21).
+        #
+        # `_last_input_fingerprint` is a SHA-256 over a curated subset
+        # of (state, event_payload) — see `_compute_fingerprint`. When
+        # the next dispatch's fingerprint matches AND the prior decision
+        # was `stay_silent`, the router short-circuits to
+        # `BrainDecision.skipped_idempotent()` (no Anthropic call).
+        #
+        # `_consecutive_stay_silent` counts back-to-back real
+        # stay_silent outcomes (router-side skips do NOT count). At
+        # N >= 2, the router enters an exponential-backoff cooldown
+        # that skips non-TURN_END / non-PHASE_TIMER events to
+        # `BrainDecision.skipped_cooldown(...)`. TURN_END resets the
+        # counter; PHASE_TIMER bypasses the cooldown gate but does not
+        # reset the counter (refinements R2 — over-budget phase
+        # silences shouldn't mask a stuck-silence state).
+        self._last_input_fingerprint: str | None = None
+        self._last_input_decision_kind: DecisionKind | None = None
+        self._consecutive_stay_silent: int = 0
+        self._cooldown_until_ms: int = 0
 
     async def handle(self, event: RouterEvent) -> None:
         """Enqueue an event; spawn `_dispatch` if not already running.
@@ -287,6 +327,13 @@ class EventRouter:
             )
             return
 
+        # Cost-throttle gates run after state load + before the brain
+        # call. Order matters: cost-cap is the M2-established final
+        # word (router goes silent for the rest of the session); the
+        # idempotent/cooldown gates only meaningfully fire on a healthy
+        # session.
+        fingerprint = self._compute_fingerprint(state, merged)
+
         if self._cost_capped or state.cost_usd_total >= state.cost_cap_usd:
             self._cost_capped = True
             decision = BrainDecision.cost_capped()
@@ -295,6 +342,27 @@ class EventRouter:
                 t_ms=snapshot_t_ms,
                 cost_usd_total=state.cost_usd_total,
                 cost_cap_usd=state.cost_cap_usd,
+            )
+        elif self._should_skip_idempotent(fingerprint, merged):
+            decision = BrainDecision.skipped_idempotent()
+            log.info(
+                "router.cost_throttle.skipped",
+                reason="skipped_idempotent",
+                t_ms=snapshot_t_ms,
+                consecutive_n=self._consecutive_stay_silent,
+                cooldown_ms=0,
+                event_type=merged.type.value,
+            )
+        elif self._should_skip_cooldown(snapshot_t_ms, merged):
+            cooldown_ms = self._active_cooldown_ms()
+            decision = BrainDecision.skipped_cooldown(cooldown_ms=cooldown_ms)
+            log.info(
+                "router.cost_throttle.skipped",
+                reason="stay_silent_backoff",
+                t_ms=snapshot_t_ms,
+                consecutive_n=self._consecutive_stay_silent,
+                cooldown_ms=cooldown_ms,
+                event_type=merged.type.value,
             )
         else:
             try:
@@ -320,6 +388,7 @@ class EventRouter:
         self._post_snapshot(snapshot_t_ms, applied_state, event_payload, decision)
         self._emit_brain_decision_event(snapshot_t_ms, decision)
         self._update_violation_counter(decision)
+        self._update_throttle_state(decision, fingerprint, merged, snapshot_t_ms)
         self._maybe_push_utterance(decision, snapshot_t_ms)
         self._maybe_emit_recovery_utterance(decision)
 
@@ -478,6 +547,138 @@ class EventRouter:
         self._apology_used = True
         self._emit_synthetic(text=self._recovery_text, reason=decision.reason or "brain_timeout")
 
+    def _compute_fingerprint(self, state: SessionState, merged: RouterEvent) -> str:
+        """Hash a curated subset of state + event payload for the throttle.
+
+        Refinements R1: only the brain-decision-relevant signals enter
+        the hash. ``transcript_window_hash``, ``summary_chars``, and
+        ``canvas_description_hash`` are deliberately EXCLUDED — summary
+        mutations alone (Haiku compaction's parallel CAS appends) and
+        canvas description churn alone do NOT change the brain's
+        decision surface, which is the throttle's purpose. Compaction's
+        transcript-window decrement IS captured via
+        ``transcript_turn_count`` (correct: brain reads compressed
+        summary plus a smaller window).
+
+        Stable JSON kwargs locked in (``sort_keys``, ``ensure_ascii``,
+        ``separators``) to prevent dict-ordering or whitespace drift
+        from flickering the hash across runs.
+        """
+        active_topic = state.active_argument.topic if state.active_argument is not None else None
+        payload: dict[str, Any] = {
+            "transcript_turn_count": len(state.transcript_window),
+            "decisions_count": len(state.decisions),
+            "phase": state.phase.value,
+            "active_argument_topic": active_topic,
+            "fingerprint_payload": _fingerprint_payload(merged),
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _should_skip_idempotent(self, fingerprint: str, merged: RouterEvent) -> bool:
+        """Return True iff this dispatch should short-circuit to skipped_idempotent.
+
+        Skip rules: fingerprint matches the last call, prior decision
+        was stay_silent, and the event type is NOT TURN_END (candidate
+        finished a turn — we always take the call). PHASE_TIMER IS
+        subject to the fingerprint gate per refinements R2 — bucketed
+        ``over_budget_pct_tier`` (Unit 7) keeps the payload stable
+        within a tier, so back-to-back PHASE_TIMER ticks at the same
+        tier short-circuit and don't burn Anthropic cost.
+        """
+        if fingerprint != self._last_input_fingerprint:
+            return False
+        if self._last_input_decision_kind != "stay_silent":
+            return False
+        return merged.type is not EventType.TURN_END
+
+    def _should_skip_cooldown(self, t_ms: int, merged: RouterEvent) -> bool:
+        """Return True iff this dispatch should short-circuit to skipped_cooldown.
+
+        Cooldown rules: ``t_ms < self._cooldown_until_ms`` AND the
+        event type is neither TURN_END (candidate finished talking)
+        nor PHASE_TIMER (refinements R2 — PHASE_TIMER bypasses cooldown
+        because it exists *to break a stuck silence*; without bypass a
+        32 s cooldown would eat the very PHASE_TIMER fired at second 30).
+        """
+        if t_ms >= self._cooldown_until_ms:
+            return False
+        if merged.type is EventType.TURN_END:
+            return False
+        return merged.type is not EventType.PHASE_TIMER
+
+    def _active_cooldown_ms(self) -> int:
+        """Return the cooldown duration that the current backoff sets."""
+        if self._consecutive_stay_silent < _BACKOFF_TRIGGER_N:
+            return 0
+        return min(
+            _BACKOFF_MAX_MS,
+            _BACKOFF_BASE_MS * (2 ** (self._consecutive_stay_silent - 1)),
+        )
+
+    def _update_throttle_state(
+        self,
+        decision: BrainDecision,
+        fingerprint: str,
+        merged: RouterEvent,
+        t_ms: int,
+    ) -> None:
+        """Roll the fingerprint cache + consecutive_stay_silent counter forward.
+
+        Counter rules:
+        - TURN_END resets unconditionally (candidate finished a turn).
+        - Real ``speak`` decisions reset.
+        - Real ``stay_silent`` increments (and arms the cooldown at N >= 2).
+        - Skipped paths (idempotent / cooldown) and ``cost_capped`` do
+          NOT count — otherwise the throttle eats its own tail.
+        - PHASE_TIMER does not reset (refinements R2: an over-budget
+          phase silence shouldn't mask a stuck-silence state).
+
+        Fingerprint cache always updates so the next call has a target
+        to compare against.
+        """
+        self._last_input_fingerprint = fingerprint
+        self._last_input_decision_kind = decision.decision
+
+        if merged.type is EventType.TURN_END:
+            self._reset_throttle("turn_end")
+            return
+
+        if decision.decision == "speak":
+            self._reset_throttle("speak")
+            return
+
+        if decision.reason in _THROTTLE_NONCOUNTING_REASONS:
+            return
+
+        if decision.decision == "stay_silent":
+            self._consecutive_stay_silent += 1
+            if self._consecutive_stay_silent >= _BACKOFF_TRIGGER_N:
+                cooldown_ms = self._active_cooldown_ms()
+                self._cooldown_until_ms = t_ms + cooldown_ms
+                log.info(
+                    "router.cost_throttle.cooldown_set",
+                    t_ms=t_ms,
+                    consecutive_n=self._consecutive_stay_silent,
+                    cooldown_ms=cooldown_ms,
+                )
+
+    def _reset_throttle(self, reason: str) -> None:
+        """Clear consecutive_stay_silent + cooldown after a real signal."""
+        if self._consecutive_stay_silent > 0 or self._cooldown_until_ms > 0:
+            log.info(
+                "router.cost_throttle.reset",
+                reason=reason,
+                prior_consecutive_n=self._consecutive_stay_silent,
+            )
+        self._consecutive_stay_silent = 0
+        self._cooldown_until_ms = 0
+
     def _maybe_push_utterance(self, decision: BrainDecision, t_ms: int) -> None:
         if decision.decision != "speak":
             return
@@ -507,6 +708,32 @@ def _event_to_payload(event: RouterEvent) -> dict[str, Any]:
         "t_ms": event.t_ms,
         **event.payload,
     }
+
+
+def _fingerprint_payload(event: RouterEvent) -> dict[str, Any]:
+    """Curated event-payload subset for the cost-throttle fingerprint.
+
+    Distinct from ``_event_to_payload`` (which feeds the brain prompt
+    and snapshot row, where ``t_ms`` IS material). The fingerprint
+    needs an order-stable, time-stripped projection so two
+    semantically-identical events fingerprint-match across the
+    wall-clock drift of two dispatches:
+
+    - ``t_ms`` is dropped — it flickers every dispatch.
+    - ``merged_from`` is dropped — coalescer drain order is not byte-stable.
+    - ``concurrent_transcripts`` (HIGH-priority batches) and
+      ``transcripts`` (TURN_END collapse batches) are sorted before
+      hashing so two arrival orders produce the same hash.
+    """
+    payload: dict[str, Any] = {"type": event.type.value}
+    for key, value in event.payload.items():
+        if key in ("t_ms", "merged_from"):
+            continue
+        if key in ("concurrent_transcripts", "transcripts") and isinstance(value, list):
+            payload[key] = sorted(str(item) for item in value)
+            continue
+        payload[key] = value
+    return payload
 
 
 def _decision_payload(decision: BrainDecision) -> dict[str, Any]:
