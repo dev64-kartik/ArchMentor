@@ -91,8 +91,13 @@ class FakeBrainClient:
         state: SessionState,
         event: dict[str, Any],
         t_ms: int,
+        utterance_listener: Callable[[str], Any] | None = None,
     ) -> BrainDecision:
         self.calls.append(_RecordedCall(state=state, event=dict(event), t_ms=t_ms))
+        # M4: when an `utterance_listener` is wired and the scripted
+        # decision is `speak`, push the full utterance through the
+        # listener so streaming-tts integration tests observe `audio_played`.
+        # Tests that don't care about the listener pass `utterance_listener=None`.
         if self.delay_s > 0:
             # `asyncio.sleep` is a cancellation point — exactly what
             # the cancel-mid-call tests rely on.
@@ -100,10 +105,16 @@ class FakeBrainClient:
         if self.raise_on_call is not None:
             raise self.raise_on_call
         if self._scripted:
-            return self._scripted.popleft()
-        if self.decision_factory is not None:
-            return self.decision_factory(state, event, t_ms)
-        return BrainDecision.stay_silent("default_test_response")
+            decision = self._scripted.popleft()
+        elif self.decision_factory is not None:
+            decision = self.decision_factory(state, event, t_ms)
+        else:
+            decision = BrainDecision.stay_silent("default_test_response")
+        if utterance_listener is not None and decision.decision == "speak" and decision.utterance:
+            result = utterance_listener(decision.utterance)
+            if asyncio.iscoroutine(result):
+                await result
+        return decision
 
     async def aclose(self) -> None:
         return None

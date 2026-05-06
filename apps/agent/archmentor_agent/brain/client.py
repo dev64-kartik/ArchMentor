@@ -27,8 +27,10 @@ Logging vocabulary:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 import threading
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import anthropic
@@ -47,7 +49,28 @@ from archmentor_agent.state import SessionState
 
 log = structlog.get_logger(__name__)
 
+# Type alias for `BrainClient.decide(utterance_listener=...)`. Each call
+# delivers the *new portion* of the streamed `utterance` field — the
+# substring that wasn't visible in the previous snapshot. The listener
+# is awaited synchronously inside the stream loop, so it should be cheap
+# (e.g. push into a `livekit-agents` SynthesizeStream).
+UtteranceListener = Callable[[str], Awaitable[None]]
+
 _MAX_TOKENS = 1024
+
+# Floor before the streaming utterance listener is invoked. Single-char
+# snapshots can be partial-token noise from the JSON parser; waiting
+# until the prefix is at least 2 chars dodges most of that without
+# materially delaying TTS (Kokoro on Apple Silicon's per-call inference
+# is itself the dominant cost). M4 plan, Unit 3 deferred-to-implementation
+# note on first-sentence minimum length.
+_UTTERANCE_LISTENER_MIN_CHARS = 2
+
+# M4 R3d — closing fragment pushed through the streaming TTS when
+# post-stream validation rejects the tool_use input after partial audio
+# has played. The surrounding "—" matches M3 R27/R28 voice and the lower
+# minimum sentence length so the SentenceTokenizer flushes promptly.
+_SCHEMA_VIOLATION_TAIL = " — actually, let me think again."
 
 # Bounds a single Anthropic call. Without this, the SDK default of 600 s
 # combined with `max_retries=2` (= 3 total attempts) would let a hung
@@ -75,6 +98,12 @@ _BRAIN_DEADLINE_S = 180.0
 _DECISION_VALIDATOR = Draft202012Validator(
     dict(INTERVIEW_DECISION_TOOL["input_schema"]),
 )
+
+# Schema error_paths whose values carry transcript- or candidate-derived
+# text. The schema-violation log emits `error_path` + `first_error` to
+# locate the bug; the offending value is redacted for these fields so
+# transcript bytes never leak to log sinks.
+_REDACTED_ERROR_FIELDS = ("utterance", "reasoning", "session_summary_append")
 
 
 class BrainClient:
@@ -110,6 +139,7 @@ class BrainClient:
         state: SessionState,
         event: dict[str, Any],
         t_ms: int,
+        utterance_listener: UtteranceListener | None = None,
     ) -> BrainDecision:
         """Run one brain call and return a `BrainDecision`.
 
@@ -120,7 +150,37 @@ class BrainClient:
 
         `asyncio.CancelledError` propagates. The router relies on it
         to abort the call when the candidate starts speaking.
+
+        When `utterance_listener` is provided, the streaming path
+        (`messages.stream`) is used and each new portion of the
+        `utterance` field is awaited on the listener as soon as the
+        SDK surfaces it — this is the production live-session flow,
+        used to drive sentence-chunked Kokoro TTS (M4 Unit 4).
+
+        When `utterance_listener is None`, the legacy blocking path
+        (`messages.create`) is used; this keeps `scripts/replay.py`
+        deterministic relative to the M2/M3 era and simplifies tests
+        that don't care about streaming semantics. See M4 plan Unit 3.
         """
+        if utterance_listener is None:
+            return await self._decide_blocking(state=state, event=event, t_ms=t_ms)
+        return await self._decide_streaming(
+            state=state,
+            event=event,
+            t_ms=t_ms,
+            utterance_listener=utterance_listener,
+        )
+
+    async def _decide_blocking(
+        self,
+        *,
+        state: SessionState,
+        event: dict[str, Any],
+        t_ms: int,
+    ) -> BrainDecision:
+        """Non-streaming `messages.create` path. Reached from
+        `scripts/replay.py` and from any caller that doesn't pass an
+        `utterance_listener`. Behaviour unchanged from M2/M3."""
         kwargs = build_call_kwargs(
             state,
             event,
@@ -136,9 +196,10 @@ class BrainClient:
             transcript_turns=len(state.transcript_window),
             decisions=len(state.decisions),
             phase=state.phase.value,
+            mode="blocking",
         )
 
-        call_start_s = asyncio.get_event_loop().time()
+        call_start_s = asyncio.get_running_loop().time()
 
         try:
             response: Message = await asyncio.wait_for(
@@ -198,7 +259,7 @@ class BrainClient:
             # this branch to matter; if the SDK lets CancelledError propagate
             # transparently the `except TimeoutError` branch above already
             # handles it correctly.
-            elapsed_s = asyncio.get_event_loop().time() - call_start_s
+            elapsed_s = asyncio.get_running_loop().time() - call_start_s
             if elapsed_s >= _BRAIN_DEADLINE_S:
                 log.error(
                     "brain.api_error",
@@ -234,83 +295,213 @@ class BrainClient:
             return BrainDecision.stay_silent("api_error")
 
         usage = _usage_from_response(response.usage, model=self._model)
+        return _assemble_decision_from_message(response, t_ms=t_ms, usage=usage)
 
-        if response.stop_reason != "tool_use":
-            log.warning(
-                "brain.unexpected_stop",
-                t_ms=t_ms,
-                stop_reason=response.stop_reason,
-            )
-            return BrainDecision.stay_silent("unexpected_stop_reason", usage=usage)
+    async def _decide_streaming(
+        self,
+        *,
+        state: SessionState,
+        event: dict[str, Any],
+        t_ms: int,
+        utterance_listener: UtteranceListener,
+    ) -> BrainDecision:
+        """Streaming `messages.stream` path used in live sessions.
 
-        tool_block = _extract_tool_block(response)
-        if tool_block is None:
-            log.warning("brain.missing_tool_block", t_ms=t_ms)
-            return BrainDecision.stay_silent("missing_tool_block", usage=usage)
+        Each new portion of the `utterance` field is awaited on
+        `utterance_listener` as soon as the SDK surfaces it. After
+        `message_stop`, the accumulated `tool_use.input` is validated
+        against the same jsonschema + XML-spillover recovery + utterance
+        sanitiser the blocking path uses; the resulting `BrainDecision`
+        has the same shape regardless of which entry point produced it.
 
-        # SDK types tool_block.input as object; cast to dict for
-        # downstream consumption. A non-dict here is a Claude-side
-        # regression worth loud-erroring on.
-        tool_input = tool_block.input
-        if not isinstance(tool_input, dict):
-            log.warning(
-                "brain.schema_violation",
-                t_ms=t_ms,
-                reason="tool_input_not_object",
-            )
-            return BrainDecision.schema_violation(None, usage=usage)
+        Streaming-error decision matrix (M4 plan §405-422):
+        - 4xx (Auth/BadRequest) → propagate (caller bug).
+        - 5xx / RateLimit → degrade to `stay_silent("api_error")`.
+        - APIConnectionError after `_BRAIN_DEADLINE_S` →
+          `stay_silent("anthropic_api_connection_during_wait_for")`.
+        - APIConnectionError within deadline → propagate (router catches).
+        - `asyncio.TimeoutError` → `stay_silent("brain_timeout")` (R27 fires).
+        - `CancelledError` → propagate (router invariant I2).
+        - Final-validation failure → `BrainDecision.schema_violation(...)`.
 
-        # Recover Opus's XML-tool-use spillover before validation. Opus
-        # 4.x intermittently emits nested-object fields as a single
-        # string of `<parameter name="...">value</parameter>` even
-        # though the schema asks for an object. Observed in M3 dogfood
-        # 2026-04-25 when state_updates arrived as one long XML blob,
-        # which previously crashed the entire dispatch and silently
-        # dropped a real session_summary update.
-        tool_input = _recover_xml_tool_input(tool_input, t_ms=t_ms)
-
-        errors = sorted(_DECISION_VALIDATOR.iter_errors(tool_input), key=lambda e: e.path)
-        if errors:
-            first = errors[0]
-            # Log the JSON pointer to the offending field plus a short
-            # snippet of the value. Without these the operator can't tell
-            # which sub-key the brain mangled — observed during the M3
-            # dogfood when Opus emitted `"\n"` for an object-typed field.
-            error_path = "/".join(str(part) for part in first.absolute_path) or "<root>"
-            offending = repr(first.instance)
-            if len(offending) > 80:
-                offending = offending[:80] + "…"
-            log.warning(
-                "brain.schema_violation",
-                t_ms=t_ms,
-                first_error=first.message,
-                error_path=error_path,
-                offending_value=offending,
-                error_count=len(errors),
-            )
-            return BrainDecision.schema_violation(tool_input, usage=usage)
-
-        decision = BrainDecision.from_tool_block(tool_input, usage=usage)
-        if decision.reason in ("utterance_too_long", "utterance_has_control_chars"):
-            log.warning(
-                "brain.utterance_rejected",
-                t_ms=t_ms,
-                reason=decision.reason,
-            )
+        Partial TTS audio that already played is NOT rolled back when
+        post-stream validation fails; the audio is in the candidate's
+        ear and the snapshot row carries the discriminator.
+        """
+        kwargs = build_call_kwargs(
+            state,
+            event,
+            model=self._model,
+            tool=INTERVIEW_DECISION_TOOL,
+            max_tokens=_MAX_TOKENS,
+        )
 
         log.info(
-            "brain.call.end",
+            "brain.call.begin",
             t_ms=t_ms,
-            decision=decision.decision,
-            priority=decision.priority,
-            confidence=decision.confidence,
-            reason=decision.reason,
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cache_creation_input_tokens=usage.cache_creation_input_tokens,
-            cache_read_input_tokens=usage.cache_read_input_tokens,
-            cost_usd=usage.cost_usd,
+            model=self._model,
+            transcript_turns=len(state.transcript_window),
+            decisions=len(state.decisions),
+            phase=state.phase.value,
+            mode="streaming",
         )
+
+        call_start_s = asyncio.get_running_loop().time()
+
+        try:
+            return await asyncio.wait_for(
+                self._stream_and_assemble(
+                    kwargs=kwargs,
+                    t_ms=t_ms,
+                    utterance_listener=utterance_listener,
+                ),
+                timeout=_BRAIN_DEADLINE_S,
+            )
+        except TimeoutError:
+            log.error(
+                "brain.api_error",
+                t_ms=t_ms,
+                kind="TimeoutError",
+                deadline_s=_BRAIN_DEADLINE_S,
+                mode="streaming",
+            )
+            return BrainDecision.stay_silent("brain_timeout")
+        except (anthropic.BadRequestError, anthropic.AuthenticationError) as exc:
+            log.error(
+                "brain.api_error",
+                t_ms=t_ms,
+                kind=type(exc).__name__,
+                status=getattr(exc, "status_code", None),
+                mode="streaming",
+            )
+            raise
+        except anthropic.APIConnectionError as exc:
+            elapsed_s = asyncio.get_running_loop().time() - call_start_s
+            if elapsed_s >= _BRAIN_DEADLINE_S:
+                log.error(
+                    "brain.api_error",
+                    t_ms=t_ms,
+                    kind="APIConnectionError_after_deadline",
+                    elapsed_s=elapsed_s,
+                    deadline_s=_BRAIN_DEADLINE_S,
+                    mode="streaming",
+                )
+                return BrainDecision.stay_silent("anthropic_api_connection_during_wait_for")
+            log.error(
+                "brain.api_error",
+                t_ms=t_ms,
+                kind=type(exc).__name__,
+                elapsed_s=elapsed_s,
+                mode="streaming",
+            )
+            # Mid-stream connection drops degrade to `api_error` (M4 plan
+            # §405-422 row "APIConnectionError within deadline, mid-stream
+            # → stay_silent('api_error')") — the router doesn't catch
+            # generic Exception here; we own the degrade.
+            return BrainDecision.stay_silent("api_error")
+        except (
+            anthropic.RateLimitError,
+            anthropic.APIStatusError,
+        ) as exc:
+            log.error(
+                "brain.api_error",
+                t_ms=t_ms,
+                kind=type(exc).__name__,
+                status=getattr(exc, "status_code", None),
+                mode="streaming",
+            )
+            return BrainDecision.stay_silent("api_error")
+
+    async def _stream_and_assemble(
+        self,
+        *,
+        kwargs: dict[str, Any],
+        t_ms: int,
+        utterance_listener: UtteranceListener,
+    ) -> BrainDecision:
+        """Drive the SDK stream and return an assembled `BrainDecision`.
+
+        Wrapped by `_decide_streaming` in `asyncio.wait_for(_BRAIN_DEADLINE_S)`
+        and one outer try/except that maps SDK errors to the streaming-
+        path decision matrix. Splitting this into its own coroutine lets
+        the timeout-and-error scaffolding stay readable.
+        """
+        utterance_high_water = 0
+        first_delta_logged = False
+
+        async with self._client.messages.stream(**kwargs) as stream:
+            async for stream_event in stream:
+                # We only react to `input_json` events. Other events
+                # (message_start, content_block_start/stop, etc.) just
+                # accumulate the SDK's internal snapshot — the helper
+                # `accumulate_event` runs ahead of `build_events`, so
+                # by the time we see them the snapshot is already updated.
+                if getattr(stream_event, "type", None) != "input_json":
+                    continue
+                snapshot = getattr(stream_event, "snapshot", None)
+                if not isinstance(snapshot, dict):
+                    continue
+                utterance = snapshot.get("utterance")
+                if not isinstance(utterance, str):
+                    continue
+                if len(utterance) < _UTTERANCE_LISTENER_MIN_CHARS:
+                    continue
+                if len(utterance) <= utterance_high_water:
+                    # Snapshot didn't grow this tick (SDK can re-emit on
+                    # mid-token deltas). Nothing to push.
+                    continue
+                delta = utterance[utterance_high_water:]
+                utterance_high_water = len(utterance)
+                if not first_delta_logged:
+                    log.info(
+                        "brain.stream.utterance.first_delta",
+                        t_ms=t_ms,
+                        chars=len(delta),
+                    )
+                    first_delta_logged = True
+                # Listener is awaited inline so back-pressure from the
+                # downstream TTS path naturally throttles the stream.
+                await utterance_listener(delta)
+            final_message = await stream.get_final_message()
+
+        if first_delta_logged:
+            log.info(
+                "brain.stream.utterance.complete",
+                t_ms=t_ms,
+                total_chars=utterance_high_water,
+            )
+
+        usage = _usage_from_response(getattr(final_message, "usage", None), model=self._model)
+        decision = _assemble_decision_from_message(final_message, t_ms=t_ms, usage=usage)
+
+        # M4 R3d — schema-violation tail in the interviewer's voice.
+        # When post-stream validation rejects the tool_use input AND the
+        # candidate already heard partial audio, push a closing token
+        # through the SAME listener so the half-sentence resolves on a
+        # complete clause. Without this, the next dispatch may steelman
+        # an unrelated point and the candidate hears jarring jumps like
+        # "Walk me through capacit— [pause] — How would you partition?".
+        # Discriminate the row as `schema_violation_partial_recovery` so
+        # the eval harness can filter it; the router treats it the same
+        # as `schema_violation` for the consecutive-violations counter.
+        if decision.reason == "schema_violation" and utterance_high_water > 0:
+            try:
+                await utterance_listener(_SCHEMA_VIOLATION_TAIL)
+            except Exception:
+                log.exception(
+                    "brain.stream.schema_violation_tail_failed",
+                    t_ms=t_ms,
+                )
+            decision = BrainDecision.schema_violation(
+                decision.raw_input or None,
+                usage=usage,
+            )
+            decision = _replace_decision_reason(decision, "schema_violation_partial_recovery")
+            log.info(
+                "brain.stream.schema_violation_partial_recovery",
+                t_ms=t_ms,
+            )
+
         return decision
 
     async def aclose(self) -> None:
@@ -324,6 +515,132 @@ def _extract_tool_block(response: Message) -> ToolUseBlock | None:
         if isinstance(block, ToolUseBlock) and block.name == INTERVIEW_DECISION_TOOL["name"]:
             return block
     return None
+
+
+def _replace_decision_reason(decision: BrainDecision, reason: str) -> BrainDecision:
+    """Return a copy of ``decision`` with a new ``reason`` discriminator.
+
+    Used for the streaming-path post-recovery cases where the decision
+    shape is otherwise unchanged but the reason needs a more specific
+    suffix for replay tooling. ``BrainDecision`` is a frozen dataclass,
+    so we materialise a new instance rather than mutating in place.
+    Using ``dataclasses.replace`` keeps this in sync automatically when
+    new fields are added — the prior manual field-by-field rebuild was
+    a silent-drop hazard during M5/M6 schema growth.
+    """
+    return dataclasses.replace(decision, reason=reason)
+
+
+def _assemble_decision_from_message(
+    response: Any,
+    *,
+    t_ms: int,
+    usage: BrainUsage,
+) -> BrainDecision:
+    """Validate a complete `Message` and produce a `BrainDecision`.
+
+    Shared between the blocking and streaming entry points so the only
+    difference between them is the SDK call shape — error taxonomy and
+    `BrainDecision` output identical otherwise. Runs the same four
+    checks, in the same order:
+
+    1. ``stop_reason == "tool_use"`` — model honored ``tool_choice``.
+    2. ``tool_block`` exists with the expected name.
+    3. ``tool_block.input`` is a dict (not a list/string regression).
+    4. XML-spillover recovery, then jsonschema validation, then sanitize.
+
+    The function accepts ``Any`` rather than ``Message`` because the
+    streaming path delivers the SDK's ``ParsedMessage`` (a subclass) and
+    test fakes pass duck-typed stand-ins; the field accesses below are
+    the only contract we depend on.
+    """
+    if getattr(response, "stop_reason", None) != "tool_use":
+        log.warning(
+            "brain.unexpected_stop",
+            t_ms=t_ms,
+            stop_reason=getattr(response, "stop_reason", None),
+        )
+        return BrainDecision.stay_silent("unexpected_stop_reason", usage=usage)
+
+    tool_block = _extract_tool_block(response)
+    if tool_block is None:
+        log.warning("brain.missing_tool_block", t_ms=t_ms)
+        return BrainDecision.stay_silent("missing_tool_block", usage=usage)
+
+    # SDK types tool_block.input as object; cast to dict for downstream
+    # consumption. A non-dict here is a Claude-side regression worth
+    # loud-erroring on.
+    tool_input = tool_block.input
+    if not isinstance(tool_input, dict):
+        log.warning(
+            "brain.schema_violation",
+            t_ms=t_ms,
+            reason="tool_input_not_object",
+        )
+        return BrainDecision.schema_violation(None, usage=usage)
+
+    # Recover Opus's XML-tool-use spillover before validation. Opus 4.x
+    # intermittently emits nested-object fields as a single string of
+    # `<parameter name="...">value</parameter>` even though the schema
+    # asks for an object. Observed in M3 dogfood 2026-04-25 when
+    # state_updates arrived as one long XML blob, which previously
+    # crashed the entire dispatch and silently dropped a real
+    # session_summary update.
+    tool_input = _recover_xml_tool_input(tool_input, t_ms=t_ms)
+
+    errors = sorted(_DECISION_VALIDATOR.iter_errors(tool_input), key=lambda e: e.path)
+    if errors:
+        first = errors[0]
+        # Log the JSON pointer to the offending field plus a short
+        # snippet of the value. Without these the operator can't tell
+        # which sub-key the brain mangled — observed during the M3
+        # dogfood when Opus emitted `"\n"` for an object-typed field.
+        error_path = "/".join(str(part) for part in first.absolute_path) or "<root>"
+        # Redact content-bearing fields (transcript-derived text from the
+        # candidate side) before logging. error_path + first.message
+        # localise the schema bug; the value bytes are not needed and
+        # leaking them downstream to log sinks widens the blast radius
+        # of a prompt-injection-style transcript.
+        if error_path in _REDACTED_ERROR_FIELDS or any(
+            error_path.startswith(prefix + "/") for prefix in _REDACTED_ERROR_FIELDS
+        ):
+            offending = f"<redacted len={len(repr(first.instance))}>"
+        else:
+            offending = repr(first.instance)
+            if len(offending) > 80:
+                offending = offending[:80] + "…"
+        log.warning(
+            "brain.schema_violation",
+            t_ms=t_ms,
+            first_error=first.message,
+            error_path=error_path,
+            offending_value=offending,
+            error_count=len(errors),
+        )
+        return BrainDecision.schema_violation(tool_input, usage=usage)
+
+    decision = BrainDecision.from_tool_block(tool_input, usage=usage)
+    if decision.reason in ("utterance_too_long", "utterance_has_control_chars"):
+        log.warning(
+            "brain.utterance_rejected",
+            t_ms=t_ms,
+            reason=decision.reason,
+        )
+
+    log.info(
+        "brain.call.end",
+        t_ms=t_ms,
+        decision=decision.decision,
+        priority=decision.priority,
+        confidence=decision.confidence,
+        reason=decision.reason,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens,
+        cache_read_input_tokens=usage.cache_read_input_tokens,
+        cost_usd=usage.cost_usd,
+    )
+    return decision
 
 
 # The only object-typed key on `interview_decision` that Opus intermittently

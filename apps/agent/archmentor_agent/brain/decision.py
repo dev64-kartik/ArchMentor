@@ -130,6 +130,18 @@ class BrainDecision:
     reason: str | None = None  # populated for non-happy paths only
     usage: BrainUsage = field(default_factory=BrainUsage)
     raw_input: dict[str, Any] = field(default_factory=dict)
+    # True only on the streaming-cancel-mid-stream factory below
+    # (`BrainDecision.partial`). All other factories leave it False so
+    # M5/M6 replay readers fail loudly on the unknown discriminator
+    # combination instead of silently classifying a partial-played row
+    # as an abstention. See M4 plan R3c.
+    #
+    # Field name uses `is_partial` rather than `partial` because
+    # frozen+slots dataclasses materialize each field as a member
+    # descriptor on the class, which would shadow the `partial(...)`
+    # classmethod factory below. Keep the factory's name canonical
+    # (matches the plan); rename the predicate.
+    is_partial: bool = False
 
     @classmethod
     def from_tool_block(
@@ -247,6 +259,85 @@ class BrainDecision:
         writes a snapshot + ledger event for operator visibility.
         """
         return cls._silent(reason="cost_capped", confidence=1.0)
+
+    @classmethod
+    def skipped_idempotent(cls) -> BrainDecision:
+        """Router-side short-circuit when the brain-input fingerprint matches the last call.
+
+        The fingerprint hashes a curated subset of state + event payload
+        (transcript_turn_count, decisions_count, phase, active_argument
+        topic, fingerprint_payload). When two consecutive dispatches see
+        identical inputs and the prior decision was ``stay_silent``, no
+        Anthropic call is worth making — re-asking the brain the same
+        question yields the same answer and burns budget.
+
+        Snapshot + ``brain_decision`` ledger row still emit so replay /
+        cost-throttle observability survives. ``BrainUsage`` is empty;
+        the ``cost_usd_total`` line in the next CAS apply doesn't move.
+        """
+        return cls._silent(reason="skipped_idempotent", confidence=1.0)
+
+    @classmethod
+    def partial(
+        cls,
+        *,
+        utterance: str,
+        reason: str,
+        usage: BrainUsage | None = None,
+    ) -> BrainDecision:
+        """Snapshot of a streaming dispatch cancelled after partial audio played.
+
+        Constructed when `task.cancel()` arrives mid-stream after the
+        brain has emitted at least one ``utterance`` delta and the
+        candidate has heard partial audio, but before the SDK reaches
+        ``message_stop``. The accumulated utterance string is preserved
+        so M5/M6 replay tooling can reconstruct exactly what the
+        candidate heard; ``decision`` collapses to ``stay_silent`` so
+        downstream consumers without the new ``partial`` discriminator
+        still treat it as "no further action this turn." The combination
+        ``decision="stay_silent" + reason=<...> + partial=True`` is the
+        explicit three-part discriminator. See M4 plan R3c.
+        """
+        return cls(
+            decision="stay_silent",
+            priority="low",
+            confidence=0.0,
+            reasoning="",
+            utterance=utterance,
+            reason=reason,
+            usage=usage or BrainUsage(),
+            raw_input={},
+            is_partial=True,
+        )
+
+    @classmethod
+    def skipped_cooldown(cls, *, cooldown_ms: int) -> BrainDecision:
+        """Router-side short-circuit during the exponential-backoff window.
+
+        After ``N >= 2`` consecutive ``stay_silent`` outcomes, the router
+        sets a cooldown of ``min(60_000, 4_000 * 2 ** (N-1))`` ms during
+        which non-TURN_END / non-PHASE_TIMER events are skipped. The
+        cooldown clears on any speak decision or any TURN_END event;
+        PHASE_TIMER bypasses the cooldown gate (refinements R2 — it
+        exists *to break a stuck silence*).
+
+        ``cooldown_ms`` carries the active cooldown duration so the
+        snapshot row records "how aggressively was the throttle
+        engaged."
+        """
+        decision = cls._silent(reason="stay_silent_backoff", confidence=1.0)
+        # Carry cooldown_ms via raw_input — keeps the dataclass shape
+        # stable while exposing the diagnostic value to snapshot rows.
+        return cls(
+            decision=decision.decision,
+            priority=decision.priority,
+            confidence=decision.confidence,
+            reasoning=decision.reasoning,
+            utterance=decision.utterance,
+            reason=decision.reason,
+            usage=decision.usage,
+            raw_input={"cooldown_ms": int(cooldown_ms)},
+        )
 
 
 __all__ = [

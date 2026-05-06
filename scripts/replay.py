@@ -145,6 +145,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--password",
         help="GoTrue password for --lifecycle sign-in.",
     )
+    parser.add_argument(
+        "--cost-throttle-stats",
+        metavar="SESSION_UUID",
+        help="Print cost-throttle outcome counts (skipped_idempotent, "
+        "skipped_cooldown, etc.) for a session by counting brain_snapshot "
+        "rows by `reason`. M4 dogfood gate (Unit 10).",
+    )
     return parser
 
 
@@ -573,9 +580,72 @@ async def _run_lifecycle(email: str, password: str) -> int:
     return EXIT_MATCH
 
 
+def run_cost_throttle_stats(session_id: str) -> int:
+    """Print cost-throttle outcome counts for a single session.
+
+    Reads `brain_snapshots` rows for the session and counts the
+    distribution of `brain_output_json.decision` and the secondary
+    `reason` discriminator. Skipped paths (`skipped_idempotent`,
+    `skipped_cooldown`) carry the M4 dogfood-gate signal — when they
+    dominate during canvas-only sequences the throttle is doing its
+    job; when they're empty the throttle never armed.
+    """
+    try:
+        session_uuid = UUID(session_id)
+    except ValueError as exc:
+        print(f"--cost-throttle-stats expects a UUID: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    from sqlalchemy import select
+
+    decision_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    total = 0
+    cost_usd = 0.0
+    with Session(engine) as db:
+        stmt = (
+            select(BrainSnapshot)
+            .where(BrainSnapshot.session_id == session_uuid)
+            .order_by(BrainSnapshot.t_ms)
+        )
+        for row in db.exec(stmt).scalars():
+            data = dict(row.brain_output_json)
+            decision = str(data.get("decision") or "unknown")
+            reason = str(data.get("reason") or "")
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+            if reason:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            usage = data.get("usage")
+            if isinstance(usage, dict):
+                cost = usage.get("cost_usd")
+                if isinstance(cost, (int, float)):
+                    cost_usd += float(cost)
+            total += 1
+
+    if total == 0:
+        print(f"no brain_snapshots rows for session {session_uuid}")
+        return EXIT_NOT_FOUND
+
+    print(f"=== cost-throttle stats for session {session_uuid} ===")
+    print(f"total snapshots: {total}")
+    print(f"total brain cost (sum of snapshot.usage.cost_usd): ${cost_usd:.4f}")
+    print()
+    print("decisions:")
+    for kind in sorted(decision_counts):
+        print(f"  {kind:20s} {decision_counts[kind]}")
+    if reason_counts:
+        print()
+        print("reasons (skipped_* dominate during canvas-only sequences):")
+        for reason in sorted(reason_counts):
+            print(f"  {reason:36s} {reason_counts[reason]}")
+    return EXIT_MATCH
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.cost_throttle_stats:
+        return run_cost_throttle_stats(args.cost_throttle_stats)
     if args.lifecycle:
         if not args.email or not args.password:
             print(

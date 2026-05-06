@@ -157,7 +157,7 @@ class RedisSessionStore:
         session_id: UUID,
         mutator: StateMutator,
         *,
-        max_retries: int = 3,
+        max_retries: int = 6,
     ) -> SessionState:
         """CAS-protected read-modify-write.
 
@@ -166,6 +166,14 @@ class RedisSessionStore:
         `RedisCasExhaustedError` rather than silently dropping the
         update — losing state without telling the caller masks the
         exact bug we're trying to prevent.
+
+        The default was bumped from 3 to 6 in M4 Unit 5: with the
+        Haiku compactor running concurrently against the existing
+        transcript / canvas / brain-dispatch / phase-advance writers,
+        five active CAS writers compete on the single session key.
+        Three retries was sized for the M2/M3 contention budget (two
+        active writers); the new ceiling absorbs the compactor without
+        routinely starving the slower path.
 
         The mutator must be pure-sync. It receives the deserialized
         current state (None if the key doesn't exist) and returns the

@@ -34,6 +34,8 @@ from typing import Any, cast
 import anthropic
 import httpx
 import pytest
+from _helpers import FakeAsyncMessageStream, utterance_deltas
+from _helpers.streaming import FakeStreamEvent
 from anthropic import AsyncAnthropic
 from anthropic.types import Message, TextBlock, ToolUseBlock, Usage
 from archmentor_agent.brain.client import BrainClient
@@ -121,9 +123,11 @@ def _make_message(
 
 
 class _FakeMessages:
-    def __init__(self, responder):  # type: ignore[no-untyped-def]
+    def __init__(self, responder, stream_responder=None):  # type: ignore[no-untyped-def]
         self._responder = responder
+        self._stream_responder = stream_responder
         self.calls: list[dict[str, Any]] = []
+        self.stream_calls: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Message:
         self.calls.append(kwargs)
@@ -132,32 +136,45 @@ class _FakeMessages:
             return await result
         return result
 
+    def stream(self, **kwargs: Any):  # type: ignore[no-untyped-def]
+        # `stream(...)` does NOT await — it returns the manager
+        # synchronously, then the caller does `async with`. This
+        # mirrors the real SDK's `AsyncMessageStreamManager` shape.
+        self.stream_calls.append(kwargs)
+        if self._stream_responder is None:
+            raise AssertionError(
+                "_FakeMessages.stream called but no stream_responder configured; "
+                "tests that exercise the streaming path must pass `stream_responder=`."
+            )
+        return self._stream_responder(kwargs)
+
 
 class _FakeAnthropic:
     """Satisfies the subset of AsyncAnthropic surface BrainClient uses.
 
-    We only need `messages.create(...)` and `close()`. The real SDK has
-    retry middleware in front of `messages.create`; we test post-retry
-    behavior by having the fake raise the post-retry exception
-    directly. This mirrors the ledger-client test approach where
-    `httpx.MockTransport` stands in for the real transport.
+    We only need `messages.create(...)`, `messages.stream(...)`, and
+    `close()`. The real SDK has retry middleware in front of
+    `messages.create`; we test post-retry behavior by having the fake
+    raise the post-retry exception directly. This mirrors the ledger-
+    client test approach where `httpx.MockTransport` stands in for the
+    real transport.
     """
 
-    def __init__(self, responder):  # type: ignore[no-untyped-def]
-        self.messages = _FakeMessages(responder)
+    def __init__(self, responder, stream_responder=None):  # type: ignore[no-untyped-def]
+        self.messages = _FakeMessages(responder, stream_responder)
 
     async def close(self) -> None:
         return None
 
 
-def _client(responder) -> BrainClient:  # type: ignore[no-untyped-def]
+def _client(responder, stream_responder=None) -> BrainClient:  # type: ignore[no-untyped-def]
     # Cast through Any so BrainClient accepts our fake that quacks like
     # AsyncAnthropic without inheriting from it. `settings` is unused
     # when `client=` is provided — the constructor only touches it for
     # the api_key kwarg on the real AsyncAnthropic.
     return BrainClient(
         settings=cast(Settings, None),
-        client=cast(AsyncAnthropic, _FakeAnthropic(responder)),
+        client=cast(AsyncAnthropic, _FakeAnthropic(responder, stream_responder)),
     )
 
 
@@ -673,3 +690,482 @@ class TestErrorTaxonomy:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# ─────────────────────── streaming-path scenarios ─────────────────────
+
+
+class TestStreamingPath:
+    """Per M4 plan Unit 3 — streaming `BrainClient.decide` reshapes the
+    call to use `messages.stream(...)`, surfaces `utterance` deltas to a
+    listener, and validates the full `tool_use.input` after `message_stop`.
+
+    When `utterance_listener is None`, `decide()` falls through to the
+    legacy `_decide_blocking` path so replay (`scripts/replay.py`)
+    determinism is preserved.
+    """
+
+    async def test_listener_receives_each_utterance_delta(self) -> None:
+        utterance = "Walk me through your capacity assumptions."
+        events = utterance_deltas(utterance, chunks=4)
+        final_msg = _make_message(
+            tool_input=_valid_tool_input(
+                decision="speak",
+                priority="high",
+                confidence=0.85,
+                utterance=utterance,
+            ),
+        )
+
+        def stream_responder(_kwargs: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(events=events, final_message=final_msg)
+
+        client = _client(responder=lambda _k: final_msg, stream_responder=stream_responder)
+
+        deltas: list[str] = []
+
+        async def listener(delta: str) -> None:
+            deltas.append(delta)
+
+        decision = await client.decide(
+            state=_state(),
+            event={"type": "turn_end"},
+            t_ms=0,
+            utterance_listener=listener,
+        )
+
+        assert decision.decision == "speak"
+        assert decision.utterance == utterance
+        # Concatenated deltas reconstruct the full utterance.
+        assert "".join(deltas) == utterance
+        # No empty deltas (each event added new characters).
+        assert all(d for d in deltas)
+
+    async def test_no_listener_falls_through_to_blocking_path(self) -> None:
+        """Replay determinism: `decide()` without a listener still runs
+        the non-streaming `messages.create` path. No `stream_responder`
+        configured here — `_FakeMessages.stream` would assert if hit."""
+
+        def responder(_k: dict[str, Any]) -> Message:
+            return _make_message(tool_input=_valid_tool_input())
+
+        client = _client(responder)  # no stream_responder
+        decision = await client.decide(state=_state(), event={}, t_ms=0)
+        assert decision.decision == "stay_silent"
+
+    async def test_stay_silent_decision_never_invokes_listener(self) -> None:
+        """When `utterance` is null/missing throughout the stream, the
+        listener is never called."""
+        # Snapshot reveals only `decision`/`reasoning`, never `utterance`.
+        events = [
+            FakeStreamEvent(
+                type="input_json",
+                snapshot={"reasoning": "ok"},
+            ),
+            FakeStreamEvent(
+                type="input_json",
+                snapshot={"reasoning": "ok", "decision": "stay_silent"},
+            ),
+        ]
+        final_msg = _make_message(tool_input=_valid_tool_input())
+
+        def stream_responder(_kwargs: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(events=events, final_message=final_msg)
+
+        client = _client(responder=lambda _k: final_msg, stream_responder=stream_responder)
+        called = False
+
+        async def listener(_delta: str) -> None:
+            nonlocal called
+            called = True
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.decision == "stay_silent"
+        assert decision.reason is None
+        assert called is False
+
+    async def test_utterance_below_min_chars_skipped_until_two_chars(self) -> None:
+        """Single-char `utterance: "W"` snapshot should not trigger the
+        listener — the floor is 2 chars to dodge mid-token noise. Once
+        the snapshot grows past the floor, the full prefix is delivered
+        in one delta."""
+        events = [
+            FakeStreamEvent(type="input_json", snapshot={"utterance": "W"}),
+            FakeStreamEvent(type="input_json", snapshot={"utterance": "Wal"}),
+            FakeStreamEvent(type="input_json", snapshot={"utterance": "Walk."}),
+        ]
+        final_msg = _make_message(
+            tool_input=_valid_tool_input(decision="speak", utterance="Walk."),
+        )
+
+        def stream_responder(_k: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(events=events, final_message=final_msg)
+
+        client = _client(responder=lambda _k: final_msg, stream_responder=stream_responder)
+        deltas: list[str] = []
+
+        async def listener(d: str) -> None:
+            deltas.append(d)
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.utterance == "Walk."
+        assert "".join(deltas) == "Walk."
+        # First delta is "Wal" (3 chars) not "W" — floor skipped one event.
+        assert deltas[0] == "Wal"
+
+    async def test_control_char_utterance_rejected_post_stream(self) -> None:
+        """Final validation runs `sanitize_utterance` after `message_stop`;
+        a control char in the final input flips reason to
+        `utterance_has_control_chars`. The half-utterance the listener
+        already heard is NOT rolled back — by design, per M4 plan R4."""
+        utterance_with_ctrl = "ok\x00injection"
+        events = [
+            FakeStreamEvent(type="input_json", snapshot={"utterance": "ok"}),
+            FakeStreamEvent(
+                type="input_json",
+                snapshot={"utterance": utterance_with_ctrl},
+            ),
+        ]
+        final_msg = _make_message(
+            tool_input=_valid_tool_input(
+                decision="speak",
+                utterance=utterance_with_ctrl,
+            ),
+        )
+
+        def stream_responder(_k: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(events=events, final_message=final_msg)
+
+        client = _client(responder=lambda _k: final_msg, stream_responder=stream_responder)
+        deltas: list[str] = []
+
+        async def listener(d: str) -> None:
+            deltas.append(d)
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.decision == "stay_silent"
+        assert decision.reason == "utterance_has_control_chars"
+        # Listener still saw the partial pre-control-char text.
+        assert deltas[0] == "ok"
+
+    async def test_aenter_authentication_error_propagates(self) -> None:
+        def stream_responder(_k: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(
+                aenter_error=anthropic.AuthenticationError(
+                    message="bad key",
+                    response=_fake_http_error(401).response,
+                    body=None,
+                ),
+            )
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+
+        async def listener(_d: str) -> None:
+            pass
+
+        with pytest.raises(anthropic.AuthenticationError):
+            await client.decide(state=_state(), event={}, t_ms=0, utterance_listener=listener)
+
+    async def test_aenter_rate_limit_error_degrades_to_stay_silent(self) -> None:
+        def stream_responder(_k: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(
+                aenter_error=anthropic.RateLimitError(
+                    message="slow down",
+                    response=_fake_http_error(429).response,
+                    body=None,
+                ),
+            )
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+
+        async def listener(_d: str) -> None:
+            pass
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.decision == "stay_silent"
+        assert decision.reason == "api_error"
+
+    async def test_mid_stream_api_connection_error_degrades(self) -> None:
+        events = utterance_deltas("Walk me through capacity.", chunks=2)
+
+        def stream_responder(_k: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(
+                events=events,
+                aiter_error=anthropic.APIConnectionError(
+                    message="dropped mid-stream",
+                    request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+                ),
+                aiter_error_after=1,  # error fires after first event yields
+            )
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+        deltas: list[str] = []
+
+        async def listener(d: str) -> None:
+            deltas.append(d)
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.decision == "stay_silent"
+        assert decision.reason == "api_error"
+        # First delta still reached the listener before the error.
+        assert deltas, "listener should have received at least one delta"
+
+    async def test_stream_timeout_degrades_to_brain_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`asyncio.wait_for` deadline trips → `stay_silent("brain_timeout")`
+        so R27's synthetic recovery utterance fires (router-side path
+        unchanged from M2)."""
+        monkeypatch.setattr("archmentor_agent.brain.client._BRAIN_DEADLINE_S", 0.05)
+
+        class _HangingStream:
+            async def __aenter__(self) -> _HangingStream:
+                await asyncio.sleep(10)
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+            async def __aiter__(self):
+                if False:  # pragma: no cover
+                    yield None
+
+            async def get_final_message(self) -> Any:
+                raise AssertionError("should not reach")
+
+        def stream_responder(_k: dict[str, Any]) -> _HangingStream:
+            return _HangingStream()
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+
+        async def listener(_d: str) -> None:
+            pass
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.decision == "stay_silent"
+        assert decision.reason == "brain_timeout"
+
+    async def test_external_cancel_propagates_through_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Router invariant I2 — `cancel_in_flight()` must propagate
+        `CancelledError` through the streaming `async with` exit; the
+        wait_for wrapper must NOT shadow it as a TimeoutError."""
+        monkeypatch.setattr("archmentor_agent.brain.client._BRAIN_DEADLINE_S", 30.0)
+
+        class _HangingStream:
+            async def __aenter__(self) -> _HangingStream:
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+            async def __aiter__(self):
+                await asyncio.sleep(10)
+                if False:  # pragma: no cover
+                    yield None
+
+            async def get_final_message(self) -> Any:
+                raise AssertionError("should not reach")
+
+        def stream_responder(_k: dict[str, Any]) -> _HangingStream:
+            return _HangingStream()
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+
+        async def listener(_d: str) -> None:
+            pass
+
+        task = asyncio.create_task(
+            client.decide(state=_state(), event={}, t_ms=0, utterance_listener=listener)
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_post_stream_schema_violation_with_partial_audio_pushes_tail(
+        self,
+    ) -> None:
+        """M4 R3d — Final `tool_use.input` fails jsonschema validation,
+        but partial audio already played → push the closing tail through
+        the listener and discriminate as `schema_violation_partial_recovery`
+        so the candidate hears a graceful close instead of a half-sentence."""
+        utterance = "Walk me through capacity."
+        events = utterance_deltas(utterance, chunks=2)
+        bad_input = _valid_tool_input(decision="speak", utterance=utterance, confidence=1.5)
+        final_msg = _make_message(tool_input=bad_input)
+
+        def stream_responder(_k: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(events=events, final_message=final_msg)
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+        deltas: list[str] = []
+
+        async def listener(d: str) -> None:
+            deltas.append(d)
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.decision == "stay_silent"
+        assert decision.reason == "schema_violation_partial_recovery"
+        # Original utterance reached the listener.
+        assert "".join(deltas[:-1]) == utterance
+        # The closing tail was pushed through the same listener.
+        assert "let me think again" in deltas[-1]
+
+    async def test_post_stream_schema_violation_no_partial_audio_no_tail(
+        self,
+    ) -> None:
+        """When the schema violation occurs without any partial audio
+        having played (e.g. listener never invoked because `utterance`
+        key never appeared), R3d does NOT push a closing tail and the
+        reason stays `schema_violation`. The candidate heard nothing,
+        so there's nothing to gracefully close."""
+        # Stream emits zero `utterance` events; final has bad confidence.
+        events: list[FakeStreamEvent] = []
+        bad_input = _valid_tool_input(decision="stay_silent", confidence=1.5)
+        final_msg = _make_message(tool_input=bad_input)
+
+        def stream_responder(_k: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(events=events, final_message=final_msg)
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+        deltas: list[str] = []
+
+        async def listener(d: str) -> None:
+            deltas.append(d)
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.decision == "stay_silent"
+        assert decision.reason == "schema_violation"
+        assert deltas == []
+
+    async def test_post_stream_xml_tool_input_recovered(self) -> None:
+        """XML-spillover recovery runs only on the final accumulated dict,
+        per M4 plan R4 (never on partial snapshots)."""
+        utterance = "Pushed for QPS."
+        events = utterance_deltas(utterance, chunks=2)
+        tool_input = _valid_tool_input(
+            decision="speak",
+            utterance=utterance,
+        )
+        tool_input["state_updates"] = (
+            '<parameter name="session_summary_append">Pushed for QPS.</parameter>'
+        )
+        final_msg = _make_message(tool_input=tool_input)
+
+        def stream_responder(_k: dict[str, Any]) -> FakeAsyncMessageStream:
+            return FakeAsyncMessageStream(events=events, final_message=final_msg)
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+
+        async def listener(_d: str) -> None:
+            pass
+
+        decision = await client.decide(
+            state=_state(), event={}, t_ms=0, utterance_listener=listener
+        )
+        assert decision.reason is None
+        assert decision.state_updates == {
+            "session_summary_append": "Pushed for QPS.",
+        }
+
+    async def test_stream_kwargs_match_blocking_path(self) -> None:
+        """The streaming path must pass identical kwargs to `messages.stream`
+        as the blocking path passes to `messages.create`. Replay determinism
+        depends on this — the only difference between the two paths is the
+        SDK entry point, not the prompt or tool config."""
+        captured: dict[str, Any] = {}
+        utterance = "Hi."
+        final_msg = _make_message(
+            tool_input=_valid_tool_input(decision="speak", utterance=utterance),
+        )
+
+        def stream_responder(kwargs: dict[str, Any]) -> FakeAsyncMessageStream:
+            captured.update(kwargs)
+            return FakeAsyncMessageStream(
+                events=utterance_deltas(utterance, chunks=1),
+                final_message=final_msg,
+            )
+
+        client = _client(responder=lambda _k: None, stream_responder=stream_responder)
+
+        async def listener(_d: str) -> None:
+            pass
+
+        await client.decide(
+            state=_state(),
+            event={"type": "turn_end"},
+            t_ms=0,
+            utterance_listener=listener,
+        )
+        assert captured["model"] == BRAIN_MODEL
+        assert captured["tool_choice"] == {
+            "type": "tool",
+            "name": "interview_decision",
+        }
+        assert captured["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+class TestToolSchemaPropertyOrder:
+    """M4 plan R6: `utterance` must be the first property declared in
+    `INTERVIEW_DECISION_TOOL["input_schema"]["properties"]` so Anthropic
+    streams it first and TTS can start as soon as the model commits to
+    speaking."""
+
+    def test_utterance_is_first_property(self) -> None:
+        from archmentor_agent.brain.tools import INTERVIEW_DECISION_TOOL
+
+        first_key = next(iter(INTERVIEW_DECISION_TOOL["input_schema"]["properties"]))
+        assert first_key == "utterance", (
+            f"`utterance` must be declared first to minimize TTFA; got `{first_key}`"
+        )
+
+    def test_state_updates_is_last_property(self) -> None:
+        from archmentor_agent.brain.tools import INTERVIEW_DECISION_TOOL
+
+        keys = list(INTERVIEW_DECISION_TOOL["input_schema"]["properties"])
+        assert keys[-1] == "state_updates"
+
+
+class TestBrainDecisionPartialFactory:
+    """M4 plan R3c: `BrainDecision.partial(utterance, reason)` is the
+    explicit factory for cancellation post-utterance pre-`message_stop`.
+    Combination `decision="stay_silent" + reason=<...> + partial=True`
+    is the three-part discriminator M5/M6 replay readers look for."""
+
+    def test_partial_factory_carries_utterance_and_partial_flag(self) -> None:
+        decision = BrainDecision.partial(
+            utterance="Walk me through capacity.",
+            reason="cancelled_mid_stream",
+        )
+        assert decision.decision == "stay_silent"
+        assert decision.utterance == "Walk me through capacity."
+        assert decision.reason == "cancelled_mid_stream"
+        assert decision.is_partial is True
+
+    def test_other_factories_default_partial_false(self) -> None:
+        for d in (
+            BrainDecision.stay_silent("anything"),
+            BrainDecision.schema_violation(None),
+            BrainDecision.cost_capped(),
+            BrainDecision.skipped_idempotent(),
+            BrainDecision.skipped_cooldown(cooldown_ms=4_000),
+        ):
+            assert d.is_partial is False, f"{d.reason} should default is_partial=False"

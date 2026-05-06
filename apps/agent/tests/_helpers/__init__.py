@@ -13,10 +13,14 @@ from _helpers.brain import FakeBrainClient
 from _helpers.canvas import FakeCanvasSnapshotClient
 from _helpers.snapshots import FakeSnapshotClient
 from _helpers.store import FakeSessionStore
+from _helpers.streaming import FakeAsyncMessageStream, FakeStreamEvent, utterance_deltas
 
 __all__ = [
+    "FakeAsyncMessageStream",
     "FakeBrainClient",
     "FakeCanvasSnapshotClient",
     "FakeSessionStore",
     "FakeSnapshotClient",
+    "FakeStreamEvent",
+    "utterance_deltas",
 ]

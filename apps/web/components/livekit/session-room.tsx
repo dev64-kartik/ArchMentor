@@ -55,10 +55,26 @@ type AiSpeakingState = "idle" | "listening" | "speaking" | "thinking";
 // before the opening utterance has even finished playing.
 const MIN_SESSION_SEC = 45;
 
-// Allocate the decoder once — per-event `new TextDecoder()` is free
-// at single-digit ms scale but allocates a native object per data
+// Allocate decoders once — per-event `new TextDecoder()` is free at
+// single-digit ms scale but allocates a native object per data
 // message and the data channel fires on every agent phase transition.
+// Each topic gets its own instance so a future call site adding
+// `{ stream: true }` to one decoder can't corrupt the other's state.
 const AI_STATE_DECODER = new TextDecoder();
+const AI_TELEMETRY_DECODER = new TextDecoder();
+
+// Cost-budget telemetry payload published by the agent on the
+// `ai_telemetry` topic (M4 Unit 9 / R24). Five fixed fields, ~80 bytes
+// over the wire — small enough to ride `publishData` alongside
+// `ai_state` without crowding the data channel. Frontend renders the
+// thin `<CostBudgetIndicator>` progress bar from this.
+type AiTelemetry = {
+  costUsdTotal: number;
+  costCapUsd: number;
+  callsMade: number;
+  tokensInTotal: number;
+  tokensOutTotal: number;
+};
 
 function isAiSpeakingState(value: unknown): value is AiSpeakingState {
   return (
@@ -80,6 +96,51 @@ function parseAiState(payload: Uint8Array): AiSpeakingState | null {
     return null;
   } catch (err) {
     console.warn("[session] ai_state parse failed", err);
+    return null;
+  }
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  // `typeof` accepts NaN/Infinity which collapse downstream arithmetic
+  // (ratio = NaN → progress bar `width: NaN%`). Reject them at the
+  // boundary instead of letting them propagate.
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function parseAiTelemetry(payload: Uint8Array): AiTelemetry | null {
+  try {
+    const text = AI_TELEMETRY_DECODER.decode(payload);
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    if (
+      !("cost_usd_total" in parsed) ||
+      !("cost_cap_usd" in parsed) ||
+      !("calls_made" in parsed) ||
+      !("tokens_in_total" in parsed) ||
+      !("tokens_out_total" in parsed)
+    ) {
+      return null;
+    }
+    const { cost_usd_total, cost_cap_usd, calls_made, tokens_in_total, tokens_out_total } =
+      parsed;
+    if (
+      !isFiniteNumber(cost_usd_total) ||
+      !isFiniteNumber(cost_cap_usd) ||
+      !isFiniteNumber(calls_made) ||
+      !isFiniteNumber(tokens_in_total) ||
+      !isFiniteNumber(tokens_out_total)
+    ) {
+      return null;
+    }
+    return {
+      costUsdTotal: cost_usd_total,
+      costCapUsd: cost_cap_usd,
+      callsMade: calls_made,
+      tokensInTotal: tokens_in_total,
+      tokensOutTotal: tokens_out_total,
+    };
+  } catch (err) {
+    console.warn("[session] ai_telemetry parse failed", err);
     return null;
   }
 }
@@ -117,6 +178,7 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
     ConnectionState.Disconnected,
   );
   const [aiState, setAiState] = useState<AiSpeakingState>("idle");
+  const [aiTelemetry, setAiTelemetry] = useState<AiTelemetry | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
   const [joined, setJoined] = useState(false);
@@ -176,6 +238,7 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
   const resetJoinedState = useCallback(() => {
     setJoined(false);
     setAiState("idle");
+    setAiTelemetry(null);
     setElapsedSec(0);
     setMicHealth("idle");
     joiningRef.current = false;
@@ -233,22 +296,34 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
       // "thinking" }` on the `ai_state` topic at every phase boundary
       // so the UI can prompt the candidate to speak and tell them
       // when their input is being processed.
-      if (topic !== "ai_state") return;
-      // Origin filter: accept `ai_state` only from remote participants,
+      // The agent also publishes `{ cost_usd_total, cost_cap_usd,
+      // calls_made, tokens_in_total, tokens_out_total }` on the
+      // `ai_telemetry` topic once per brain dispatch (M4 Unit 9 / R24)
+      // so the candidate can see budget remaining live.
+      if (topic !== "ai_state" && topic !== "ai_telemetry") return;
+      // Origin filter: accept telemetry only from remote participants,
       // and reject messages from the local participant (we never send
       // them to ourselves in M1, but LiveKit loopback is easy to trip
       // into with a misconfigured second tab). Rejecting local also
       // blocks a malicious extension that publishes on the same topic.
       if (!participant || participant.isLocal) {
-        console.warn("[session] ai_state rejected: no remote origin", {
+        console.warn("[session] data rejected: no remote origin", {
+          topic,
           participant: participant?.identity,
         });
         return;
       }
-      const state = parseAiState(payload);
-      if (state) {
-        console.log("[session] ai_state", state, "from", participant.identity);
-        setAiState(state);
+      if (topic === "ai_state") {
+        const state = parseAiState(payload);
+        if (state) {
+          console.log("[session] ai_state", state, "from", participant.identity);
+          setAiState(state);
+        }
+        return;
+      }
+      const telemetry = parseAiTelemetry(payload);
+      if (telemetry) {
+        setAiTelemetry(telemetry);
       }
     });
     room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
@@ -474,6 +549,7 @@ export function SessionRoom({ room: roomName, sessionId, onRoomChange }: Props) 
         </span>
       </div>
       <AiStateIndicator state={aiState} />
+      <CostBudgetIndicator telemetry={aiTelemetry} />
 
       {!joined ? (
         <button
@@ -593,6 +669,51 @@ function AiStateIndicator({ state }: { state: AiSpeakingState }) {
       <div>{label}</div>
       {reassure ? (
         <div className="mt-1 text-sm font-normal opacity-90">{reassure}</div>
+      ) : null}
+    </div>
+  );
+}
+
+function CostBudgetIndicator({ telemetry }: { telemetry: AiTelemetry | null }) {
+  // Lives next to `<AiStateIndicator>`. Stays hidden until the first
+  // dispatch publishes telemetry — pre-first-frame the bar would
+  // render at $0.00 / $5.00 and draw the candidate's eye at the most
+  // sensitive moment (intro). Collapses to the dollar number alone
+  // when below 50% to keep budget out of the candidate's primary
+  // focus area; expands to a thin progress bar above 50%; turns red
+  // at the cap (the agent stays silent past the cap regardless, so
+  // the colour is a visible mirror of an existing behaviour).
+  if (!telemetry) return null;
+  const { costUsdTotal, costCapUsd } = telemetry;
+  const ratio = costCapUsd > 0 ? Math.min(1, costUsdTotal / costCapUsd) : 0;
+  const formatted = `$${costUsdTotal.toFixed(2)} / $${costCapUsd.toFixed(2)}`;
+  const collapsed = ratio < 0.5;
+  const capped = ratio >= 1;
+  const barColor = capped
+    ? "bg-red-500"
+    : ratio >= 0.8
+      ? "bg-amber-500"
+      : "bg-emerald-500";
+  const textColor = capped
+    ? "text-red-700 dark:text-red-300"
+    : "text-neutral-700 dark:text-neutral-300";
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      aria-label={`Session cost ${formatted}${capped ? " — budget reached" : ""}`}
+      className="flex items-center gap-2 text-xs"
+    >
+      <span className={`font-mono ${textColor}`}>
+        {collapsed ? `$${costUsdTotal.toFixed(2)}` : formatted}
+      </span>
+      {!collapsed ? (
+        <span className="h-1.5 w-24 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
+          <span
+            className={`block h-full ${barColor}`}
+            style={{ width: `${(ratio * 100).toFixed(1)}%` }}
+          />
+        </span>
       ) : null}
     </div>
   );

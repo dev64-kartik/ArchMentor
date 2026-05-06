@@ -36,7 +36,7 @@ class FakeSessionStore:
         session_id: UUID,
         mutator: StateMutator,
         *,
-        max_retries: int = 3,
+        max_retries: int = 6,
     ) -> SessionState:
         self.apply_calls += 1
         if self.cas_error is not None:

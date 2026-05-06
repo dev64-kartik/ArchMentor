@@ -135,3 +135,36 @@ def test_append_event_rejects_negative_t_ms(engine: Engine, live_session_id: str
             event_type=SessionEventType.ERROR,
             payload={},
         )
+
+
+def test_append_event_accepts_summary_compressed(engine: Engine, live_session_id: str) -> None:
+    """M4 Unit 5/6: the Haiku compactor writes `summary_compressed`
+    ledger rows. Adding the enum value to `SessionEventType` AND
+    landing the Alembic migration is a binding atomic pair — the
+    agent's ingest client must round-trip these without a 422."""
+    from uuid import UUID
+
+    session_id = UUID(live_session_id)
+    with Session(engine) as db:
+        event = append_event(
+            db,
+            session_id=session_id,
+            t_ms=125_000,
+            event_type=SessionEventType.SUMMARY_COMPRESSED,
+            payload={
+                "model": "anthropic/claude-haiku-4-5",
+                "input_tokens": 1_240,
+                "output_tokens": 220,
+                "cost_usd": 0.00234,
+                "dropped_turn_count": 5,
+                "summary_chars_before": 0,
+                "summary_chars_after": 412,
+            },
+        )
+        db.commit()
+        assert event.id is not None
+
+    with Session(engine) as db:
+        stored = db.exec(select(SessionEvent).where(SessionEvent.session_id == session_id)).one()
+        assert stored.type is SessionEventType.SUMMARY_COMPRESSED
+        assert stored.payload_json["dropped_turn_count"] == 5

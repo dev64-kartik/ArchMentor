@@ -12,12 +12,14 @@ unit-tested on their own; this file is the adapter seam.
 
 from __future__ import annotations
 
+import asyncio
+import uuid
 from typing import TYPE_CHECKING
 
 import numpy as np
 import structlog
 from livekit import rtc
-from livekit.agents import stt, tts
+from livekit.agents import stt, tokenize, tts
 from livekit.agents.language import LanguageCode
 from livekit.agents.types import (
     DEFAULT_API_CONNECT_OPTIONS,
@@ -201,16 +203,22 @@ class WhisperCppSTT(stt.STT):
 
 
 class KokoroStreamingTTS(tts.TTS):
-    """Kokoro streaming TTS.
+    """Kokoro TTS — supports both one-shot and streaming synthesis.
 
     `synthesize(text)` returns a `ChunkedStream` that pulls float32
     frames from `tts.kokoro.synthesize` and emits them as int16 PCM on
-    the framework's audio pipe.
+    the framework's audio pipe (used by `session.say(...)` callers).
+
+    `stream()` returns a `_KokoroSynthesizeStream` that consumes text
+    via `push_text(...)` / `flush()` / `end_input()`, slices the input
+    on sentence boundaries via livekit-agents' `SentenceTokenizer`, and
+    synthesizes each sentence in turn — used by M4's streaming brain
+    pipe (`BrainClient.decide(utterance_listener=...)`).
     """
 
     def __init__(self) -> None:
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False),
+            capabilities=tts.TTSCapabilities(streaming=True),
             sample_rate=_KOKORO_SAMPLE_RATE,
             num_channels=_KOKORO_NUM_CHANNELS,
         )
@@ -233,11 +241,16 @@ class KokoroStreamingTTS(tts.TTS):
     ) -> tts.ChunkedStream:
         return _KokoroChunkedStream(tts=self, input_text=text, conn_options=conn_options)
 
+    def stream(
+        self,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> _KokoroSynthesizeStream:
+        return _KokoroSynthesizeStream(tts=self, conn_options=conn_options)
+
 
 class _KokoroChunkedStream(tts.ChunkedStream):
     async def _run(self, output_emitter: AudioEmitter) -> None:
-        import uuid
-
         output_emitter.initialize(
             request_id=uuid.uuid4().hex,
             sample_rate=_KOKORO_SAMPLE_RATE,
@@ -246,6 +259,86 @@ class _KokoroChunkedStream(tts.ChunkedStream):
         )
         async for chunk in kokoro.synthesize(self.input_text):
             output_emitter.push(_float32_to_int16_bytes(chunk))
+
+
+class _KokoroSynthesizeStream(tts.SynthesizeStream):
+    """Streaming Kokoro adapter for sentence-chunked TTS.
+
+    The stream consumes text from `self._input_ch` (`push_text` /
+    `flush` / `end_input` on the parent class), slices on sentence
+    boundaries with `livekit.agents.tokenize.basic.SentenceTokenizer`,
+    and synthesizes each completed sentence atomically through
+    `kokoro.synthesize(...)`. PCM frames push into the framework's
+    `AudioEmitter` on the per-sentence segment id.
+
+    LiveKit's `SentenceTokenizer.stream()` (BufferedSentenceStream)
+    holds back tokens until either ≥ `min_sentence_len` chars have
+    accumulated OR `flush()` is called. `end_input()` flushes the
+    tail. We pass the defaults (min_sentence_len=20) — see M4 plan
+    Unit 4 deferred-to-implementation note. Tune after dogfood.
+    """
+
+    async def _run(self, output_emitter: AudioEmitter) -> None:
+        request_id = uuid.uuid4().hex
+        output_emitter.initialize(
+            request_id=request_id,
+            sample_rate=_KOKORO_SAMPLE_RATE,
+            num_channels=_KOKORO_NUM_CHANNELS,
+            mime_type="audio/pcm",
+            stream=True,
+        )
+
+        sent_tokenizer_stream = tokenize.basic.SentenceTokenizer().stream()
+
+        async def _feed_sentence_stream() -> None:
+            """Pump push_text / flush / end_input from `_input_ch` to the
+            sentence tokenizer. Runs as a sibling task so the synthesis
+            loop below can iterate sentences as they finish."""
+            try:
+                async for data in self._input_ch:
+                    if isinstance(data, self._FlushSentinel):
+                        sent_tokenizer_stream.flush()
+                        continue
+                    sent_tokenizer_stream.push_text(data)
+            finally:
+                # `end_input` flushes any tail buffered below min-len so
+                # the synthesis loop sees the closing fragment.
+                sent_tokenizer_stream.end_input()
+
+        feeder = asyncio.create_task(_feed_sentence_stream(), name="kokoro.feed")
+        # Single output segment per stream instance — matches the
+        # framework's contract (`SynthesizeStream._num_segments` counts
+        # input segments, `AudioEmitter._num_segments` counts output
+        # segments; the parent `_main_task` asserts they match). One
+        # input call to `push_text` is one logical segment regardless
+        # of how many sentences the tokenizer carves out of it.
+        segment_started = False
+        try:
+            async for token_data in sent_tokenizer_stream:
+                sentence = token_data.token
+                if not sentence.strip():
+                    continue
+                if not segment_started:
+                    output_emitter.start_segment(segment_id=token_data.segment_id)
+                    segment_started = True
+                try:
+                    async for chunk in kokoro.synthesize(sentence):
+                        output_emitter.push(_float32_to_int16_bytes(chunk))
+                except (RuntimeError, ValueError, OSError):
+                    # Don't break the outer loop on a single sentence
+                    # failure — the next sentence may still synthesize.
+                    # The framework's `_main_task` retry path catches
+                    # APIError; for non-API errors we want the partial
+                    # segment to close cleanly and the next to start.
+                    # Narrow to the failure modes Kokoro / MPS / file-IO
+                    # actually raise so unrelated programming errors
+                    # (TypeError, AttributeError, NameError) surface
+                    # loudly instead of being swallowed mid-session.
+                    log.exception("kokoro.synth_error", sentence_preview=sentence[:40])
+            if segment_started:
+                output_emitter.end_segment()
+        finally:
+            await feeder
 
 
 def _audio_frame_to_float32(frame: rtc.AudioFrame) -> np.ndarray:

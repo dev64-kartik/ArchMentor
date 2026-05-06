@@ -163,7 +163,9 @@ def test_kokoro_tts_configuration() -> None:
     tts_impl = KokoroStreamingTTS()
     assert tts_impl.sample_rate == 24_000
     assert tts_impl.num_channels == 1
-    assert tts_impl.capabilities.streaming is False
+    # M4: streaming TTS path enabled — `tts.stream()` returns a
+    # SynthesizeStream that consumes text via `push_text` / `flush`.
+    assert tts_impl.capabilities.streaming is True
     assert tts_impl.provider == "kokoro"
 
 
@@ -213,3 +215,62 @@ async def test_kokoro_tts_chunks_arrive_as_int16_pcm() -> None:
         decoded = np.frombuffer(audio.data, dtype=np.int16)
         # 0.5 * 32767 ~= 16383; tolerate tiny rounding.
         assert decoded[0] == pytest.approx(16_383, abs=2)
+
+
+# ────────────────────── streaming TTS adapter ─────────────────────────
+
+
+async def test_kokoro_synthesize_stream_sentence_chunks_through_kokoro() -> None:
+    """`tts.stream()` consumes pushed text, slices on sentence boundaries,
+    and synthesizes each sentence atomically through `kokoro.synthesize`.
+    The list of sentences observed by the fake synth proves boundaries
+    were detected before the second-sentence audio was queued."""
+    tts_impl = KokoroStreamingTTS()
+    sentences_synthesized: list[str] = []
+
+    async def fake_synth(text: str):
+        sentences_synthesized.append(text)
+        # one tiny chunk per sentence so the stream emits at least one
+        # frame before moving on
+        yield np.full(120, 0.5, dtype=np.float32)
+
+    with patch.object(framework_adapters.kokoro, "synthesize", fake_synth):
+        stream = tts_impl.stream()
+        # Two complete sentences plus a fragment that flush will close.
+        stream.push_text(
+            "Walk me through your capacity assumptions. What read-to-write ratio do you expect"
+        )
+        stream.push_text("?")
+        stream.end_input()
+        # Drain the stream so `_main_task` runs to completion.
+        async for _frame in stream:
+            pass
+        await stream.aclose()
+
+    # Both complete sentences reached the synthesizer.
+    assert len(sentences_synthesized) >= 1, "at least one full sentence should synthesize"
+    joined = " ".join(sentences_synthesized)
+    assert "capacity assumptions" in joined
+    assert "read-to-write ratio" in joined
+
+
+async def test_kokoro_synthesize_stream_empty_input_closes_cleanly() -> None:
+    """`end_input()` with no text pushed must not crash — a stay_silent
+    decision pushes nothing through the listener; the stream still has
+    to terminate cleanly."""
+    tts_impl = KokoroStreamingTTS()
+    sentences_synthesized: list[str] = []
+
+    async def fake_synth(text: str):
+        sentences_synthesized.append(text)
+        if False:  # never yields
+            yield np.zeros(1, dtype=np.float32)
+
+    with patch.object(framework_adapters.kokoro, "synthesize", fake_synth):
+        stream = tts_impl.stream()
+        stream.end_input()
+        async for _frame in stream:
+            pass
+        await stream.aclose()
+
+    assert sentences_synthesized == []

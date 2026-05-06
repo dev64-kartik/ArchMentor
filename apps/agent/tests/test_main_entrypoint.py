@@ -11,6 +11,8 @@ the brain-loop wiring against lightweight fakes — real `EventRouter`,
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -332,10 +334,16 @@ class _FakeAgentSession:
     brain's utterance from `TURN_ACK_UTTERANCE` on the kill-switch
     path. The return value matches the `say()` shape the agent awaits
     for the opening utterance only.
+
+    The `streamed_*` lists capture utterances delivered through the
+    M4 streaming TTS path (`_start_streaming_say`); declared up front
+    so static type checkers see the attributes.
     """
 
     def __init__(self, *, raise_on_say: bool = False) -> None:
         self.said: list[str] = []
+        self.streamed_deltas: list[str] = []
+        self.streamed_full: list[str] = []
         self._raise_on_say = raise_on_say
 
     def say(self, text: str) -> _FakeSpeechHandle:
@@ -397,6 +405,46 @@ def _seed_state(cost_usd_total: float = 0.0, cost_cap_usd: float = 5.0) -> Sessi
     )
 
 
+class FakeHaikuClient:
+    """Records compaction calls; returns a scripted summary text."""
+
+    def __init__(
+        self,
+        *,
+        summary_text: str = "[compressed summary]",
+        cost_usd: float = 0.001,
+        model: str = "anthropic/claude-haiku-4-5",
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self.summary_text = summary_text
+        self.cost_usd = cost_usd
+        self._model = model
+        self.raise_exc = raise_exc
+        self.calls: list[tuple[str, list[str]]] = []
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    async def compress(
+        self,
+        *,
+        existing_summary: str,
+        dropped_turns: list[Any],
+    ) -> tuple[str, BrainUsage]:
+        self.calls.append((existing_summary, [t.text for t in dropped_turns]))
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.summary_text, BrainUsage(
+            input_tokens=120,
+            output_tokens=40,
+            cost_usd=self.cost_usd,
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
 def _build_agent_under_test(
     *,
     brain_enabled: bool,
@@ -406,6 +454,7 @@ def _build_agent_under_test(
     canvas_snapshots: FakeCanvasSnapshotClient | None = None,
     seed_state: SessionState | None = None,
     session_raises: bool = False,
+    haiku: FakeHaikuClient | None = None,
 ) -> tuple[
     MentorAgent,
     _FakeAgentSession,
@@ -441,6 +490,7 @@ def _build_agent_under_test(
             store=cast(RedisSessionStore, store),
             snapshot_client=cast(SnapshotClient, snapshots),
             canvas_snapshot_client=cast(CanvasSnapshotClient, canvas_snapshots),
+            haiku=cast(Any, haiku),
         )
         agent.attach_brain(wiring)
 
@@ -453,6 +503,33 @@ def _build_agent_under_test(
         fake_session.said.append(text)
 
     agent._say = fake_say  # ty: ignore[invalid-assignment]
+
+    # Streaming TTS test seam — `_start_streaming_say` is the M4 hand-off
+    # for `session.say(async_iterable)`. The fake collects each delta
+    # into `fake_session.streamed_deltas` so tests can assert "streaming
+    # path was used" without needing a live `AgentSession`.
+    # Lists are pre-allocated on `_FakeAgentSession.__init__`; just
+    # reset them here in case the harness is reused across tests.
+    fake_session.streamed_deltas.clear()
+    fake_session.streamed_full.clear()
+
+    def fake_start_streaming_say(deltas: AsyncIterator[str]) -> Any:
+        async def _drain() -> None:
+            collected: list[str] = []
+            async for delta in deltas:
+                fake_session.streamed_deltas.append(delta)
+                collected.append(delta)
+            fake_session.streamed_full.append("".join(collected))
+
+        task = asyncio.create_task(_drain(), name="fake.streaming_say")
+
+        class _FakeStreamingHandle:
+            async def wait_for_playout(self) -> None:
+                await task
+
+        return _FakeStreamingHandle()
+
+    agent._start_streaming_say = fake_start_streaming_say  # ty: ignore[invalid-assignment]
     # Prime the t0 clock so `_now_relative_ms` returns deterministic
     # values. `on_enter` would normally do this.
     agent._t0_ms = 0
@@ -462,6 +539,8 @@ def _build_agent_under_test(
 async def _drain_tasks(agent: MentorAgent) -> None:
     if agent._snapshot_tasks:
         await asyncio.gather(*agent._snapshot_tasks, return_exceptions=True)
+    if agent._summary_tasks:
+        await asyncio.gather(*agent._summary_tasks, return_exceptions=True)
     if agent._ledger_tasks:
         await asyncio.gather(*agent._ledger_tasks, return_exceptions=True)
 
@@ -477,7 +556,11 @@ async def test_brain_enabled_speaks_brain_utterance_not_static_ack() -> None:
     await agent.handle_user_input("I'd use a 7-char base62 code.")
     await _drain_tasks(agent)
 
-    assert fake_session.said == ["Tell me how you'd index the short codes."]
+    # Streaming TTS path is the M4 production default — the brain
+    # utterance flows through `_start_streaming_say`, NOT the legacy
+    # one-shot `session.say(text)`. Tests that exercise the brain →
+    # speech wiring should observe `streamed_full`.
+    assert fake_session.streamed_full == ["Tell me how you'd index the short codes."]
     event_types = [et for et, _ in ledger.appends]
     assert "utterance_candidate" in event_types
     assert "brain_decision" in event_types
@@ -672,7 +755,9 @@ async def test_scripted_multi_turn_session_records_all_decisions() -> None:
         await agent.handle_user_input(f"turn {idx}: requirements")
     await _drain_tasks(agent)
 
-    assert fake_session.said == ["probe 1", "probe 2", "probe 3"]
+    # Streaming TTS path delivers each speak utterance live; the legacy
+    # `_say` path is unused under M4.
+    assert fake_session.streamed_full == ["probe 1", "probe 2", "probe 3"]
     assert len(snapshots.posts) == 5
     decisions = [p for et, p in ledger.appends if et == "brain_decision"]
     assert len(decisions) == 5
@@ -778,14 +863,20 @@ async def test_static_ack_path_appends_both_candidate_and_ai_turns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transcript_window_caps_at_30_turns() -> None:
-    """Window holds the most-recent 30 turns; older entries fall off the head."""
+async def test_transcript_window_grows_past_threshold_without_haiku() -> None:
+    """Without a Haiku client wired, the window grows unbounded.
+
+    M4 Unit 5 replaced the M2/M3 hard-truncate-at-30 contract with a
+    Haiku-compactor flow: the rolling window keeps growing until a
+    threshold-crossing tick spawns ``_run_compaction``, which then
+    drops the oldest N turns via CAS. With no Haiku client wired
+    (the default for `_build_agent_under_test`), the compactor never
+    runs and the window grows freely. Replay/dev paths intentionally
+    rely on this — they don't want a network call during tests.
+    """
     from archmentor_agent.state.session_state import TranscriptTurn
 
     brain = FakeBrainClient()
-    # Pre-seed a state with 30 existing turns so a single new append
-    # forces the cap to engage. Re-using FakeBrainClient with stay_silent
-    # avoids a second AI turn being appended (which would be 31 total).
     seed = _seed_state()
     seeded = seed.model_copy(
         update={
@@ -804,9 +895,11 @@ async def test_transcript_window_caps_at_30_turns() -> None:
 
     final_state = await store.load(SESSION_ID)
     assert final_state is not None
-    assert len(final_state.transcript_window) == 30
-    # Head was dropped (turn-0); tail is the new turn.
-    assert final_state.transcript_window[0].text == "turn-1"
+    # Without a Haiku client wired, the M4 compactor never runs and the
+    # window keeps every turn. The old "hard truncate at 30" contract
+    # was deliberately removed — see M4 plan Unit 5.
+    assert len(final_state.transcript_window) == 31
+    assert final_state.transcript_window[0].text == "turn-0"
     assert final_state.transcript_window[-1].text == "the 31st turn"
 
 
@@ -866,6 +959,843 @@ async def test_publish_state_swallows_publish_data_error() -> None:
     assert len(failed_logs) == 1
     assert failed_logs[0]["state"] == "listening"
     assert "engine" in failed_logs[0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Unit 2 — Pre-dispatch queue drain wired through `build_brain_wiring`
+# (R22 / R23, integration coverage)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_brain_wiring_registers_pre_dispatch_callback() -> None:
+    """`build_brain_wiring` must register a callable on `router._pre_dispatch_callback`
+    so the M3-dogfood TTL-drop reproducers stay fixed."""
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True)
+    assert agent._brain is not None
+    assert agent._brain.router._pre_dispatch_callback is not None
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_drain_delivers_queued_speak_before_canvas_dispatch() -> None:
+    """End-to-end M3-dogfood reproducer (i):
+    A SPEAK utterance from a prior dispatch is delivered (`session.say` called)
+    before the next CANVAS_CHANGE dispatch's brain call starts."""
+    from archmentor_agent.events import EventType, RouterEvent
+    from archmentor_agent.events.types import Priority
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("post-canvas")  # the canvas dispatch's outcome
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    assert agent._brain is not None
+
+    # Pre-seed the queue as if a prior dispatch produced a SPEAK that
+    # was about to be drained when a competing CANVAS_CHANGE arrived.
+    agent._brain.queue.push(
+        PendingUtterance(
+            text="from prior dispatch",
+            generated_at_ms=agent.now_relative_ms(),
+            ttl_ms=10_000,
+        )
+    )
+
+    # Default gate state is "not speaking" (no prior `mark_speaking`
+    # call), so the pre-dispatch drain isn't suppressed.
+
+    # Fire a CANVAS_CHANGE — under M3, the queued speak would have aged
+    # past TTL during the canvas dispatch and been dropped on the next
+    # pop_if_fresh. Under Unit 2 it's drained pre-dispatch.
+    await agent._brain.router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=agent.now_relative_ms() + 10,
+            payload={"scene_text": "<label>API</label>"},
+            priority=Priority.HIGH,
+        )
+    )
+    # Wait for both the pre-dispatch drain + the dispatch loop to finish.
+    if agent._brain.router._in_flight is not None:
+        await agent._brain.router._in_flight
+    await _drain_tasks(agent)
+
+    assert "from prior dispatch" in fake_session.said
+    assert len(brain.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_drain_skipped_when_candidate_speaking() -> None:
+    """Plan §365 edge case: candidate is mid-speech when the callback
+    fires → drain is suppressed by the speech-check gate; the queued
+    speak waits for a quieter moment."""
+    from archmentor_agent.events import EventType, RouterEvent
+    from archmentor_agent.events.types import Priority
+    from archmentor_agent.state.session_state import PendingUtterance
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    assert agent._brain is not None
+
+    agent._brain.queue.push(
+        PendingUtterance(
+            text="should not barge",
+            generated_at_ms=agent.now_relative_ms(),
+            ttl_ms=10_000,
+        )
+    )
+
+    # Candidate is mid-speech.
+    agent._brain.gate.mark_speaking()
+
+    await agent._brain.router.handle(
+        RouterEvent(
+            EventType.CANVAS_CHANGE,
+            t_ms=agent.now_relative_ms() + 10,
+            payload={"scene_text": "x"},
+            priority=Priority.HIGH,
+        )
+    )
+    if agent._brain.router._in_flight is not None:
+        await agent._brain.router._in_flight
+    await _drain_tasks(agent)
+
+    # No barge — gate suppressed the drain.
+    assert "should not barge" not in fake_session.said
+    # Item is still in the queue (drain didn't pop it).
+    assert agent._brain.queue.peek_fresh() is not None
+
+
+# ─────────────────────── M4 streaming TTS handle ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_streaming_dispatch_routes_speak_through_streaming_path() -> None:
+    """End-to-end: brain.decide returns `speak` → router invokes the
+    streaming factory → `_StreamingTtsHandle.listener` pushes the
+    utterance through `_start_streaming_say` → `audio_played` is True
+    → router skips queue.push → drain finds no AI utterance → no AI
+    transcript turn appended via the legacy queue path."""
+    brain = FakeBrainClient()
+    brain.enqueue_speak("Walk me through capacity.", confidence=0.9)
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    await agent.handle_user_input("How many users do we expect?")
+    if agent._brain is not None and agent._brain.router._in_flight is not None:
+        await agent._brain.router._in_flight
+    await _drain_tasks(agent)
+
+    # Streaming path delivered the utterance, not legacy `_say`.
+    assert fake_session.streamed_full == ["Walk me through capacity."]
+    # Legacy `say()` was NOT used for the streaming utterance (only
+    # whatever the test scaffolding pushed during opening).
+    assert "Walk me through capacity." not in fake_session.said
+
+
+@pytest.mark.asyncio
+async def test_streaming_dispatch_stay_silent_does_not_open_say() -> None:
+    """`stay_silent` decisions never invoke the listener; the streaming
+    factory's lazy-start path means no `session.say` is ever scheduled
+    (no SynthesizeStream warmed up for an utterance that won't play)."""
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("listening")
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    await agent.handle_user_input("Quick check.")
+    if agent._brain is not None and agent._brain.router._in_flight is not None:
+        await agent._brain.router._in_flight
+    await _drain_tasks(agent)
+
+    assert fake_session.streamed_deltas == []
+    assert fake_session.streamed_full == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_say_holds_say_lock_so_drain_short_circuits() -> None:
+    """Plan Unit 4 / ADV-009: a streaming dispatch holds `_say_lock` for
+    its full duration so the router's pre-dispatch
+    `_drain_if_fresh` (which calls `_drain_utterance_queue`, which
+    short-circuits on `_say_lock.locked()`) cannot race a queued
+    `session.say(text)` against an in-flight `session.say(deltas)`.
+    """
+    from archmentor_agent.main import _StreamingTtsHandle
+
+    brain = FakeBrainClient()
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    handle = _StreamingTtsHandle(agent)
+
+    # Lock unheld before any deltas.
+    assert agent._say_lock.locked() is False
+
+    # First delta starts the streaming say AND acquires the lock.
+    await handle.listener("hello ")
+    assert agent._say_lock.locked() is True
+    # While streaming-say is in flight, `_drain_utterance_queue` is a
+    # no-op and the candidate cannot have a queued utterance racing the
+    # streaming output.
+    await agent._drain_utterance_queue()
+    # No drain side effect (the queue is empty AND the lock is held —
+    # either gate would skip; we want both to be intact).
+    assert fake_session.said == [] or "hello" not in fake_session.said[-1]
+
+    # `aclose` releases the lock so the next dispatch can drain.
+    await handle.listener("world")
+    await handle.aclose()
+    assert agent._say_lock.locked() is False
+    # Audio actually delivered through the streaming path.
+    assert fake_session.streamed_full == ["hello world"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_handle_releases_say_lock_on_playout_exception() -> None:
+    """If `wait_for_playout` raises a non-CancelledError, `aclose` still
+    runs the transcript-append + releases `_say_lock` so the rest of
+    the session is not deadlocked behind a permanently-held lock.
+    """
+    from archmentor_agent.main import _StreamingTtsHandle
+
+    brain = FakeBrainClient()
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    class _ExplodingHandle:
+        async def wait_for_playout(self) -> None:
+            raise RuntimeError("playout disconnected")
+
+    def _exploding_start_streaming_say(_deltas):
+        return _ExplodingHandle()
+
+    agent._start_streaming_say = _exploding_start_streaming_say  # ty: ignore[invalid-assignment]
+
+    handle = _StreamingTtsHandle(agent)
+    await handle.listener("ping")
+    assert agent._say_lock.locked() is True
+    # `aclose` must swallow the playout error and still release the
+    # lock — the candidate has heard partial audio either way and the
+    # session must continue.
+    await handle.aclose()
+    assert agent._say_lock.locked() is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# M4 Unit 5 — Haiku compactor + SessionTelemetry
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _make_window_state(*, turn_count: int, summary: str = "") -> SessionState:
+    """Seed state with `turn_count` candidate turns + an existing summary."""
+    from archmentor_agent.state.session_state import TranscriptTurn
+
+    return _seed_state().model_copy(
+        update={
+            "transcript_window": [
+                TranscriptTurn(t_ms=i * 100, speaker="candidate", text=f"turn-{i}")
+                for i in range(turn_count)
+            ],
+            "session_summary": summary,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_compactor_runs_when_window_crosses_threshold() -> None:
+    """Threshold-crossing append spawns the Haiku compactor task.
+
+    Seeds 30 turns; the next candidate turn brings the window to 31,
+    which is the first cross of `_SUMMARY_COMPACTION_THRESHOLD = 30`.
+    The compactor must (a) call Haiku, (b) drop the oldest 1 turn,
+    (c) append to `session_summary`, (d) roll usage into cost_usd_total,
+    (e) emit a `summary_compressed` ledger row.
+    """
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient(summary_text="Compressed window slice.", cost_usd=0.005)
+
+    seed = _make_window_state(turn_count=30, summary="prior digest")
+    agent, _, ledger, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    await agent.handle_user_input("the 31st turn")
+    await _drain_tasks(agent)
+
+    # Compactor ran exactly once and saw the existing summary + dropped slice.
+    assert len(haiku.calls) == 1
+    existing, dropped_texts = haiku.calls[0]
+    assert existing == "prior digest"
+    assert dropped_texts == ["turn-0"]
+
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    # Window dropped the oldest turn; tail still has the new candidate turn.
+    assert len(final_state.transcript_window) == 30
+    assert final_state.transcript_window[0].text == "turn-1"
+    assert final_state.transcript_window[-1].text == "the 31st turn"
+    # Summary appended with the new fragment.
+    assert "prior digest" in final_state.session_summary
+    assert "Compressed window slice." in final_state.session_summary
+    # Cost rolled in (compactor adds 0.005 to whatever the brain dispatch added).
+    assert final_state.cost_usd_total >= 0.005
+    # `summary_compressed` ledger row landed.
+    summary_rows = [p for et, p in ledger.appends if et == "summary_compressed"]
+    assert len(summary_rows) == 1
+    assert summary_rows[0]["dropped_turn_count"] == 1
+    assert summary_rows[0]["model"] == "anthropic/claude-haiku-4-5"
+    assert "input_tokens" in summary_rows[0]
+    assert "output_tokens" in summary_rows[0]
+    # Telemetry counter incremented.
+    assert agent._telemetry.compactions_run == 1
+
+
+@pytest.mark.asyncio
+async def test_compactor_does_not_run_below_threshold() -> None:
+    """30 turns or fewer leaves the window untouched; no Haiku call fires."""
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient()
+
+    seed = _make_window_state(turn_count=28)
+    agent, _, _, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    await agent.handle_user_input("turn 29")
+    await _drain_tasks(agent)
+
+    assert haiku.calls == []
+    assert agent._telemetry.compactions_run == 0
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    # Window kept all 29 (28 seeded + 1 new) — no truncation, no compaction.
+    assert len(final_state.transcript_window) == 29
+
+
+@pytest.mark.asyncio
+async def test_compactor_does_not_run_when_haiku_not_wired() -> None:
+    """No Haiku client → window grows unbounded; no compaction attempted.
+
+    This is the contract for replay/dev paths that don't want a network
+    call during tests. The threshold trigger checks `self._brain.haiku is None`.
+    """
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    seed = _make_window_state(turn_count=30)
+    agent, _, _, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=None
+    )
+
+    await agent.handle_user_input("turn 31")
+    await _drain_tasks(agent)
+
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    # Window grew past 30 — no Haiku, no compactor, no truncation.
+    assert len(final_state.transcript_window) == 31
+    assert agent._telemetry.compactions_run == 0
+
+
+@pytest.mark.asyncio
+async def test_compactor_failure_records_failed_ledger_row_and_releases_in_flight_flag() -> None:
+    """A Haiku exception is logged, surfaces as `summary_compression_failed`,
+    and resets `_summary_in_flight` so the next threshold tick can retry.
+    """
+    import structlog.testing
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    boom = RuntimeError("haiku 5xx")
+    haiku = FakeHaikuClient(raise_exc=boom)
+
+    seed = _make_window_state(turn_count=30)
+    agent, _, ledger, _, _, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await agent.handle_user_input("turn 31")
+        await _drain_tasks(agent)
+
+    failed_rows = [p for et, p in ledger.appends if et == "summary_compression_failed"]
+    assert len(failed_rows) == 1
+    assert failed_rows[0]["dropped_turn_count"] == 1
+    failed_logs = [le for le in logs if le.get("event") == "agent.summary.compaction.failed"]
+    assert len(failed_logs) == 1
+    assert agent._summary_in_flight is False
+    # Counter still increments (counts attempts, not Haiku-billed calls).
+    assert agent._telemetry.compactions_run == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_threshold_crossings_short_circuit_via_in_flight_flag() -> None:
+    """Two threshold-crossings in quick succession: the second short-circuits
+    because `_summary_in_flight` is True — exactly one Haiku call fires.
+
+    Drives the case where the flag is set by the first tick before its
+    task awaits `haiku.compress` — a second tick that arrives between
+    the spawn and the flag-clear should NOT spawn a duplicate task.
+    """
+    import asyncio as _asyncio
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    brain.enqueue_stay_silent("ack")
+
+    # Custom fake that blocks until released so we can land a second
+    # `handle_user_input` while the first compactor is mid-flight.
+    release = _asyncio.Event()
+
+    class _SlowHaiku(FakeHaikuClient):
+        async def compress(self, *, existing_summary: str, dropped_turns: list[Any]):
+            self.calls.append((existing_summary, [t.text for t in dropped_turns]))
+            await release.wait()
+            return self.summary_text, BrainUsage(
+                input_tokens=10,
+                output_tokens=5,
+                cost_usd=0.0001,
+            )
+
+    haiku = _SlowHaiku()
+    seed = _make_window_state(turn_count=30)
+    agent, _, _, _, _, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    # First trigger — spawns the compactor task; it parks on `release`.
+    await agent.handle_user_input("turn 31")
+    # Second trigger — must short-circuit (one in-flight already).
+    await agent.handle_user_input("turn 32")
+    assert agent._summary_in_flight is True
+    assert len(haiku.calls) == 1
+    # Release the in-flight compactor and drain.
+    release.set()
+    await _drain_tasks(agent)
+    assert agent._summary_in_flight is False
+    # Only one Haiku call across both triggers.
+    assert len(haiku.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_decisions_byte_identical() -> None:
+    """Plan R10: the decisions log is sacred — compaction MUST NOT mutate
+    a single byte of `state.decisions`. The mutator only updates
+    `transcript_window`, `session_summary`, and the cost/token counters;
+    a regression here corrupts the structured-decision history that
+    replay tooling treats as authoritative.
+    """
+    from archmentor_agent.state.session_state import DesignDecision, TranscriptTurn
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient(summary_text="compressed")
+
+    seeded_decisions = [
+        DesignDecision(
+            t_ms=10_000,
+            decision="Use Kafka for event sourcing",
+            reasoning="Need durability + replay",
+            alternatives=["RabbitMQ", "Kinesis"],
+        ),
+        DesignDecision(
+            t_ms=20_000,
+            decision="Shard by user_id",
+            reasoning="Most reads are user-scoped",
+            alternatives=["Hash sharding", "Range sharding"],
+        ),
+    ]
+    seed = _seed_state().model_copy(
+        update={
+            "transcript_window": [
+                TranscriptTurn(t_ms=i * 100, speaker="candidate", text=f"turn-{i}")
+                for i in range(30)
+            ],
+            "session_summary": "prior digest",
+            "decisions": seeded_decisions,
+        }
+    )
+
+    # Snapshot a deep-copy of the decisions list before compaction so a
+    # post-apply mutation surfaces as a difference.
+    pre_snapshot = [d.model_dump() for d in seeded_decisions]
+
+    agent, _, _, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    await agent.handle_user_input("turn 31")
+    await _drain_tasks(agent)
+
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    # Compaction ran (sanity check — otherwise the assertion below is
+    # vacuous).
+    assert len(haiku.calls) == 1
+    # Decisions list is the same length and every entry's serialized
+    # bytes match the pre-compaction snapshot exactly.
+    assert len(final_state.decisions) == len(pre_snapshot)
+    for actual, expected in zip(final_state.decisions, pre_snapshot, strict=True):
+        assert actual.model_dump() == expected, "compaction mutator leaked into decisions log"
+
+
+@pytest.mark.asyncio
+async def test_compaction_skips_gracefully_on_cas_exhausted() -> None:
+    """Plan-bound: when the CAS apply for a compaction exhausts retries,
+    `_run_compaction` logs `agent.summary.compaction.cas_exhausted` and
+    returns cleanly — `_summary_in_flight` resets so the next threshold
+    crossing retries, and no `summary_compressed` row gets written
+    (would otherwise mis-represent the in-Redis state).
+    """
+    import structlog.testing
+    from archmentor_agent.state import RedisCasExhaustedError
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient()
+
+    seed = _make_window_state(turn_count=30)
+    store = FakeSessionStore()
+    await store.put(SESSION_ID, seed)
+    agent, _, ledger, _, _, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku, store=store
+    )
+
+    # Patch the store's `apply` so the compaction-side CAS raises
+    # `RedisCasExhaustedError` after the transcript-append (which
+    # crosses the threshold) has already landed. The transcript-append
+    # CAS must succeed first so the compactor task actually spawns.
+    real_apply = store.apply
+
+    async def _flaky_apply(
+        session_id: UUID,
+        mutator: Callable[[SessionState | None], SessionState],
+        *,
+        max_retries: int = 6,
+    ) -> SessionState:
+        # Calls 1..N pass through normally; the compaction-side apply
+        # is the one that lands AFTER `_run_compaction` calls `await
+        # haiku.compress(...)`. In the fake store there's no inherent
+        # contention; we tag the failing call by the `_summary_in_flight`
+        # flag the agent flips before spawning compaction.
+        if agent._summary_in_flight and len(haiku.calls) >= 1:
+            raise RedisCasExhaustedError("simulated CAS exhaustion during compaction apply")
+        return await real_apply(session_id, mutator, max_retries=max_retries)
+
+    store.apply = _flaky_apply  # ty: ignore[invalid-assignment]
+
+    with structlog.testing.capture_logs() as logs:
+        await agent.handle_user_input("turn 31")
+        await _drain_tasks(agent)
+
+    # Haiku was called (compaction spawned), but the apply blew up.
+    assert len(haiku.calls) == 1
+    # `_summary_in_flight` reset — next threshold can retry.
+    assert agent._summary_in_flight is False
+    # No `summary_compressed` row written (apply never landed).
+    summary_rows = [p for et, p in ledger.appends if et == "summary_compressed"]
+    assert summary_rows == []
+    # CAS-exhausted log line emitted.
+    cas_logs = [le for le in logs if le.get("event") == "agent.summary.compaction.cas_exhausted"]
+    assert len(cas_logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_compactor_handles_repeated_threshold_crossings_without_drift() -> None:
+    """Plan-bound 200-turn-stress proxy: drive the compactor through 30
+    threshold crossings (≈ a 200-turn session at our cadence) and
+    assert (a) every Haiku invocation produced exactly one
+    `summary_compressed` row, (b) the rolling window stayed bounded
+    near the threshold, (c) `_summary_in_flight` is False at the end,
+    (d) decisions stay byte-identical from start to finish.
+    """
+    from archmentor_agent.state.session_state import DesignDecision
+
+    brain = FakeBrainClient()
+    haiku = FakeHaikuClient(summary_text="cycle")
+    seeded_decisions = [
+        DesignDecision(t_ms=1_000, decision="seed-d-1", reasoning="r1"),
+        DesignDecision(t_ms=2_000, decision="seed-d-2", reasoning="r2"),
+    ]
+    seed = _make_window_state(turn_count=30).model_copy(update={"decisions": seeded_decisions})
+    pre_snapshot = [d.model_dump() for d in seeded_decisions]
+
+    agent, _, ledger, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    cycles = 30
+    for i in range(cycles):
+        brain.enqueue_stay_silent(f"cycle-{i}")
+        await agent.handle_user_input(f"stress-turn-{i}")
+        await _drain_tasks(agent)
+
+    # Every cycle crossed the 30-turn threshold once → one Haiku call
+    # per cycle, one ledger row per cycle.
+    assert len(haiku.calls) == cycles
+    summary_rows = [p for et, p in ledger.appends if et == "summary_compressed"]
+    assert len(summary_rows) == cycles
+    # Window stayed bounded around the threshold (each cycle drops 1,
+    # adds 1).
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    assert len(final_state.transcript_window) <= 31
+    # The flag has reset; the agent is not stuck.
+    assert agent._summary_in_flight is False
+    # Decisions log untouched after `cycles` compactions.
+    assert len(final_state.decisions) == len(pre_snapshot)
+    for actual, expected in zip(final_state.decisions, pre_snapshot, strict=True):
+        assert actual.model_dump() == expected
+
+
+def test_publish_telemetry_payload_fits_at_max_realistic_values() -> None:
+    """P1-8 / ADV-006 pre-flight: the 5-field telemetry payload at the
+    upper end of plausible session values fits inside
+    `_TELEMETRY_PAYLOAD_MAX_BYTES`. Adding a 6th field (or letting
+    counters overflow this guard) is what would otherwise trip the
+    runtime size check in `_publish_telemetry` and silently kill the
+    cost-budget indicator for the rest of the session.
+    """
+    import json as _json
+
+    from archmentor_agent.main import _TELEMETRY_PAYLOAD_MAX_BYTES
+
+    payload = _json.dumps(
+        {
+            # 6-decimal cost burn at the upper end of cost cap headroom.
+            "cost_usd_total": 9999.999_999,
+            "cost_cap_usd": 9999.999_999,
+            # 7-digit dispatch count covers a multi-day soak run.
+            "calls_made": 9_999_999,
+            # 12-digit token totals cover a 45-min session at Opus
+            # output rates with margin to spare.
+            "tokens_in_total": 999_999_999_999,
+            "tokens_out_total": 999_999_999_999,
+        }
+    )
+    assert len(payload) <= _TELEMETRY_PAYLOAD_MAX_BYTES, (
+        f"telemetry payload {len(payload)}B exceeds budget "
+        f"{_TELEMETRY_PAYLOAD_MAX_BYTES}B — review field set"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_telemetry_emits_log_line_on_shutdown() -> None:
+    """Single `agent.session.telemetry` line per session, with all 6 fields."""
+    import structlog.testing
+
+    brain = FakeBrainClient()
+    brain.enqueue_speak("first answer")
+    brain.enqueue_stay_silent("nothing more")
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    await agent.handle_user_input("first turn")
+    await agent.handle_user_input("second turn")
+    await _drain_tasks(agent)
+
+    with structlog.testing.capture_logs() as logs:
+        await agent.shutdown()
+
+    telemetry_lines = [le for le in logs if le.get("event") == "agent.session.telemetry"]
+    assert len(telemetry_lines) == 1
+    line = telemetry_lines[0]
+    # Six fields, all present.
+    assert "ttfa_ms_histogram" in line
+    assert "brain_calls_made" in line
+    assert "skipped_idempotent_count" in line
+    assert "skipped_cooldown_count" in line
+    assert "dropped_stale_count" in line
+    assert "compactions_run" in line
+    # Two dispatches → two recorded brain calls.
+    assert line["brain_calls_made"] == 2
+    # The streaming TTS path produced at least one TTFA sample for the speak.
+    assert isinstance(line["ttfa_ms_histogram"], list)
+    assert len(line["ttfa_ms_histogram"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_telemetry_log_line_emits_even_under_kill_switch() -> None:
+    """Stable log shape across configurations — kill-switch emits zeros."""
+    import structlog.testing
+
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=False)
+
+    with structlog.testing.capture_logs() as logs:
+        await agent.shutdown()
+
+    telemetry_lines = [le for le in logs if le.get("event") == "agent.session.telemetry"]
+    assert len(telemetry_lines) == 1
+    line = telemetry_lines[0]
+    assert line["brain_calls_made"] == 0
+    assert line["compactions_run"] == 0
+    assert line["dropped_stale_count"] == 0
+    assert line["ttfa_ms_histogram"] == []
+
+
+@pytest.mark.asyncio
+async def test_router_increments_skipped_idempotent_telemetry() -> None:
+    """Repeat dispatches with identical state + payload short-circuit; counter rises."""
+    from archmentor_agent.events.types import EventType, RouterEvent
+
+    brain = FakeBrainClient()
+    # First call: stay_silent → arms the fingerprint.
+    brain.enqueue_stay_silent("nothing")
+    # Second call should NOT reach the brain; it short-circuits.
+    brain.enqueue_speak("would-be-spoken")
+
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    assert agent._brain is not None
+    router = agent._brain.router
+
+    payload = {"phase": "intro"}
+    await router.handle(RouterEvent(type=EventType.PHASE_TIMER, t_ms=100, payload=payload))
+    await router.wait_for_idle()
+    await router.handle(RouterEvent(type=EventType.PHASE_TIMER, t_ms=200, payload=payload))
+    await router.wait_for_idle()
+    await _drain_tasks(agent)
+
+    # Second dispatch was skipped — only one Anthropic-side call.
+    assert len(brain.calls) == 1
+    assert agent._telemetry.skipped_idempotent_count == 1
+    # Both dispatches counted toward total brain calls (skipped paths included).
+    assert agent._telemetry.brain_calls_made == 2
+
+
+# ---------------------------------------------------------------------------
+# Unit 9 — `ai_telemetry` publish + post-dispatch callback wiring (R24)
+# ---------------------------------------------------------------------------
+
+
+def _published_telemetry_frames(agent: MentorAgent) -> list[dict[str, Any]]:
+    """Return the parsed JSON payloads sent to the `ai_telemetry` topic."""
+    participant = cast(_FakeLocalParticipant, agent._room.local_participant)
+    frames: list[dict[str, Any]] = []
+    for topic, payload in participant.published:
+        if topic != "ai_telemetry":
+            continue
+        frames.append(json.loads(payload))
+    return frames
+
+
+@pytest.mark.asyncio
+async def test_dispatch_complete_publishes_ai_telemetry_frame() -> None:
+    """Every brain dispatch publishes one `ai_telemetry` frame mirroring SessionState."""
+    brain = FakeBrainClient()
+    brain.enqueue_speak("First nudge.", cost_usd=0.012)
+    seed = _seed_state(cost_usd_total=0.0, cost_cap_usd=5.0)
+    agent, _, _, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed
+    )
+
+    await agent.handle_user_input("Initial requirements walk-through.")
+    await _drain_tasks(agent)
+
+    frames = _published_telemetry_frames(agent)
+    assert len(frames) == 1
+    frame = frames[0]
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    assert frame["cost_usd_total"] == round(final_state.cost_usd_total, 4)
+    assert frame["cost_cap_usd"] == 5.0
+    assert frame["calls_made"] == agent._telemetry.brain_calls_made
+    assert frame["tokens_in_total"] == final_state.tokens_input_total
+    assert frame["tokens_out_total"] == final_state.tokens_output_total
+
+
+@pytest.mark.asyncio
+async def test_compaction_publishes_ai_telemetry_frame() -> None:
+    """Haiku compaction emits an extra telemetry frame so the bar updates after Haiku spend."""
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient(summary_text="Compressed slice.", cost_usd=0.003)
+    seed = _make_window_state(turn_count=30, summary="prior digest")
+    agent, _, _, _, _, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    await agent.handle_user_input("the 31st turn")
+    await _drain_tasks(agent)
+
+    frames = _published_telemetry_frames(agent)
+    # Two frames: one from the dispatch callback, one from the compactor.
+    assert len(frames) == 2
+    # Final frame reflects post-compaction cost (>= compactor's 0.003 add).
+    assert frames[-1]["cost_usd_total"] >= 0.003
+
+
+@pytest.mark.asyncio
+async def test_publish_telemetry_swallows_publish_data_error() -> None:
+    """Mid-teardown PublishDataError must not break the voice loop."""
+    import structlog.testing
+    from livekit.rtc.participant import PublishDataError
+
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=False)
+
+    async def _raise_engine_closed(payload: str, *, topic: str) -> None:
+        _ = payload, topic
+        raise PublishDataError("engine: connection error: engine is closed")
+
+    agent._room.local_participant.publish_data = _raise_engine_closed  # ty: ignore[invalid-assignment]
+
+    state = _seed_state(cost_usd_total=0.42, cost_cap_usd=5.0)
+    with structlog.testing.capture_logs() as logs:
+        await agent._publish_telemetry(state)
+
+    failed = [le for le in logs if le.get("event") == "agent.publish_telemetry_failed"]
+    assert len(failed) == 1
+    assert "engine" in failed[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_publish_telemetry_payload_under_size_budget() -> None:
+    """Payload stays comfortably under `_TELEMETRY_PAYLOAD_MAX_BYTES`."""
+    from archmentor_agent.main import _TELEMETRY_PAYLOAD_MAX_BYTES
+
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=False)
+    # Use generous values to stress-test the budget — millions of tokens
+    # / four-digit cost still has to fit.
+    agent._telemetry.brain_calls_made = 9999
+    state = _seed_state(cost_usd_total=4.9876, cost_cap_usd=5.0)
+    state = state.model_copy(
+        update={
+            "tokens_input_total": 9_876_543,
+            "tokens_output_total": 1_234_567,
+        }
+    )
+    await agent._publish_telemetry(state)
+    frames = _published_telemetry_frames(agent)
+    assert len(frames) == 1
+    raw = json.dumps(frames[0])
+    assert len(raw) < _TELEMETRY_PAYLOAD_MAX_BYTES
+
+
+# ---------------------------------------------------------------------------
+# Unit 10 — M3-dogfood transcript_window=0 regression (commit ce90164)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transcript_window_populates_after_two_user_turns() -> None:
+    """Regression: `state.transcript_window` length >= 2 after two finals.
+
+    Master plan §696 logged a M3 dogfood finding where the agent's
+    in-memory `transcript_window` stayed empty after the first turn
+    because the CAS apply path was passing `state` instead of mutating
+    `transcript_window`. Fixed in `ce90164`. This test pins the fix so
+    a future refactor of `_append_transcript_turn` doesn't regress it.
+    """
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("first")
+    brain.enqueue_stay_silent("second")
+    agent, _, _, _, store, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    await agent.handle_user_input("Talk about partitioning first.")
+    await agent.handle_user_input("Then we should walk capacity.")
+    await _drain_tasks(agent)
+
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    candidate_turns = [t for t in final_state.transcript_window if t.speaker == "candidate"]
+    assert len(candidate_turns) >= 2, (
+        f"transcript_window has {len(candidate_turns)} candidate turn(s); "
+        "M3 dogfood regression — should have at least 2 after two finals."
+    )
 
 
 # Suppress unused-import warnings — these types are used via `cast`.
