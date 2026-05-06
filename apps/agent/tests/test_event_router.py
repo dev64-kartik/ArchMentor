@@ -1946,7 +1946,7 @@ async def test_router_different_topic_starts_fresh_argument() -> None:
 
 @pytest.mark.asyncio
 async def test_router_passes_now_ms_to_enable_stale_auto_clear() -> None:
-    """A prior at rounds=0 older than 3 minutes auto-clears even if the brain
+    """A prior at rounds=1 older than 3 minutes auto-clears even if the brain
     omits `new_active_argument` on this turn. Pre-seed the store with a
     stale opener; the router's `_apply_decision` passes `now_ms=t_ms` to
     `with_state_updates`, which triggers the safety-net branch.
@@ -1959,7 +1959,7 @@ async def test_router_passes_now_ms_to_enable_stale_auto_clear() -> None:
             "active_argument": ActiveArgument(
                 topic="leaked_topic",
                 opened_at_ms=0,
-                rounds=0,
+                rounds=1,
                 candidate_pushed_back=False,
             ),
         }

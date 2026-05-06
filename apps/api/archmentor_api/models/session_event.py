@@ -33,6 +33,13 @@ class SessionEventType(StrEnum):
     # these rows to reconstruct the (input_tokens, output_tokens,
     # cost_usd, dropped_turn_count, summary_chars_before/after) timeline.
     SUMMARY_COMPRESSED = "summary_compressed"
+    # M4 Unit 5/6: emitted when a Haiku compaction call raises (gateway
+    # 5xx, timeout, schema rejection). Carries `dropped_turn_count` so
+    # operators can correlate failed compactions against transcript
+    # growth. Without this enum value the failure-row write 422s and the
+    # ledger client drops it as a permanent 4xx, leaving Haiku outages
+    # observable only in the agent's stderr.
+    SUMMARY_COMPRESSION_FAILED = "summary_compression_failed"
 
 
 class SessionEvent(SQLModel, table=True):

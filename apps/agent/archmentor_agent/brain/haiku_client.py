@@ -21,6 +21,7 @@ Logging vocabulary:
 
 from __future__ import annotations
 
+import asyncio
 import threading
 
 import httpx
@@ -55,6 +56,17 @@ _SUMMARY_COMPACTION_THRESHOLD = 30
 # Haiku's typical sub-second turn-around plus retry/backoff.
 _HAIKU_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
 
+# Wall-clock ceiling for the entire compress() call. The httpx timeout
+# above bounds a single attempt; with `max_retries=2` the SDK can
+# compound to ~3x read timeout on consecutive 5xx/connection errors.
+# Mirrors `BrainClient._BRAIN_DEADLINE_S=180`. 90 s is enough for one
+# real call plus one cheap retry; on `TimeoutError` we let it propagate
+# so `_run_compaction` resets `_summary_in_flight` and the next
+# threshold crossing retries — leaving the flag pinned for 195 s would
+# starve compaction during a partial gateway outage and inflate every
+# subsequent Opus prompt.
+_HAIKU_DEADLINE_S = 90.0
+
 _MAX_TOKENS = 512
 
 
@@ -79,6 +91,11 @@ class HaikuClient:
             timeout=_HAIKU_TIMEOUT,
         )
 
+    @property
+    def model(self) -> str:
+        """Model id used by this client. Surfaced for ledger payloads."""
+        return self._model
+
     async def compress(
         self,
         *,
@@ -87,23 +104,31 @@ class HaikuClient:
     ) -> tuple[str, BrainUsage]:
         """Call Haiku and return ``(new_summary_text, usage)``.
 
-        On any Anthropic SDK error (5xx, rate-limit, connection, timeout
-        across retries) the call is allowed to raise — the caller
-        (``MentorAgent._run_compaction``) catches and degrades. Letting
-        the exception propagate keeps the contract symmetric with
-        `BrainClient` for the brain-side errors that DO degrade
-        (`stay_silent`): the compactor isn't part of the voice loop, so
-        a failed compaction is a logged miss, not a per-turn fallback.
+        Wrapped in ``asyncio.wait_for(_HAIKU_DEADLINE_S)`` so a hung
+        gateway can't keep ``_summary_in_flight`` pinned across the
+        full SDK retry chain. On any Anthropic SDK error (5xx,
+        rate-limit, connection) or ``TimeoutError`` the call is allowed
+        to raise — the caller (``MentorAgent._run_compaction``) catches
+        and degrades. Letting the exception propagate keeps the
+        contract symmetric with `BrainClient` for the brain-side
+        errors that DO degrade (`stay_silent`): the compactor isn't
+        part of the voice loop, so a failed compaction is a logged
+        miss, not a per-turn fallback. ``asyncio.CancelledError`` MUST
+        still propagate (mirrors `BrainClient`'s router-cancellation
+        contract).
         """
         user_message = build_user_message(
             existing_summary=existing_summary,
             dropped_turns=dropped_turns,
         )
-        response: Message = await self._client.messages.create(
-            model=self._model,
-            max_tokens=_MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+        response: Message = await asyncio.wait_for(
+            self._client.messages.create(
+                model=self._model,
+                max_tokens=_MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+            ),
+            timeout=_HAIKU_DEADLINE_S,
         )
         text = _extract_text(response)
         truncated = _truncate_summary(text)

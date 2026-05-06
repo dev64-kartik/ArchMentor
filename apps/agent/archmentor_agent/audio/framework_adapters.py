@@ -12,6 +12,7 @@ unit-tested on their own; this file is the adapter seam.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import TYPE_CHECKING
 
@@ -304,8 +305,6 @@ class _KokoroSynthesizeStream(tts.SynthesizeStream):
                 # the synthesis loop sees the closing fragment.
                 sent_tokenizer_stream.end_input()
 
-        import asyncio  # local import — only needed when streaming runs
-
         feeder = asyncio.create_task(_feed_sentence_stream(), name="kokoro.feed")
         # Single output segment per stream instance — matches the
         # framework's contract (`SynthesizeStream._num_segments` counts
@@ -325,13 +324,17 @@ class _KokoroSynthesizeStream(tts.SynthesizeStream):
                 try:
                     async for chunk in kokoro.synthesize(sentence):
                         output_emitter.push(_float32_to_int16_bytes(chunk))
-                except Exception:
-                    log.exception("kokoro.synth_error", sentence_preview=sentence[:40])
+                except (RuntimeError, ValueError, OSError):
                     # Don't break the outer loop on a single sentence
                     # failure — the next sentence may still synthesize.
                     # The framework's `_main_task` retry path catches
                     # APIError; for non-API errors we want the partial
                     # segment to close cleanly and the next to start.
+                    # Narrow to the failure modes Kokoro / MPS / file-IO
+                    # actually raise so unrelated programming errors
+                    # (TypeError, AttributeError, NameError) surface
+                    # loudly instead of being swallowed mid-session.
+                    log.exception("kokoro.synth_error", sentence_preview=sentence[:40])
             if segment_started:
                 output_emitter.end_segment()
         finally:

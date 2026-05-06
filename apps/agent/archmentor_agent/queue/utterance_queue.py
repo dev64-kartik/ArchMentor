@@ -127,7 +127,7 @@ class UtteranceQueue:
         had stolen the dispatch slot." Non-positive ``extra_ms`` is a
         no-op so the call site doesn't have to guard.
         """
-        if extra_ms <= 0:
+        if extra_ms <= 0 or not self._items:
             return
         bumped: deque[PendingUtterance] = deque()
         for item in self._items:

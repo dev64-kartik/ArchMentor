@@ -55,15 +55,13 @@ type AiSpeakingState = "idle" | "listening" | "speaking" | "thinking";
 // before the opening utterance has even finished playing.
 const MIN_SESSION_SEC = 45;
 
-// Allocate the decoder once — per-event `new TextDecoder()` is free
-// at single-digit ms scale but allocates a native object per data
+// Allocate decoders once — per-event `new TextDecoder()` is free at
+// single-digit ms scale but allocates a native object per data
 // message and the data channel fires on every agent phase transition.
+// Each topic gets its own instance so a future call site adding
+// `{ stream: true }` to one decoder can't corrupt the other's state.
 const AI_STATE_DECODER = new TextDecoder();
-// Reused for the `ai_telemetry` topic (M4 Unit 9 / R24). A single
-// decoder is fine — `decode()` is stateless when called without
-// `{ stream: true }` and the two topics arrive on the same data
-// channel anyway.
-const AI_TELEMETRY_DECODER = AI_STATE_DECODER;
+const AI_TELEMETRY_DECODER = new TextDecoder();
 
 // Cost-budget telemetry payload published by the agent on the
 // `ai_telemetry` topic (M4 Unit 9 / R24). Five fixed fields, ~80 bytes
@@ -102,32 +100,44 @@ function parseAiState(payload: Uint8Array): AiSpeakingState | null {
   }
 }
 
+function isFiniteNumber(value: unknown): value is number {
+  // `typeof` accepts NaN/Infinity which collapse downstream arithmetic
+  // (ratio = NaN → progress bar `width: NaN%`). Reject them at the
+  // boundary instead of letting them propagate.
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 function parseAiTelemetry(payload: Uint8Array): AiTelemetry | null {
   try {
     const text = AI_TELEMETRY_DECODER.decode(payload);
     const parsed: unknown = JSON.parse(text);
     if (typeof parsed !== "object" || parsed === null) return null;
-    const raw = parsed as Record<string, unknown>;
-    const costUsdTotal = raw["cost_usd_total"];
-    const costCapUsd = raw["cost_cap_usd"];
-    const callsMade = raw["calls_made"];
-    const tokensInTotal = raw["tokens_in_total"];
-    const tokensOutTotal = raw["tokens_out_total"];
     if (
-      typeof costUsdTotal !== "number" ||
-      typeof costCapUsd !== "number" ||
-      typeof callsMade !== "number" ||
-      typeof tokensInTotal !== "number" ||
-      typeof tokensOutTotal !== "number"
+      !("cost_usd_total" in parsed) ||
+      !("cost_cap_usd" in parsed) ||
+      !("calls_made" in parsed) ||
+      !("tokens_in_total" in parsed) ||
+      !("tokens_out_total" in parsed)
+    ) {
+      return null;
+    }
+    const { cost_usd_total, cost_cap_usd, calls_made, tokens_in_total, tokens_out_total } =
+      parsed;
+    if (
+      !isFiniteNumber(cost_usd_total) ||
+      !isFiniteNumber(cost_cap_usd) ||
+      !isFiniteNumber(calls_made) ||
+      !isFiniteNumber(tokens_in_total) ||
+      !isFiniteNumber(tokens_out_total)
     ) {
       return null;
     }
     return {
-      costUsdTotal,
-      costCapUsd,
-      callsMade,
-      tokensInTotal,
-      tokensOutTotal,
+      costUsdTotal: cost_usd_total,
+      costCapUsd: cost_cap_usd,
+      callsMade: calls_made,
+      tokensInTotal: tokens_in_total,
+      tokensOutTotal: tokens_out_total,
     };
   } catch (err) {
     console.warn("[session] ai_telemetry parse failed", err);

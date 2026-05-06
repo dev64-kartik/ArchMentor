@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -413,12 +413,18 @@ class FakeHaikuClient:
         *,
         summary_text: str = "[compressed summary]",
         cost_usd: float = 0.001,
+        model: str = "anthropic/claude-haiku-4-5",
         raise_exc: BaseException | None = None,
     ) -> None:
         self.summary_text = summary_text
         self.cost_usd = cost_usd
+        self._model = model
         self.raise_exc = raise_exc
         self.calls: list[tuple[str, list[str]]] = []
+
+    @property
+    def model(self) -> str:
+        return self._model
 
     async def compress(
         self,
@@ -1104,6 +1110,72 @@ async def test_streaming_dispatch_stay_silent_does_not_open_say() -> None:
     assert fake_session.streamed_full == []
 
 
+@pytest.mark.asyncio
+async def test_streaming_say_holds_say_lock_so_drain_short_circuits() -> None:
+    """Plan Unit 4 / ADV-009: a streaming dispatch holds `_say_lock` for
+    its full duration so the router's pre-dispatch
+    `_drain_if_fresh` (which calls `_drain_utterance_queue`, which
+    short-circuits on `_say_lock.locked()`) cannot race a queued
+    `session.say(text)` against an in-flight `session.say(deltas)`.
+    """
+    from archmentor_agent.main import _StreamingTtsHandle
+
+    brain = FakeBrainClient()
+    agent, fake_session, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+    handle = _StreamingTtsHandle(agent)
+
+    # Lock unheld before any deltas.
+    assert agent._say_lock.locked() is False
+
+    # First delta starts the streaming say AND acquires the lock.
+    await handle.listener("hello ")
+    assert agent._say_lock.locked() is True
+    # While streaming-say is in flight, `_drain_utterance_queue` is a
+    # no-op and the candidate cannot have a queued utterance racing the
+    # streaming output.
+    await agent._drain_utterance_queue()
+    # No drain side effect (the queue is empty AND the lock is held —
+    # either gate would skip; we want both to be intact).
+    assert fake_session.said == [] or "hello" not in fake_session.said[-1]
+
+    # `aclose` releases the lock so the next dispatch can drain.
+    await handle.listener("world")
+    await handle.aclose()
+    assert agent._say_lock.locked() is False
+    # Audio actually delivered through the streaming path.
+    assert fake_session.streamed_full == ["hello world"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_handle_releases_say_lock_on_playout_exception() -> None:
+    """If `wait_for_playout` raises a non-CancelledError, `aclose` still
+    runs the transcript-append + releases `_say_lock` so the rest of
+    the session is not deadlocked behind a permanently-held lock.
+    """
+    from archmentor_agent.main import _StreamingTtsHandle
+
+    brain = FakeBrainClient()
+    agent, _, _, _, _, _, _ = _build_agent_under_test(brain_enabled=True, brain=brain)
+
+    class _ExplodingHandle:
+        async def wait_for_playout(self) -> None:
+            raise RuntimeError("playout disconnected")
+
+    def _exploding_start_streaming_say(_deltas):
+        return _ExplodingHandle()
+
+    agent._start_streaming_say = _exploding_start_streaming_say  # ty: ignore[invalid-assignment]
+
+    handle = _StreamingTtsHandle(agent)
+    await handle.listener("ping")
+    assert agent._say_lock.locked() is True
+    # `aclose` must swallow the playout error and still release the
+    # lock — the candidate has heard partial audio either way and the
+    # session must continue.
+    await handle.aclose()
+    assert agent._say_lock.locked() is False
+
+
 # ──────────────────────────────────────────────────────────────────────
 # M4 Unit 5 — Haiku compactor + SessionTelemetry
 # ──────────────────────────────────────────────────────────────────────
@@ -1166,7 +1238,10 @@ async def test_compactor_runs_when_window_crosses_threshold() -> None:
     # `summary_compressed` ledger row landed.
     summary_rows = [p for et, p in ledger.appends if et == "summary_compressed"]
     assert len(summary_rows) == 1
-    assert summary_rows[0]["dropped_turns"] == 1
+    assert summary_rows[0]["dropped_turn_count"] == 1
+    assert summary_rows[0]["model"] == "anthropic/claude-haiku-4-5"
+    assert "input_tokens" in summary_rows[0]
+    assert "output_tokens" in summary_rows[0]
     # Telemetry counter incremented.
     assert agent._telemetry.compactions_run == 1
 
@@ -1241,7 +1316,7 @@ async def test_compactor_failure_records_failed_ledger_row_and_releases_in_fligh
 
     failed_rows = [p for et, p in ledger.appends if et == "summary_compression_failed"]
     assert len(failed_rows) == 1
-    assert failed_rows[0]["dropped_turns"] == 1
+    assert failed_rows[0]["dropped_turn_count"] == 1
     failed_logs = [le for le in logs if le.get("event") == "agent.summary.compaction.failed"]
     assert len(failed_logs) == 1
     assert agent._summary_in_flight is False
@@ -1296,6 +1371,208 @@ async def test_concurrent_threshold_crossings_short_circuit_via_in_flight_flag()
     assert agent._summary_in_flight is False
     # Only one Haiku call across both triggers.
     assert len(haiku.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_decisions_byte_identical() -> None:
+    """Plan R10: the decisions log is sacred — compaction MUST NOT mutate
+    a single byte of `state.decisions`. The mutator only updates
+    `transcript_window`, `session_summary`, and the cost/token counters;
+    a regression here corrupts the structured-decision history that
+    replay tooling treats as authoritative.
+    """
+    from archmentor_agent.state.session_state import DesignDecision, TranscriptTurn
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient(summary_text="compressed")
+
+    seeded_decisions = [
+        DesignDecision(
+            t_ms=10_000,
+            decision="Use Kafka for event sourcing",
+            reasoning="Need durability + replay",
+            alternatives=["RabbitMQ", "Kinesis"],
+        ),
+        DesignDecision(
+            t_ms=20_000,
+            decision="Shard by user_id",
+            reasoning="Most reads are user-scoped",
+            alternatives=["Hash sharding", "Range sharding"],
+        ),
+    ]
+    seed = _seed_state().model_copy(
+        update={
+            "transcript_window": [
+                TranscriptTurn(t_ms=i * 100, speaker="candidate", text=f"turn-{i}")
+                for i in range(30)
+            ],
+            "session_summary": "prior digest",
+            "decisions": seeded_decisions,
+        }
+    )
+
+    # Snapshot a deep-copy of the decisions list before compaction so a
+    # post-apply mutation surfaces as a difference.
+    pre_snapshot = [d.model_dump() for d in seeded_decisions]
+
+    agent, _, _, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    await agent.handle_user_input("turn 31")
+    await _drain_tasks(agent)
+
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    # Compaction ran (sanity check — otherwise the assertion below is
+    # vacuous).
+    assert len(haiku.calls) == 1
+    # Decisions list is the same length and every entry's serialized
+    # bytes match the pre-compaction snapshot exactly.
+    assert len(final_state.decisions) == len(pre_snapshot)
+    for actual, expected in zip(final_state.decisions, pre_snapshot, strict=True):
+        assert actual.model_dump() == expected, "compaction mutator leaked into decisions log"
+
+
+@pytest.mark.asyncio
+async def test_compaction_skips_gracefully_on_cas_exhausted() -> None:
+    """Plan-bound: when the CAS apply for a compaction exhausts retries,
+    `_run_compaction` logs `agent.summary.compaction.cas_exhausted` and
+    returns cleanly — `_summary_in_flight` resets so the next threshold
+    crossing retries, and no `summary_compressed` row gets written
+    (would otherwise mis-represent the in-Redis state).
+    """
+    import structlog.testing
+    from archmentor_agent.state import RedisCasExhaustedError
+
+    brain = FakeBrainClient()
+    brain.enqueue_stay_silent("ack")
+    haiku = FakeHaikuClient()
+
+    seed = _make_window_state(turn_count=30)
+    store = FakeSessionStore()
+    await store.put(SESSION_ID, seed)
+    agent, _, ledger, _, _, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku, store=store
+    )
+
+    # Patch the store's `apply` so the compaction-side CAS raises
+    # `RedisCasExhaustedError` after the transcript-append (which
+    # crosses the threshold) has already landed. The transcript-append
+    # CAS must succeed first so the compactor task actually spawns.
+    real_apply = store.apply
+
+    async def _flaky_apply(
+        session_id: UUID,
+        mutator: Callable[[SessionState | None], SessionState],
+        *,
+        max_retries: int = 6,
+    ) -> SessionState:
+        # Calls 1..N pass through normally; the compaction-side apply
+        # is the one that lands AFTER `_run_compaction` calls `await
+        # haiku.compress(...)`. In the fake store there's no inherent
+        # contention; we tag the failing call by the `_summary_in_flight`
+        # flag the agent flips before spawning compaction.
+        if agent._summary_in_flight and len(haiku.calls) >= 1:
+            raise RedisCasExhaustedError("simulated CAS exhaustion during compaction apply")
+        return await real_apply(session_id, mutator, max_retries=max_retries)
+
+    store.apply = _flaky_apply  # ty: ignore[invalid-assignment]
+
+    with structlog.testing.capture_logs() as logs:
+        await agent.handle_user_input("turn 31")
+        await _drain_tasks(agent)
+
+    # Haiku was called (compaction spawned), but the apply blew up.
+    assert len(haiku.calls) == 1
+    # `_summary_in_flight` reset — next threshold can retry.
+    assert agent._summary_in_flight is False
+    # No `summary_compressed` row written (apply never landed).
+    summary_rows = [p for et, p in ledger.appends if et == "summary_compressed"]
+    assert summary_rows == []
+    # CAS-exhausted log line emitted.
+    cas_logs = [le for le in logs if le.get("event") == "agent.summary.compaction.cas_exhausted"]
+    assert len(cas_logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_compactor_handles_repeated_threshold_crossings_without_drift() -> None:
+    """Plan-bound 200-turn-stress proxy: drive the compactor through 30
+    threshold crossings (≈ a 200-turn session at our cadence) and
+    assert (a) every Haiku invocation produced exactly one
+    `summary_compressed` row, (b) the rolling window stayed bounded
+    near the threshold, (c) `_summary_in_flight` is False at the end,
+    (d) decisions stay byte-identical from start to finish.
+    """
+    from archmentor_agent.state.session_state import DesignDecision
+
+    brain = FakeBrainClient()
+    haiku = FakeHaikuClient(summary_text="cycle")
+    seeded_decisions = [
+        DesignDecision(t_ms=1_000, decision="seed-d-1", reasoning="r1"),
+        DesignDecision(t_ms=2_000, decision="seed-d-2", reasoning="r2"),
+    ]
+    seed = _make_window_state(turn_count=30).model_copy(update={"decisions": seeded_decisions})
+    pre_snapshot = [d.model_dump() for d in seeded_decisions]
+
+    agent, _, ledger, _, store, _, _ = _build_agent_under_test(
+        brain_enabled=True, brain=brain, seed_state=seed, haiku=haiku
+    )
+
+    cycles = 30
+    for i in range(cycles):
+        brain.enqueue_stay_silent(f"cycle-{i}")
+        await agent.handle_user_input(f"stress-turn-{i}")
+        await _drain_tasks(agent)
+
+    # Every cycle crossed the 30-turn threshold once → one Haiku call
+    # per cycle, one ledger row per cycle.
+    assert len(haiku.calls) == cycles
+    summary_rows = [p for et, p in ledger.appends if et == "summary_compressed"]
+    assert len(summary_rows) == cycles
+    # Window stayed bounded around the threshold (each cycle drops 1,
+    # adds 1).
+    final_state = await store.load(SESSION_ID)
+    assert final_state is not None
+    assert len(final_state.transcript_window) <= 31
+    # The flag has reset; the agent is not stuck.
+    assert agent._summary_in_flight is False
+    # Decisions log untouched after `cycles` compactions.
+    assert len(final_state.decisions) == len(pre_snapshot)
+    for actual, expected in zip(final_state.decisions, pre_snapshot, strict=True):
+        assert actual.model_dump() == expected
+
+
+def test_publish_telemetry_payload_fits_at_max_realistic_values() -> None:
+    """P1-8 / ADV-006 pre-flight: the 5-field telemetry payload at the
+    upper end of plausible session values fits inside
+    `_TELEMETRY_PAYLOAD_MAX_BYTES`. Adding a 6th field (or letting
+    counters overflow this guard) is what would otherwise trip the
+    runtime size check in `_publish_telemetry` and silently kill the
+    cost-budget indicator for the rest of the session.
+    """
+    import json as _json
+
+    from archmentor_agent.main import _TELEMETRY_PAYLOAD_MAX_BYTES
+
+    payload = _json.dumps(
+        {
+            # 6-decimal cost burn at the upper end of cost cap headroom.
+            "cost_usd_total": 9999.999_999,
+            "cost_cap_usd": 9999.999_999,
+            # 7-digit dispatch count covers a multi-day soak run.
+            "calls_made": 9_999_999,
+            # 12-digit token totals cover a 45-min session at Opus
+            # output rates with margin to spare.
+            "tokens_in_total": 999_999_999_999,
+            "tokens_out_total": 999_999_999_999,
+        }
+    )
+    assert len(payload) <= _TELEMETRY_PAYLOAD_MAX_BYTES, (
+        f"telemetry payload {len(payload)}B exceeds budget "
+        f"{_TELEMETRY_PAYLOAD_MAX_BYTES}B — review field set"
+    )
 
 
 @pytest.mark.asyncio

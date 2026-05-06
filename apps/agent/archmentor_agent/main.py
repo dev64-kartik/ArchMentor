@@ -956,10 +956,14 @@ class MentorAgent(Agent):
             tokens_in_total: int — input tokens across all brain calls
             tokens_out_total: int — output tokens across all brain calls
 
-        Field-creep is caught at runtime by the
-        `_TELEMETRY_PAYLOAD_MAX_BYTES` assertion; the SCTP per-frame limit
-        is two orders of magnitude larger but the budget rule should
-        fail loudly so future additions go through review.
+        Field-creep is caught by `test_publish_telemetry_payload_fits`
+        at module-load time. In production we additionally guard at
+        runtime: an oversize payload is logged at ERROR and the publish
+        is SKIPPED — never raised. A runtime AssertionError here was
+        previously caught by the router's
+        `dispatch_complete_callback` `except Exception` wrapper, which
+        silenced the failure and broke the cost-budget indicator
+        permanently with no surfaced error (M4 review ADV-006).
         """
         payload = json.dumps(
             {
@@ -971,10 +975,12 @@ class MentorAgent(Agent):
             }
         )
         if len(payload) > _TELEMETRY_PAYLOAD_MAX_BYTES:
-            raise AssertionError(
-                f"ai_telemetry payload exceeds {_TELEMETRY_PAYLOAD_MAX_BYTES}B "
-                f"budget ({len(payload)}B) — review field set"
+            log.error(
+                "agent.publish_telemetry.payload_oversize",
+                bytes=len(payload),
+                budget=_TELEMETRY_PAYLOAD_MAX_BYTES,
             )
+            return
         try:
             await self._room.local_participant.publish_data(
                 payload,
@@ -1420,7 +1426,7 @@ class MentorAgent(Agent):
                 )
                 self._log(
                     "summary_compression_failed",
-                    {"dropped_turns": len(dropped_turns)},
+                    {"dropped_turn_count": len(dropped_turns)},
                 )
                 return
 
@@ -1482,16 +1488,20 @@ class MentorAgent(Agent):
             # The `summary_compressed` ledger row needs Unit 6's API
             # enum extension (`SUMMARY_COMPRESSED`) to land in the API
             # before the agent emits — the ingest route 422s otherwise.
-            # Unit 6 has shipped (commit `883f807`), so this is safe.
+            # The migration ships in this PR (revision `c3d4e5f6a7b8`);
+            # the deploy choreography is "alembic upgrade head on every
+            # API replica before any agent worker is rolled" — see the
+            # PR's rollout notes.
             self._log(
                 "summary_compressed",
                 {
-                    "dropped_turns": len(dropped_turns),
+                    "model": haiku.model,
+                    "dropped_turn_count": len(dropped_turns),
                     "summary_chars_before": summary_chars_before_apply,
                     "summary_chars_after": len(applied.session_summary),
                     "cost_usd": usage.cost_usd,
-                    "tokens_input": usage.tokens_input_total,
-                    "tokens_output": usage.output_tokens,
+                    "input_tokens": usage.tokens_input_total,
+                    "output_tokens": usage.output_tokens,
                 },
             )
             # M4 Unit 9 / R24: surface the new cost burn after a
@@ -1562,6 +1572,7 @@ class _StreamingTtsHandle:
         "_dispatch_start_ms",
         "_handle",
         "_queue",
+        "_say_lock_held",
         "_started",
         "_streamed_text",
     )
@@ -1576,6 +1587,12 @@ class _StreamingTtsHandle:
         # invocation so a stay_silent decision (no listener calls) does
         # not enqueue an empty say + spin up an unused SynthesizeStream.
         self._started = False
+        # Tracks whether `_start_say` has acquired `agent._say_lock` so
+        # `aclose` releases it exactly once. The lock blocks
+        # `_drain_utterance_queue` (its `if self._say_lock.locked():`
+        # gate) from racing the streaming-TTS path — see Plan Unit 4
+        # `_streaming_say_lock` requirement and ADV-009.
+        self._say_lock_held = False
         # Accumulates the full streamed utterance so `aclose` can append
         # an AI turn to `transcript_window` once playout finishes — the
         # brain needs the AI's prior utterances visible across turns,
@@ -1638,52 +1655,80 @@ class _StreamingTtsHandle:
                     return
                 yield item
 
+        # Hold `_say_lock` for the entire streaming dispatch so the
+        # router's pre-dispatch `_drain_if_fresh` (which calls
+        # `_drain_utterance_queue`, which short-circuits on
+        # `_say_lock.locked()`) cannot race a queued
+        # `session.say(text)` against the still-streaming
+        # `session.say(deltas)`. Plan Unit 4 marks this lock binding;
+        # without it, two concurrent says interleave audio frames and
+        # the candidate hears overlapping speech (ADV-009).
+        await self._agent._say_lock.acquire()
+        self._say_lock_held = True
         try:
             self._handle = self._agent._start_streaming_say(_delta_generator())
         except Exception:
             log.exception("agent.streaming_tts.start_failed")
             self._handle = None
+            # Release on construction failure so the next dispatch can
+            # drain. `aclose` will see `_say_lock_held=False` and skip.
+            self._agent._say_lock.release()
+            self._say_lock_held = False
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if not self._started:
-            # No deltas ever arrived → no SpeechHandle was opened; nothing
-            # to drain or wait on.
-            return
-        # Signal the async generator to terminate so `session.say`'s
-        # internal TTS pipeline knows there's no more text.
-        await self._queue.put(None)
-        handle = self._handle
-        if handle is None:
-            return
         try:
-            await handle.wait_for_playout()
-        except asyncio.CancelledError:
-            # Cancellation must propagate so router invariant I2 holds.
-            raise
-        except Exception:
-            log.exception("agent.streaming_tts.playout_error")
-        # Audio has played (or attempted to play). Append the
-        # candidate-visible utterance to the transcript ledger + window
-        # — the legacy queue.push + `_drain_utterance_queue` path that
-        # would have done this is now skipped because the streaming
-        # factory consumed the audio. Skipping this append leaves the
-        # brain blind to its own prior utterances (transcript_window
-        # only gets candidate turns, ai turns vanish).
-        if self._audio_played and self._streamed_text:
-            full_text = "".join(self._streamed_text)
-            ai_t_ms = self._agent.now_relative_ms()
-            self._agent._log("utterance_ai", {"text": full_text, "speaker": "ai"})
+            if not self._started:
+                # No deltas ever arrived → no SpeechHandle was opened;
+                # nothing to drain or wait on. `_say_lock` was never
+                # acquired either (lazy in `_start_say`), so the finally
+                # below is a no-op.
+                return
+            # Signal the async generator to terminate so `session.say`'s
+            # internal TTS pipeline knows there's no more text.
+            await self._queue.put(None)
+            handle = self._handle
+            if handle is None:
+                return
             try:
-                await self._agent._append_transcript_turn(
-                    speaker="ai",
-                    text=full_text,
-                    t_ms=ai_t_ms,
-                )
+                await handle.wait_for_playout()
+            except asyncio.CancelledError:
+                # Cancellation must propagate so router invariant I2 holds.
+                raise
             except Exception:
-                log.exception("agent.streaming_tts.transcript_append_failed")
+                log.exception("agent.streaming_tts.playout_error")
+            # Audio has played (or attempted to play). Append the
+            # candidate-visible utterance to the transcript ledger +
+            # window — the legacy queue.push + `_drain_utterance_queue`
+            # path that would have done this is now skipped because the
+            # streaming factory consumed the audio. Skipping this
+            # append leaves the brain blind to its own prior utterances
+            # (transcript_window only gets candidate turns, ai turns
+            # vanish).
+            if self._audio_played and self._streamed_text:
+                full_text = "".join(self._streamed_text)
+                ai_t_ms = self._agent.now_relative_ms()
+                self._agent._log("utterance_ai", {"text": full_text, "speaker": "ai"})
+                try:
+                    await self._agent._append_transcript_turn(
+                        speaker="ai",
+                        text=full_text,
+                        t_ms=ai_t_ms,
+                    )
+                except Exception:
+                    log.exception("agent.streaming_tts.transcript_append_failed")
+        finally:
+            # Release the streaming-say lock so the next dispatch's
+            # pre-dispatch drain can proceed. Releasing in `finally`
+            # ensures cancellation on `wait_for_playout` does not strand
+            # the lock held forever — which would deadlock every
+            # subsequent `_drain_utterance_queue` for the rest of the
+            # session.
+            if self._say_lock_held:
+                self._agent._say_lock.release()
+                self._say_lock_held = False
 
 
 def build_brain_wiring(

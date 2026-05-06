@@ -392,14 +392,18 @@ def test_different_topic_starts_fresh_argument_at_rounds_one() -> None:
     assert updated.active_argument.opened_at_ms == 500
 
 
-def test_stale_opener_auto_clears_at_rounds_zero() -> None:
-    """Prior at rounds=0 older than 3 minutes → cleared even when the brain
+def test_stale_opener_auto_clears_at_rounds_one() -> None:
+    """Prior at rounds=1 older than 3 minutes → cleared even when the brain
     didn't emit `new_active_argument` this turn.
 
     This is the safety-net branch: covers the brain opening a thread
     the candidate never engages with, then the brain forgets to close it.
+    Every fresh-open / topic-change branch in `_resolve_active_argument`
+    assigns ``rounds=1``, so ``rounds==1`` is the operational
+    "opened-but-never-followed-up" state — the prior ``rounds==0``
+    condition was permanently unreachable in production.
     """
-    prior = ActiveArgument(topic="consistency", opened_at_ms=0, rounds=0)
+    prior = ActiveArgument(topic="consistency", opened_at_ms=0, rounds=1)
     state = _state_with_argument(prior)
 
     updated = state.with_state_updates(
@@ -411,7 +415,7 @@ def test_stale_opener_auto_clears_at_rounds_zero() -> None:
 
 
 def test_stale_opener_does_not_auto_clear_when_rounds_advanced() -> None:
-    """Auto-clear applies ONLY at rounds=0; an active dispute is preserved."""
+    """Auto-clear applies ONLY at rounds=1; an active dispute is preserved."""
     prior = ActiveArgument(topic="consistency", opened_at_ms=0, rounds=2)
     state = _state_with_argument(prior)
 
@@ -426,7 +430,7 @@ def test_stale_opener_does_not_auto_clear_when_rounds_advanced() -> None:
 
 def test_stale_auto_clear_skipped_when_now_ms_omitted() -> None:
     """Replay path (no now_ms) keeps the prior unchanged."""
-    prior = ActiveArgument(topic="consistency", opened_at_ms=0, rounds=0)
+    prior = ActiveArgument(topic="consistency", opened_at_ms=0, rounds=1)
     state = _state_with_argument(prior)
 
     updated = state.with_state_updates(

@@ -27,6 +27,7 @@ Logging vocabulary:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 import threading
 from collections.abc import Awaitable, Callable
@@ -97,6 +98,12 @@ _BRAIN_DEADLINE_S = 180.0
 _DECISION_VALIDATOR = Draft202012Validator(
     dict(INTERVIEW_DECISION_TOOL["input_schema"]),
 )
+
+# Schema error_paths whose values carry transcript- or candidate-derived
+# text. The schema-violation log emits `error_path` + `first_error` to
+# locate the bug; the offending value is redacted for these fields so
+# transcript bytes never leak to log sinks.
+_REDACTED_ERROR_FIELDS = ("utterance", "reasoning", "session_summary_append")
 
 
 class BrainClient:
@@ -192,7 +199,7 @@ class BrainClient:
             mode="blocking",
         )
 
-        call_start_s = asyncio.get_event_loop().time()
+        call_start_s = asyncio.get_running_loop().time()
 
         try:
             response: Message = await asyncio.wait_for(
@@ -252,7 +259,7 @@ class BrainClient:
             # this branch to matter; if the SDK lets CancelledError propagate
             # transparently the `except TimeoutError` branch above already
             # handles it correctly.
-            elapsed_s = asyncio.get_event_loop().time() - call_start_s
+            elapsed_s = asyncio.get_running_loop().time() - call_start_s
             if elapsed_s >= _BRAIN_DEADLINE_S:
                 log.error(
                     "brain.api_error",
@@ -339,7 +346,7 @@ class BrainClient:
             mode="streaming",
         )
 
-        call_start_s = asyncio.get_event_loop().time()
+        call_start_s = asyncio.get_running_loop().time()
 
         try:
             return await asyncio.wait_for(
@@ -369,7 +376,7 @@ class BrainClient:
             )
             raise
         except anthropic.APIConnectionError as exc:
-            elapsed_s = asyncio.get_event_loop().time() - call_start_s
+            elapsed_s = asyncio.get_running_loop().time() - call_start_s
             if elapsed_s >= _BRAIN_DEADLINE_S:
                 log.error(
                     "brain.api_error",
@@ -517,20 +524,11 @@ def _replace_decision_reason(decision: BrainDecision, reason: str) -> BrainDecis
     shape is otherwise unchanged but the reason needs a more specific
     suffix for replay tooling. ``BrainDecision`` is a frozen dataclass,
     so we materialise a new instance rather than mutating in place.
+    Using ``dataclasses.replace`` keeps this in sync automatically when
+    new fields are added — the prior manual field-by-field rebuild was
+    a silent-drop hazard during M5/M6 schema growth.
     """
-    return BrainDecision(
-        decision=decision.decision,
-        priority=decision.priority,
-        confidence=decision.confidence,
-        reasoning=decision.reasoning,
-        utterance=decision.utterance,
-        can_be_skipped_if_stale=decision.can_be_skipped_if_stale,
-        state_updates=dict(decision.state_updates),
-        reason=reason,
-        usage=decision.usage,
-        raw_input=dict(decision.raw_input),
-        is_partial=decision.is_partial,
-    )
+    return dataclasses.replace(decision, reason=reason)
 
 
 def _assemble_decision_from_message(
@@ -598,9 +596,19 @@ def _assemble_decision_from_message(
         # which sub-key the brain mangled — observed during the M3
         # dogfood when Opus emitted `"\n"` for an object-typed field.
         error_path = "/".join(str(part) for part in first.absolute_path) or "<root>"
-        offending = repr(first.instance)
-        if len(offending) > 80:
-            offending = offending[:80] + "…"
+        # Redact content-bearing fields (transcript-derived text from the
+        # candidate side) before logging. error_path + first.message
+        # localise the schema bug; the value bytes are not needed and
+        # leaking them downstream to log sinks widens the blast radius
+        # of a prompt-injection-style transcript.
+        if error_path in _REDACTED_ERROR_FIELDS or any(
+            error_path.startswith(prefix + "/") for prefix in _REDACTED_ERROR_FIELDS
+        ):
+            offending = f"<redacted len={len(repr(first.instance))}>"
+        else:
+            offending = repr(first.instance)
+            if len(offending) > 80:
+                offending = offending[:80] + "…"
         log.warning(
             "brain.schema_violation",
             t_ms=t_ms,

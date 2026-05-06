@@ -372,10 +372,16 @@ def _resolve_active_argument(
     # Stale auto-clear runs FIRST because the spec says it applies
     # regardless of ``new`` / ``key_present``. A brand-new opener that
     # arrives in the same call would still get applied below if needed.
+    # `rounds == 1` is the "brain opened the argument once but never came
+    # back to it" state — every fresh-open / topic-change branch below
+    # assigns `rounds=1`, so the prior `rounds == 0` condition was
+    # permanently unreachable and R18's stale-opener auto-clear never
+    # fired. `rounds >= 2` means the brain followed up at least once;
+    # those arguments are not stale by definition.
     auto_clear = (
         prior is not None
         and now_ms is not None
-        and prior.rounds == 0
+        and prior.rounds == 1
         and now_ms - prior.opened_at_ms > _ACTIVE_ARGUMENT_STALE_AUTO_CLEAR_MS
     )
     effective_prior: ActiveArgument | None = None if auto_clear else prior
@@ -391,7 +397,14 @@ def _resolve_active_argument(
         # validation failure upstream. Defensive: treat as no-change.
         return effective_prior
 
-    new_topic = new.get("topic", "")
+    # Normalize topic at construction so capitalization / trailing
+    # whitespace from Opus (it intermittently varies between
+    # `'Caching Strategy'` and `'caching strategy'`) doesn't reset the
+    # rounds counter on every turn — without normalization the
+    # `rounds >= 3` "let it go" safety valve in the brain prompt never
+    # fires for the same semantic topic.
+    raw_topic = new.get("topic", "")
+    new_topic = _canonical_topic(raw_topic) if isinstance(raw_topic, str) else ""
     candidate_pushed_back = bool(new.get("candidate_pushed_back", False))
     opened_at_ms = now_ms if now_ms is not None else 0
 
@@ -418,6 +431,17 @@ def _resolve_active_argument(
         rounds=1,
         candidate_pushed_back=candidate_pushed_back,
     )
+
+
+def _canonical_topic(topic: str) -> str:
+    """Normalize a counter-argument topic for FSM equality.
+
+    Applied at construction so the stored ``topic`` is the canonical
+    form; comparisons elsewhere can use plain ``==``. Strip + lowercase
+    is enough because the brain emits human-readable phrases — we don't
+    need stemming or punctuation handling.
+    """
+    return topic.strip().lower()
 
 
 _COVERAGE_DEPTHS = ("none", "shallow", "solid", "thorough")
